@@ -265,5 +265,5 @@ SOFTWARE.
 
 ---
 
-> *"The market is a device for transferring money from the impatient to the patient."*
-> — Warren Buffett
+> *"You have power over your mind, not outside events. Realize this, and you will find strength."*
+> — Marcus Aurelius
