@@ -139,9 +139,10 @@ class TradingBotConfig(BaseModel):
     NUM_BASE_MODELS: int = 20                          # Was 15 — larger ensemble for better stacking
     PPO_ONLINE_UPDATE_TIMESTEPS: int = 75_000          # Was 100k — faster online adaptation
     PPO_MAX_GRAD_NORM: float = 0.5                     # NEW — was hardcoded 0.3 (too tight for recurrent)
-    PPO_N_STEPS: int = 128                             # NEW — rollout buffer size per symbol
-    PPO_BATCH_SIZE: int = 64                           # NEW — minibatch size
-    PPO_N_EPOCHS: int = 5                              # NEW — was hardcoded 4 (slightly more training per rollout)
+    PPO_N_STEPS: int = 2048                            # Rollout buffer — must be large enough for episodes to complete
+    PPO_BATCH_SIZE: int = 128                          # Minibatch size (n_steps/batch_size = 16 minibatches per epoch)
+    PPO_N_EPOCHS: int = 3                              # Fewer epochs prevents overfitting per rollout
+    MAX_EPISODE_STEPS: int = 2048                      # Truncate portfolio episodes so they complete within rollouts
     # ==================== PORTFOLIO-LEVEL PPO ====================
     PORTFOLIO_PPO: bool = True
     MAX_LEVERAGE: float = 2.0                          # Was 2.15 — slightly more conservative

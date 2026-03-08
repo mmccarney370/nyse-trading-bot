@@ -42,6 +42,7 @@ class PortfolioEnv(gym.Env):
         self.data_dict = {sym: df.copy() for sym, df in data_dict.items()}
         self.initial_balance = initial_balance
         self.max_leverage = CONFIG.get('MAX_LEVERAGE', max_leverage)
+        self.max_episode_steps = CONFIG.get('MAX_EPISODE_STEPS', 2048)
         self.action_space = Box(low=-2.0, high=2.0, shape=(self.n_symbols,), dtype=np.float32)
   
         feature_dims = []
@@ -112,7 +113,8 @@ class PortfolioEnv(gym.Env):
   
         self.timeline = self.timeline[-min_valid_steps:]
         self.current_step = 0
-        logger.info(f"Precomputation complete — valid steps: {len(self.timeline)}")
+        self.episode_start = 0
+        logger.info(f"Precomputation complete — valid steps: {len(self.timeline)} | max_episode_steps: {self.max_episode_steps}")
   
         self.last_weights = np.zeros(self.n_symbols, dtype=np.float32)
         self.weight_history = deque(maxlen=100)
@@ -149,14 +151,17 @@ class PortfolioEnv(gym.Env):
         self.last_weights = np.zeros(self.n_symbols, dtype=np.float32)
         self.weight_history = deque(maxlen=100)
         self.weight_history.append(self.weights.copy())
-        self.current_step = 0
+        # Randomize start position so the agent sees different data each episode
+        max_start = max(0, len(self.timeline) - self.max_episode_steps - 1)
+        self.current_step = self.np_random.integers(0, max_start + 1) if max_start > 0 else 0
+        self.episode_start = self.current_step
         self.cumulative_pnl = 0.0
         self.peak_equity = self.initial_balance
         return self._get_observation(), {}
 
     def step(self, action):
         if self.current_step >= len(self.timeline) - 1:
-            return self._get_observation(), 0.0, True, False, {}
+            return self._get_observation(), 0.0, True, False, {'volatility_target': 0.0, 'portfolio_return': 0.0, 'drawdown': 0.0}
 
         raw_targets = np.clip(action, -2.0, 2.0)
         abs_sum = np.sum(np.abs(raw_targets))
@@ -212,14 +217,19 @@ class PortfolioEnv(gym.Env):
         reward = np.clip(reward, -10.0, 10.0)
 
         self.current_step += 1
-        done = self.current_step >= len(self.timeline) - 1 or self.equity <= 0
+        steps_in_episode = self.current_step - self.episode_start
+        at_data_end = self.current_step >= len(self.timeline) - 1
+        truncated = steps_in_episode >= self.max_episode_steps
+        done = at_data_end or self.equity <= 0 or truncated
 
         info = {
             'volatility_target': annual_vol,
             'portfolio_return': portfolio_return,
             'drawdown': drawdown,
         }
-        return self._get_observation(), reward, done, False, info
+        # Gymnasium convention: done=terminal (bankrupt/data end), truncated=time limit
+        terminal = at_data_end or self.equity <= 0
+        return self._get_observation(), reward, terminal, truncated, info
 
     def _compute_portfolio_return_at_step(self, step_idx):
         timestamp = self.timeline[step_idx]
