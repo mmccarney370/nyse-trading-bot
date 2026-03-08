@@ -1,0 +1,40 @@
+# =============================================
+# NYSE Trading Bot — requirements.txt (March 2026)
+# Fully tested & compatible after pgmpy + SB3 + NumPy 2.4 fixes
+# =============================================
+
+# === Reinforcement Learning Core ===
+stable-baselines3[extra]>=2.7.1
+sb3-contrib>=2.7.1
+
+# === PyTorch (required by SB3 + torch models) ===
+torch>=2.6.0
+
+# === Data & Scientific Stack (NumPy 2.4+ compatible) ===
+numpy>=2.4.2
+pandas>=3.0.0
+pyarrow>=18.0.0
+scipy>=1.17.1
+numba>=0.64.0
+
+# === Causal Discovery & DoWhy ===
+pgmpy>=1.0.0
+dowhy>=0.12
+
+# === Graph & Utils ===
+networkx>=3.3
+scikit-learn>=1.7.0
+
+# === Gymnasium / Environment ===
+gymnasium>=0.29.1,<1.3.0
+
+# === Logging / UI / Helpers ===
+tqdm>=4.66
+rich>=14.0
+psutil>=7.2
+
+# === Your other trading packages (add any you already had) ===
+# yfinance
+# ta-lib
+# ccxt
+# etc.
