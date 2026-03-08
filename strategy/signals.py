@@ -20,10 +20,8 @@ warnings.filterwarnings(
     message="You defined a `validation_step` but have no `val_dataloader`. Skipping val loop."
 )
 # ─── ULTRA-EARLY GLOBAL TQDM SUPPRESSION (Feb 27 2026) ───────────────────────────────
-import os
 os.environ["TQDM_DISABLE"] = "1"
 os.environ["DISABLE_TQDM"] = "1"
-os.environ["TQDM_DISABLE"] = "True"
 # ─── DEFINE LOGGER FIRST ───────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────
@@ -46,9 +44,15 @@ from models.portfolio_env import PortfolioEnv
 from stable_baselines3.common.vec_env.vec_normalize import VecNormalize
 import torch # ← Required for torch.no_grad()
 # NEW: Causal RL dependencies
-from dowhy import CausalModel
-import pgmpy.estimators.GES as GES
-import networkx as nx
+# FIX: Guard causal imports — these are only needed when USE_CAUSAL_RL is enabled
+try:
+    from dowhy import CausalModel
+    import pgmpy.estimators.GES as GES
+    import networkx as nx
+    _CAUSAL_IMPORTS_OK = True
+except ImportError as _causal_import_err:
+    _CAUSAL_IMPORTS_OK = False
+    logger.warning(f"Causal RL imports failed ({_causal_import_err}) — causal features will be disabled")
 import time # ← REQUIRED for timing the causal graph build
 import pickle # ← For causal graph disk caching
 import hashlib # ← P-18 / Critical #11 FIX: for model hash
@@ -351,11 +355,12 @@ class SignalGenerator:
         # Sentiment (always compute if not precomputed, but can be passed)
         if precomputed is None:
             sentiment_score = await self.get_sentiment_score(symbol, timestamp, live_mode=live_mode)
-        # Full blend (exactly the same math you already use)
-        combined_meta = (1 - self.config.get('SENTIMENT_WEIGHT', 0.2)) * meta_prob + self.config.get('SENTIMENT_WEIGHT', 0.2) * sentiment_score
+        # Rescale sentiment from [-1,1] to [0,1] to match meta_prob's range
+        sentiment_01 = (sentiment_score + 1.0) / 2.0
+        combined_meta = (1 - self.config.get('SENTIMENT_WEIGHT', 0.2)) * meta_prob + self.config.get('SENTIMENT_WEIGHT', 0.2) * sentiment_01
         long_thresh, short_thresh = self.trainer.get_current_thresholds(symbol, timestamp)
         logger.debug(f"{symbol}: thresholds (long>{long_thresh:.3f}, short<{short_thresh:.3f})")
-        if 0.50 < combined_meta < 0.68:
+        if self.config.get('DEAD_ZONE_LOW', 0.48) < combined_meta < self.config.get('DEAD_ZONE_HIGH', 0.64):
             confidence = 0.0
             direction = 0
         else:
@@ -457,6 +462,37 @@ class SignalGenerator:
             'direction': direction,
         }
 
+    async def generate_signal(self, symbol: str, data: pd.DataFrame = None, timestamp: pd.Timestamp = None,
+                              live_mode: bool = True, full_hist_df: pd.DataFrame = None, **kwargs) -> tuple:
+        """Generate a trading signal for a single symbol.
+        Returns (direction, confidence, ppo_strength, action_raw) tuple.
+        Delegates to explain_signal_breakdown and updates prev_signals state."""
+        result = await self.explain_signal_breakdown(symbol, timestamp, data=data, live_mode=live_mode)
+        if 'error' in result:
+            return 0, 0.0, 0.0, None
+        direction = result['direction']
+        confidence = result['confidence']
+        ppo_strength = result.get('ppo_strength', 0.5)
+        # Update prev_signals state (explain_signal_breakdown is pure — state update happens here)
+        self.prev_signals[symbol] = direction
+        return direction, confidence, ppo_strength, None
+
+    def generate_signal_sync(self, symbol: str, data: pd.DataFrame = None, timestamp: pd.Timestamp = None,
+                             live_mode: bool = False, full_hist_df: pd.DataFrame = None, **kwargs) -> tuple:
+        """Synchronous wrapper for backtest compatibility."""
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            # If already in async context, create a new event loop in thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, self.generate_signal(
+                    symbol=symbol, data=data, timestamp=timestamp, live_mode=live_mode))
+                return future.result()
+        except RuntimeError:
+            return asyncio.run(self.generate_signal(
+                symbol=symbol, data=data, timestamp=timestamp, live_mode=live_mode))
+
     # ==================== MISSING METHOD ADDED HERE (fixes the crash) ====================
     async def get_sentiment_score(self, symbol: str, timestamp: pd.Timestamp = None, live_mode: bool = True) -> float:
         """Unified sentiment score using LocalLLMDebate (Ollama preferred) or fallback.
@@ -513,7 +549,8 @@ class SignalGenerator:
                 precomputed_env.data_dict = {sym: df.copy() for sym, df in data_dict.items()}
                 if hasattr(precomputed_env, 'timeline') and timestamp is not None:
                     try:
-                        step_idx = precomputed_env.timeline.get_loc(timestamp, method='ffill')
+                        step_idx = precomputed_env.timeline.searchsorted(timestamp, side='right') - 1
+                        step_idx = max(0, step_idx)
                         precomputed_env.current_step = step_idx
                     except Exception:
                         precomputed_env.current_step = len(precomputed_env.timeline) - 1
@@ -549,13 +586,11 @@ class SignalGenerator:
                         obs, state=self.last_portfolio_state, episode_start=np.array([False]), deterministic=True
                     )
                 self.last_portfolio_state = new_state
-            except (AttributeError, TypeError, ValueError):
-                # Fallback if causal wrapper fails
-                if self.portfolio_causal_manager:
-                    logger.warning("[CAUSAL FALLBACK] Portfolio causal predict failed — using base PPO")
-                    action, _ = self.portfolio_causal_manager.predict(obs, deterministic=True)
-                else:
-                    action, _ = self.trainer.portfolio_ppo_model.predict(obs, deterministic=True)
+            except (AttributeError, TypeError, ValueError) as fallback_err:
+                # FIX: Fallback was re-calling the same failing portfolio_causal_manager.predict()
+                # Use base PPO model directly instead
+                logger.warning(f"[CAUSAL FALLBACK] Portfolio causal predict failed ({fallback_err}) — using base PPO")
+                action, _ = self.trainer.portfolio_ppo_model.predict(obs, deterministic=True)
             action = action.flatten()
             max_leverage = self.config.get('MAX_LEVERAGE', 3.0)
             abs_sum = np.sum(np.abs(action))

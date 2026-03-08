@@ -11,11 +11,13 @@ import threading
 import json
 import os
 import time # ← Added for correct background thread sleep
+from collections import Counter
 import tempfile # ← Priority 1: for atomic writes
 import shutil # ← Priority 1: for atomic rename
 from config import CONFIG
 from data.ingestion import DataIngestion
 from broker.alpaca import AlpacaBroker
+from broker.stream import TradeStreamHandler
 from models.trainer import Trainer
 from strategy.signals import SignalGenerator # CausalSignalWrapper removed (Phase 1 modularization)
 from strategy.risk import RiskManager
@@ -108,6 +110,7 @@ class TradingBot:
         self.broker = AlpacaBroker(config, self.data_ingestion, bot=self)
         self.trainer = Trainer(config, self.data_ingestion)
         # Persistent regime cache — MOVED UP so it exists before SignalGenerator (BUG #4 FIX)
+        self._regime_lock = threading.Lock()
         self.regime_cache = self._load_regime_cache()
         self._cleanup_old_regimes()
         # BUG #4 FIX: Shared regime cache with bot.py (4AM precompute + _get_all_regimes now syncs live to signal generation)
@@ -123,6 +126,7 @@ class TradingBot:
         self.daily_equity = {}
         self.equity_history = {}
         self.live_signal_history = {}
+        self._signal_history_max = 500  # max entries per symbol in memory
         self.cycle_count = 0
         self.performance_check_interval = 10
         self.portfolio_ppo = config.get('PORTFOLIO_PPO', False)
@@ -300,13 +304,12 @@ class TradingBot:
     # ==================== HELPER: SAFE CLOSE VIA RISK MANAGER ====================
     # C-2 FUTURE-PROOFING: If you ever refactor to use risk_manager.safe_close_position instead of direct broker call,
     # use this helper — it handles the sync call correctly (no await needed after risk.py patch)
-    def safe_close_via_manager(self, symbol: str) -> bool:
-        """Wrapper around risk_manager.safe_close_position (sync after C-2 patch).
-        Use this instead of direct calls to avoid mistakes."""
+    async def safe_close_via_manager(self, symbol: str) -> bool:
+        """Wrapper around risk_manager.safe_close_position (async after C-2 patch)."""
         if not hasattr(self, 'risk_manager') or self.risk_manager is None:
             logger.error("RiskManager not initialized — cannot safely close")
             return False
-        success = self.risk_manager.safe_close_position(symbol)
+        success = await self.risk_manager.safe_close_position(symbol)
         if success:
             logger.info(f"Safely closed {symbol} via RiskManager")
         else:
@@ -325,6 +328,15 @@ class TradingBot:
             if today not in self.daily_equity:
                 self.daily_equity[today] = current_equity
             self.equity_history[today] = current_equity
+            # Prune equity history to last 90 trading days to prevent memory bloat
+            if len(self.equity_history) > 90:
+                sorted_dates = sorted(self.equity_history.keys())
+                for d in sorted_dates[:-90]:
+                    del self.equity_history[d]
+            if len(self.daily_equity) > 90:
+                sorted_dates = sorted(self.daily_equity.keys())
+                for d in sorted_dates[:-90]:
+                    del self.daily_equity[d]
             paused = self.risk_manager.check_pause_conditions(
                 current_equity, self.daily_equity, self.equity_history
             )
@@ -374,7 +386,12 @@ class TradingBot:
                         price = prices.get(sym)
                         if price is None or price <= 0.0:
                             continue
-                        target_qty = int((target_weight * current_equity) / price)
+                        raw_qty = (target_weight * current_equity) / price
+                        # Use fractional shares if enabled, otherwise truncate to int
+                        if self.config.get('FRACTIONAL_SHARES', False):
+                            target_qty = round(raw_qty, 4)  # Alpaca supports up to 9 decimals
+                        else:
+                            target_qty = int(raw_qty)
                         current_qty = positions.get(sym, 0)
                         direction = 1 if target_qty > 0 else (-1 if target_qty < 0 else 0)
                         target_qty = abs(target_qty) * direction
@@ -386,14 +403,15 @@ class TradingBot:
                             # Defensive tuple unpack for regime
                             if isinstance(regime, (list, tuple)):
                                 regime = regime[0]
+                            # FIX: Add fallback defaults — config.get() returns None if key missing, causing TypeError on < comparison
                             if regime == 'trending':
-                                min_hold = self.config.get('MIN_HOLD_BARS_TRENDING') # BUG-5 PATCH: no hardcoded fallback
+                                min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 48)
                             else:
-                                min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING') # BUG-5 PATCH: no hardcoded fallback
+                                min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
                             if bars_since < min_hold:
                                 if abs(target_qty) != abs(current_qty) or np.sign(target_qty) != np.sign(current_qty):
                                     logger.debug(f"MIN-HOLD ACTIVE {sym} → skipping rebalance (Gemini-tuned {min_hold} bars)")
-                                continue
+                                    continue
                         # Respect existing positions
                         if abs(current_qty) > 0 and np.sign(current_qty) == np.sign(target_qty) and abs(target_qty) > 0:
                             logger.debug(f"{sym} already has position in correct direction — skipping new bracket")
@@ -417,7 +435,8 @@ class TradingBot:
                                     self._save_last_entry_times() # B-23: immediate save after clear
                             except Exception as e:
                                 logger.error(f"Failed to safely close {sym}: {e}")
-                        if target_qty != 0 and current_qty * direction <= 0 and abs(target_qty) >= 1:
+                        min_qty = 0.01 if self.config.get('FRACTIONAL_SHARES', False) else 1
+                        if target_qty != 0 and current_qty * direction <= 0 and abs(target_qty) >= min_qty:
                             size = abs(target_qty)
                             regime = regimes.get(sym, 'mean_reverting')
                             # Defensive tuple unpack for regime
@@ -436,7 +455,10 @@ class TradingBot:
                             if size > max_affordable:
                                 logger.warning(f"[M-5 BUYING POWER CAP] {sym}: requested {size} shares → reduced to {max_affordable} "
                                                f"(buying_power=${buying_power:,.0f}, safety_factor={safety_factor})")
-                                size = max(max_affordable, 1)
+                                size = max(max_affordable, 0)
+                            if size < 1:
+                                logger.warning(f"[BUYING POWER] {sym}: insufficient buying power — skipping order")
+                                continue
                             order = self.broker.place_bracket_order(
                                 symbol=sym,
                                 size=size,
@@ -451,7 +473,8 @@ class TradingBot:
                                 # B-32 FIX: Store original observation for accurate causal reward push later
                                 features = generate_features(data_dict[sym], regime, sym, data_dict[sym])
                                 obs_for_storage = features[-1:].astype(np.float32).flatten().tolist() if features is not None and features.shape[0] > 0 else []
-                                self.live_signal_history.setdefault(sym, []).append({
+                                hist = self.live_signal_history.setdefault(sym, [])
+                                hist.append({
                                     'timestamp': datetime.now(tz=tz.gettz('UTC')),
                                     'direction': direction,
                                     'price': price,
@@ -462,6 +485,8 @@ class TradingBot:
                                     'size': size, # B-15: store entry size for accurate dollar P&L later
                                     'obs': obs_for_storage # ← BUG-2 FIX
                                 })
+                                if len(hist) > self._signal_history_max:
+                                    self.live_signal_history[sym] = hist[-self._signal_history_max:]
                                 self._save_last_entry_times() # B-23: immediate save after new entry
                 except Exception as e:
                     logger.error(f"Portfolio PPO inference/rebalance failed: {e}", exc_info=True)
@@ -511,7 +536,10 @@ class TradingBot:
                             if size > max_affordable:
                                 logger.warning(f"[M-5 BUYING POWER CAP] {symbol}: requested {size} shares → reduced to {max_affordable} "
                                                f"(buying_power=${buying_power:,.0f}, safety_factor={safety_factor})")
-                                size = max(max_affordable, 1)
+                                size = max(max_affordable, 0)
+                            if size < 1:
+                                logger.warning(f"[BUYING POWER] {symbol}: insufficient buying power — skipping order")
+                                continue
                             order = self.broker.place_bracket_order(
                                 symbol=symbol,
                                 size=size,
@@ -525,7 +553,8 @@ class TradingBot:
                                 # B-32 FIX: Store original observation for accurate causal reward push later
                                 features = generate_features(signal_data, regime, symbol, signal_data)
                                 obs_for_storage = features[-1:].astype(np.float32).flatten().tolist() if features is not None and features.shape[0] > 0 else []
-                                self.live_signal_history.setdefault(symbol, []).append({
+                                hist = self.live_signal_history.setdefault(symbol, [])
+                                hist.append({
                                     'timestamp': datetime.now(tz=tz.gettz('UTC')),
                                     'direction': direction,
                                     'price': price,
@@ -536,13 +565,15 @@ class TradingBot:
                                     'size': size, # B-15: store entry size for accurate dollar P&L later
                                     'obs': obs_for_storage # ← BUG-2 FIX
                                 })
+                                if len(hist) > self._signal_history_max:
+                                    self.live_signal_history[symbol] = hist[-self._signal_history_max:]
                                 self._save_last_entry_times() # B-23: immediate save after new entry
                     if direction == 0 and symbol in positions and positions[symbol] != 0:
                         try:
                             # B-02 / B-10 FIX: Use safe async method (awaited) instead of raw client.close_position
                             # C-2 NOTE: This is the direct broker call — correct with await.
                             # If you ever switch to risk_manager.safe_close_position, use:
-                            # success = self.safe_close_via_manager(symbol) # ← no await needed
+                            # success = await self.safe_close_via_manager(symbol)
                             logger.debug(f"Preparing safe close for {symbol} (awaiting close_position_safely)")
                             success = await self.broker.close_position_safely(symbol)
                             if success:
@@ -583,22 +614,25 @@ class TradingBot:
                 self.signal_gen.portfolio_causal_manager._ensure_graph_exists()
             logger.info("[C-3 STARTUP] Ensured all causal graphs are ready or deferred safely after initialization")
         threading.Thread(target=self._background_regime_precompute, daemon=True).start()
-        async def stream_task():
+        async def data_stream_task():
             while True:
                 try:
                     await self.data_ingestion.stream_data()
                 except Exception as e:
                     logger.error(f"Live data stream crashed: {e}. Restarting in 10 seconds...")
                     await asyncio.sleep(10)
+        # Trade updates websocket (fill-driven OCO, slippage, causal push)
+        self.trade_stream_handler = TradeStreamHandler(self.broker)
         # ==================== SCHEDULED TASKS ====================
         trading_task = asyncio.create_task(self.trading_loop())
         monitor_task = asyncio.create_task(self.broker.monitor_positions())
+        trade_stream_task = asyncio.create_task(self.trade_stream_handler.run())
         universe_task = asyncio.create_task(self._universe_update_task())
         gemini_task = asyncio.create_task(self.gemini_scheduled_task())
         ppo_nightly_task = asyncio.create_task(self.ppo_nightly_retrain_task())
-        stream_wrapper = asyncio.create_task(stream_task())
-        tasks = asyncio.gather(stream_wrapper, trading_task, monitor_task,
-                               universe_task, gemini_task, ppo_nightly_task)
+        data_stream_wrapper = asyncio.create_task(data_stream_task())
+        tasks = asyncio.gather(data_stream_wrapper, trading_task, monitor_task,
+                               trade_stream_task, universe_task, gemini_task, ppo_nightly_task)
         try:
             await tasks
         except asyncio.CancelledError:
@@ -606,9 +640,11 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
         finally:
-            # CRIT-03 + SHUTDOWN FIX (Patch 5.2): Correct Alpaca cancel using GetOrdersRequest (matches your alpaca.py)
             logger.info("Shutdown signal received. Cleaning up...")
-            self._emergency_save_all()
+            try:
+                self._emergency_save_all()
+            except Exception as e:
+                logger.error(f"Emergency save failed: {e}")
             try:
                 open_orders = self.broker.client.get_orders(GetOrdersRequest(status='open'))
                 for order in open_orders:
@@ -653,17 +689,18 @@ class TradingBot:
                 lambda sym: compute_regime(sym, self.config.get('LOOKBACK', 900), self.config),
                 symbols
             ))
-        for sym, regime_tuple in results:
-            # Always store clean (regime, persistence) tuple under plain symbol key
-            if isinstance(regime_tuple, (list, tuple)) and len(regime_tuple) == 2:
-                self.regime_cache[sym] = regime_tuple
-                regimes[sym] = regime_tuple[0]
-            else:
-                self.regime_cache[sym] = (str(regime_tuple), 0.5)
-                regimes[sym] = str(regime_tuple)
+        with self._regime_lock:
+            for sym, regime_tuple in results:
+                # Always store clean (regime, persistence) tuple under plain symbol key
+                if isinstance(regime_tuple, (list, tuple)) and len(regime_tuple) == 2:
+                    self.regime_cache[sym] = regime_tuple
+                    regimes[sym] = regime_tuple[0]
+                else:
+                    self.regime_cache[sym] = (str(regime_tuple), 0.5)
+                    regimes[sym] = str(regime_tuple)
         # B-07 REGIME PROPAGATION FIX: Set global CURRENT_REGIME so RiskManager (CVaR), min-hold, etc. always see the latest regime
         if regimes:
-            from collections import Counter
+
             regime_list = [r[0] if isinstance(r, (list,tuple)) else r for r in regimes.values()]
             dominant_regime = Counter(regime_list).most_common(1)[0][0]
             self.config['CURRENT_REGIME'] = dominant_regime
@@ -674,34 +711,30 @@ class TradingBot:
     def _get_all_regimes(self):
         regimes = {}
         symbols = self.config['SYMBOLS']
-        for sym in symbols:
-            if sym in self.regime_cache:
-                value = self.regime_cache[sym]
-                # Defensive unpack — always return string regime for trading_loop compatibility
-                if isinstance(value, (list, tuple)) and len(value) == 2:
-                    regime = value[0]
-                    persistence = value[1]
-                else:
-                    regime = str(value)
-                    persistence = 0.5
-                regimes[sym] = (regime, persistence)
-                # BUG #15 PATCH: also populate latest_prices on cache-hit (the most common/fast path)
+        with self._regime_lock:
+            for sym in symbols:
+                if sym in self.regime_cache:
+                    value = self.regime_cache[sym]
+                    if isinstance(value, (list, tuple)) and len(value) == 2:
+                        regime = value[0]
+                        persistence = value[1]
+                    else:
+                        regime = str(value)
+                        persistence = 0.5
+                    regimes[sym] = (regime, persistence)
+                    continue
                 data = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
                 if len(data) > 0:
                     self.latest_prices[sym] = data['close'].iloc[-1]
-                continue
-            data = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
-            if len(data) > 0:
-                self.latest_prices[sym] = data['close'].iloc[-1] # BUG #14 PATCH: populate cache in fallback path (cache miss/startup/new symbols) so gemini_scheduled_task + _monitor_oos_decay never hit None again
-            if len(data) < 50:
-                regime = 'mean_reverting'
-                persistence = 0.5
-            else:
-                recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
-                regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
-                persistence = 0.5
-            regimes[sym] = (regime, persistence)
-            self.regime_cache[sym] = (regime, persistence) # store as tuple for consistency
+                if len(data) < 50:
+                    regime = 'mean_reverting'
+                    persistence = 0.5
+                else:
+                    recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
+                    regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
+                    persistence = 0.5
+                regimes[sym] = (regime, persistence)
+                self.regime_cache[sym] = (regime, persistence)
         return regimes
     # ==================== GEMINI + CAUSAL REFRESH (3:30 AM) ====================
     async def gemini_scheduled_task(self):
@@ -724,82 +757,163 @@ class TradingBot:
                 for attempt in range(3):
                     try:
                         current_equity = self.broker.get_equity()
+                        buying_power = self.broker.get_buying_power()
                         starting_equity = list(self.equity_history.values())[0] if self.equity_history else current_equity
                         positions = self.broker.get_positions_dict()
-                        trade_count = sum(len(h) for h in self.live_signal_history.values())
-                        wins = total_closed = 0
+                        # === Aggregate trade statistics ===
+                        all_closed = []
                         for hist in self.live_signal_history.values():
-                            closed = [e for e in hist if e.get('realized_return') is not None]
-                            total_closed += len(closed)
-                            wins += sum(1 for e in closed if e.get('realized_return', 0) > 0)
+                            all_closed.extend([e for e in hist if e.get('realized_return') is not None])
+                        total_closed = len(all_closed)
+                        wins = sum(1 for e in all_closed if e.get('realized_return', 0) > 0)
                         win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
+                        # === Sharpe, Sortino, Max Drawdown from realized returns ===
+                        realized_returns = [e['realized_return'] for e in all_closed if 'realized_return' in e]
+                        sharpe_ratio = 0.0
+                        sortino_ratio = 0.0
+                        max_drawdown_pct = 0.0
+                        avg_return = 0.0
+                        avg_win = 0.0
+                        avg_loss = 0.0
+                        profit_factor = 0.0
+                        avg_hold_bars = 0.0
+                        if len(realized_returns) > 2:
+                            avg_return = np.mean(realized_returns)
+                            ret_std = np.std(realized_returns)
+                            sharpe_ratio = round((avg_return / ret_std * np.sqrt(252)) if ret_std > 1e-8 else 0.0, 3)
+                            downside = [r for r in realized_returns if r < 0]
+                            downside_std = np.std(downside) if len(downside) > 1 else 1e-8
+                            sortino_ratio = round((avg_return / downside_std * np.sqrt(252)) if downside_std > 1e-8 else 0.0, 3)
+                            winners = [r for r in realized_returns if r > 0]
+                            losers = [abs(r) for r in realized_returns if r < 0]
+                            avg_win = round(np.mean(winners), 5) if winners else 0.0
+                            avg_loss = round(np.mean(losers), 5) if losers else 0.0
+                            profit_factor = round(sum(winners) / sum(losers), 3) if sum(losers) > 0 else 99.0
+                            # Max drawdown from equity history
+                            if self.equity_history:
+                                eq_vals = list(self.equity_history.values())
+                                peak = eq_vals[0]
+                                max_dd = 0.0
+                                for eq in eq_vals:
+                                    peak = max(peak, eq)
+                                    dd = (peak - eq) / peak if peak > 0 else 0
+                                    max_dd = max(max_dd, dd)
+                                max_drawdown_pct = round(max_dd * 100, 2)
+                        # Average hold time
+                        hold_times = []
+                        for e in all_closed:
+                            ts = e.get('timestamp')
+                            closed_ts = e.get('closed_at')
+                            if ts and closed_ts:
+                                try:
+                                    hold_times.append((datetime.fromisoformat(str(closed_ts)) - datetime.fromisoformat(str(ts))).total_seconds() / 900)
+                                except Exception:
+                                    pass
+                        avg_hold_bars = round(np.mean(hold_times), 1) if hold_times else 0.0
+                        # === Per-symbol performance with regime breakdown ===
                         symbol_performance = {}
+                        regimes = self._get_all_regimes()
                         for sym in self.config['SYMBOLS']:
                             history = self.live_signal_history.get(sym, [])
                             closed = [e for e in history if e.get('realized_return') is not None]
-                            # BUG-13 FIX: Reuse persistent instance-level latest_prices cache (no fallback fetch)
                             current_price = self.latest_prices.get(sym)
-                            if current_price is None:
-                                logger.debug(f"[GEMINI] Price cache miss for {sym} — skipping current price (safe)")
-                                current_price = None
+                            sym_regime = regimes.get(sym, ('mixed', 0.5)) if regimes else ('mixed', 0.5)
+                            regime_str = sym_regime[0] if isinstance(sym_regime, (list, tuple)) else sym_regime
+                            persistence = sym_regime[1] if isinstance(sym_regime, (list, tuple)) and len(sym_regime) >= 2 else 0.5
                             if closed:
                                 win_rate_sym = sum(1 for e in closed if e['realized_return'] > 0) / len(closed)
                                 recent_win = sum(1 for e in closed[-10:] if e['realized_return'] > 0) / len(closed[-10:]) if len(closed) >= 10 else win_rate_sym
-                                # B-15 + B-16: Real dollar P&L (with fallback if size missing)
                                 total_pnl_dollars = 0.0
                                 recent_pnl_dollars = 0.0
+                                sym_returns = []
                                 for e in closed:
-                                    size = e.get('size', 1) # fallback to 1 if missing
+                                    size = e.get('size', 1)
                                     pnl = e['realized_return'] * e['price'] * size
                                     total_pnl_dollars += pnl
+                                    sym_returns.append(e['realized_return'])
                                     if e in closed[-10:]:
                                         recent_pnl_dollars += pnl
-                                if any('size' not in e for e in closed):
-                                    logger.warning(f"[FALLBACK] {sym} has pre-migration entries without 'size' — dollar P&L approximate")
+                                sym_sharpe = 0.0
+                                if len(sym_returns) > 2:
+                                    s_std = np.std(sym_returns)
+                                    sym_sharpe = round((np.mean(sym_returns) / s_std * np.sqrt(252)) if s_std > 1e-8 else 0.0, 3)
                             else:
-                                # B-30 FIX: Include unrealized P&L for open positions in Gemini tuning context
                                 unrealized_pnl = 0.0
-                                recent_unrealized_pnl = 0.0
-                                win_rate_sym = 0.5 # fallback
+                                win_rate_sym = 0.5
                                 recent_win = win_rate_sym
+                                sym_sharpe = 0.0
                                 open_entry = next((e for e in reversed(history) if e.get('realized_return') is None and e.get('direction', 0) != 0), None)
                                 if open_entry and current_price is not None:
                                     direction = open_entry.get('direction', 1)
                                     entry_price = open_entry.get('price', current_price)
-                                    size = open_entry.get('size', 1) # fallback
+                                    size = open_entry.get('size', 1)
                                     unrealized = (current_price - entry_price) / entry_price * direction
                                     unrealized_pnl = unrealized * entry_price * size
-                                    # Simple recent proxy: assume last entry is "recent"
-                                    recent_unrealized_pnl = unrealized_pnl
-                                    # If unrealized positive → tentative "win"
                                     win_rate_sym = 1.0 if unrealized > 0 else 0.0
                                     recent_win = win_rate_sym
-                                total_pnl_dollars = unrealized_pnl
-                                recent_pnl_dollars = recent_unrealized_pnl
+                                total_pnl_dollars = unrealized_pnl if 'unrealized_pnl' in locals() else 0.0
+                                recent_pnl_dollars = total_pnl_dollars
                             symbol_performance[sym] = {
                                 'win_rate': round(win_rate_sym, 3),
                                 'recent_10_win_rate': round(recent_win, 3),
                                 'total_pnl_dollars': round(total_pnl_dollars, 2),
                                 'recent_pnl_dollars': round(recent_pnl_dollars, 2),
-                                'trades': len(closed)
+                                'trades': len(closed),
+                                'regime': regime_str,
+                                'persistence': round(persistence, 3),
+                                'sharpe': sym_sharpe,
+                                'current_price': round(current_price, 2) if current_price else None,
                             }
-                        # B-29 FIX: Use actual dominant regime in Gemini context instead of hardcoding 'mixed'
-                        regimes = self._get_all_regimes()
+                        # === Regime breakdown ===
                         if regimes:
-                            from collections import Counter
-                            regime_list = [r[0] if isinstance(r, (list,tuple)) else r for r in regimes.values()]
+                            regime_list = [r[0] if isinstance(r, (list, tuple)) else r for r in regimes.values()]
                             dominant_regime = Counter(regime_list).most_common(1)[0][0] if regime_list else 'mixed'
+                            regime_counts = dict(Counter(regime_list))
+                            avg_persistence = round(np.mean([
+                                r[1] if isinstance(r, (list, tuple)) and len(r) >= 2 else 0.5
+                                for r in regimes.values()
+                            ]), 3)
                         else:
                             dominant_regime = self.config.get('CURRENT_REGIME', 'mixed')
+                            regime_counts = {}
+                            avg_persistence = 0.5
+                        # === Broker metrics ===
+                        slippage_offset = self.broker.limit_price_offset
+                        tracked_groups = len(self.broker.tracker.get_open_groups()) if hasattr(self.broker, 'tracker') else 0
+                        # === Build full context ===
                         context = {
-                            'pnl_summary': f"Current equity ${current_equity:,.0f} ({(current_equity / starting_equity - 1)*100:+.2f}%)",
-                            'trade_summary': str(trade_count),
+                            'pnl_summary': f"${current_equity:,.0f} ({(current_equity / starting_equity - 1)*100:+.2f}%)",
+                            'trade_summary': str(len(all_closed)),
                             'win_rate': f"{win_rate:.1f}",
-                            'equity_trend': f"Open positions: {len(positions)}",
                             'regime': dominant_regime,
-                            'symbol_performance': symbol_performance
+                            'symbol_performance': symbol_performance,
+                            # New comprehensive metrics
+                            'equity': round(current_equity, 2),
+                            'buying_power': round(buying_power, 2),
+                            'starting_equity': round(starting_equity, 2),
+                            'return_pct': round((current_equity / starting_equity - 1) * 100, 3),
+                            'open_positions': len(positions),
+                            'tracked_orders': tracked_groups,
+                            'sharpe_ratio': sharpe_ratio,
+                            'sortino_ratio': sortino_ratio,
+                            'max_drawdown_pct': max_drawdown_pct,
+                            'profit_factor': profit_factor,
+                            'avg_win': avg_win,
+                            'avg_loss': avg_loss,
+                            'avg_return': round(avg_return, 6),
+                            'total_trades': total_closed,
+                            'wins': wins,
+                            'losses': total_closed - wins,
+                            'avg_hold_bars': avg_hold_bars,
+                            'regime_counts': regime_counts,
+                            'avg_persistence': avg_persistence,
+                            'current_slippage_offset': round(slippage_offset, 5),
+                            'symbols_in_universe': len(self.config['SYMBOLS']),
                         }
-                        logger.info(f"[GEMINI PNL] Sending real dollar P&L + regime '{dominant_regime}' to tuning: {symbol_performance}")
+                        logger.info(
+                            f"[GEMINI] Sharpe={sharpe_ratio} Sortino={sortino_ratio} MaxDD={max_drawdown_pct}% "
+                            f"PF={profit_factor} WR={win_rate:.1f}% Trades={total_closed} Regime={dominant_regime}"
+                        )
                         applied = query_gemini_for_tuning(context, self.config, symbol_performance)
                         if applied:
                             logger.info(f"[GEMINI TUNER] Live config updated with {len(applied)} changes")
@@ -811,7 +925,7 @@ class TradingBot:
                             # ==================== NEW: STRUCTURED BATCH SUMMARY LOG ====================
                             batch_summary = {
                                 "event": "gemini_tuning_batch",
-                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "timestamp": datetime.now(tz=tz.gettz('UTC')).isoformat(),
                                 "changes_count": len(applied),
                                 "parameters_changed": list(applied.keys()),
                                 "pnl_context": context

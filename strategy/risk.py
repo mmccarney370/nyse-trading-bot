@@ -6,6 +6,7 @@
 # M-1 FIX (March 2026): Aggressive regime caching to eliminate 5–10 redundant HMM calls per cycle
 # M-5 FIX (March 2026): Added real-time buying power cap to prevent over-sizing beyond available margin/cash
 import logging
+import asyncio
 import numpy as np
 import pandas as pd
 import cvxpy as cp
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta
 from dateutil import tz
 from config import CONFIG
 from sklearn.covariance import LedoitWolf
+from strategy.regime import detect_regime
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +135,9 @@ class RiskManager:
         logger.debug(f"[REGIME CONFIDENCE] {symbol} | persistence={persistence:.3f} → "
                      f"multiplier={size_multiplier:.3f} (min_floor={min_size_pct}) | final_shares={scaled_shares:.1f}")
         # ==================== END RECOMMENDED UPGRADE ====================
-        if conviction < 0.35:
-            logger.debug(f"Low conviction skip for {symbol}: {conviction:.2f} < 0.35")
+        conv_threshold = self.config.get('CONVICTION_THRESHOLD', 0.28)
+        if conviction < conv_threshold:
+            logger.debug(f"Low conviction skip for {symbol}: {conviction:.2f} < {conv_threshold}")
             scaled_shares = 0
         shares = int(scaled_shares)
         max_value = equity * self.config.get('MAX_POSITION_VALUE_FRACTION', 0.2)
@@ -183,8 +186,16 @@ class RiskManager:
                 regime, persistence = self._get_cached_regime(sym, data)
                 regimes[sym] = (regime, persistence)
         
-        # Regime-aware base risk (Gemini-tuned from bot.py)
-        regime = self.config.get('CURRENT_REGIME', 'mean_reverting')
+        # FIX: Determine dominant regime from actual per-symbol regimes dict (was using stale global CURRENT_REGIME)
+        if regimes:
+            regime_counts = {}
+            for sym in symbols:
+                r = regimes.get(sym, ('mean_reverting', 0.5))
+                r_name = r[0] if isinstance(r, (list, tuple)) else r
+                regime_counts[r_name] = regime_counts.get(r_name, 0) + 1
+            regime = max(regime_counts, key=regime_counts.get)
+        else:
+            regime = self.config.get('CURRENT_REGIME', 'mean_reverting')
         base_risk_key = 'RISK_PER_TRADE_TRENDING' if regime == 'trending' else 'RISK_PER_TRADE_MEAN_REVERTING'
         base_risk_pct = self.config.get(base_risk_key, self.config.get('RISK_PER_TRADE', 0.02))
         # === CRITICAL FIX #1: Correct total portfolio risk budget ===
@@ -259,13 +270,12 @@ class RiskManager:
         u = cp.Variable(min_len)
         portfolio_return = mu @ w
         cvar = alpha + (1 / ((1 - 0.95) * min_len)) * cp.sum(u)
+        max_weight = max(self.config.get('MAX_SECTOR_CONCENTRATION', 0.30), 1.0 / n)
         constraints = [
             cp.sum(w) == 1,
-            w >= -self.config.get('MAX_LEVERAGE', 2.5),
-            w <= self.config.get('MAX_SECTOR_CONCENTRATION', 0.35),
+            w >= -0.15,
+            w <= max_weight,
         ]
-        if n > 3:
-            constraints.append(w >= -0.15)
         constraints.extend([
             u >= 0,
             u >= -R @ w - alpha,
@@ -282,7 +292,7 @@ class RiskManager:
                 cvar_magnitude /= np.sum(cvar_magnitude) + 1e-8
                 weights = np.sign(raw_signed) * cvar_magnitude
                 # Strong per-symbol cap
-                max_per_symbol = self.config.get('MAX_SECTOR_CONCENTRATION', 0.25)
+                max_per_symbol = self.config.get('MAX_SECTOR_CONCENTRATION', 0.30)
                 weights = np.clip(weights, -max_per_symbol, max_per_symbol)
                 total_abs = np.sum(np.abs(weights))
                 if total_abs > 0:
@@ -292,12 +302,17 @@ class RiskManager:
                 max_per_symbol_dollar = equity * self.config.get('MAX_POSITION_VALUE_FRACTION', 0.20) # BUG #8 PATCH: consistent with config default + other method
                 for sym in alloc:
                     alloc[sym] = np.clip(alloc[sym], -max_per_symbol_dollar, max_per_symbol_dollar)
-                # BUG #17 PATCH: renormalize after per-symbol clamp so total risk budget remains exactly respected (prevents lost leverage when any position is capped)
+                # FIX: Only redistribute budget to UNCAPPED symbols (renormalizing all defeated the clamp)
                 total_clipped = sum(abs(v) for v in alloc.values())
-                if total_clipped > 0:
-                    scale = total_risk_budget / total_clipped
-                    for sym in alloc:
-                        alloc[sym] *= scale
+                if total_clipped > 0 and total_clipped < total_risk_budget:
+                    # Some budget was freed by capping — redistribute to uncapped symbols proportionally
+                    freed = total_risk_budget - total_clipped
+                    uncapped = {sym: abs(alloc[sym]) for sym in alloc
+                                if abs(alloc[sym]) < max_per_symbol_dollar * 0.99}
+                    uncapped_total = sum(uncapped.values())
+                    if uncapped_total > 0:
+                        for sym in uncapped:
+                            alloc[sym] += np.sign(alloc[sym]) * freed * (uncapped[sym] / uncapped_total)
                 logger.info(f"[CVaR LIVE SUCCESS] Allocations (signs preserved): {alloc}")
                 logger.info(f"[CVaR TOTAL] Total risk allocated: ${sum(abs(v) for v in alloc.values()):,.0f}")
                 return alloc
@@ -346,13 +361,10 @@ class RiskManager:
         return immediate_trigger or paused_due_to_dd
 
     # ====================== SAFE POSITION CLOSE (FIXED for C-2) ======================
-    def safe_close_position(self, symbol: str) -> bool:
+    async def safe_close_position(self, symbol: str) -> bool:
         """Safely close a position by first cancelling any active bracket orders.
-        This fixes the 'insufficient qty available' error when brackets are holding shares."""
+        FIX: Made async — run_until_complete() crashes when called from an already-running event loop."""
         if self.broker is None:
             logger.error(f"Cannot safely close {symbol} — broker not passed to RiskManager")
             return False
-        # AWAIT the async broker method — returns the real bool result
-        return asyncio.get_event_loop().run_until_complete(
-            self.broker.close_position_safely(symbol)
-        )
+        return await self.broker.close_position_safely(symbol)

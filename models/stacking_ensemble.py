@@ -73,7 +73,7 @@ def train_stacking(
     params = CONFIG['LIGHTGBM_PARAMS'].copy()
    
     # Fixed training parameters
-    params['num_iterations'] = 200
+    params['num_iterations'] = CONFIG.get('LGB_NUM_ITERATIONS', 250)
     params['verbose'] = -1
    
     for i in range(n_models):

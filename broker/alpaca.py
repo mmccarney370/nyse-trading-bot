@@ -1,4 +1,5 @@
 # broker/alpaca.py
+# Event-driven broker: trailing stops, ReplaceOrderRequest PATCH, fractional shares, extended hours
 import logging
 import asyncio
 import numpy as np
@@ -7,26 +8,18 @@ from datetime import datetime, timedelta
 from dateutil import tz
 import json
 import os
+
 from utils.helpers import is_market_open
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     LimitOrderRequest,
-    StopLossRequest,
-    TakeProfitRequest,
+    TrailingStopOrderRequest,
+    ReplaceOrderRequest,
     GetOrdersRequest,
-    ReplaceOrderRequest
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionSide
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderType, PositionSide, PositionIntent
 from config import CONFIG
-from strategy.regime import detect_regime
-# Correct absolute imports (files are in models/)
-from models.ppo_utils import (
-    train_ppo,
-    save_ppo_model,
-    load_ppo_model,
-    update_model_weights as ppo_update_model_weights
-)
-from models.stacking_ensemble import train_stacking
+from broker.order_tracker import OrderTracker, GroupState
 
 logger = logging.getLogger(__name__)
 
@@ -34,46 +27,47 @@ logger = logging.getLogger(__name__)
 REGIME_CACHE_FILE = "regime_cache.json"
 LAST_ENTRY_FILE = "last_entry_times.json"
 
-# Timezone-aware epoch sentinel (used as default for last_ratchet_time lookups)
 _UTC = tz.gettz('UTC')
 _EPOCH = datetime(1970, 1, 1, tzinfo=_UTC)
+
 
 def _order_type_str(order) -> str:
     raw = str(getattr(order, 'order_type', '') or '').lower()
     return raw.split('.')[-1]
 
+
 class AlpacaBroker:
     def __init__(self, config, data_ingestion=None, bot=None):
         self.config = config
         self.data_ingestion = data_ingestion
-        self.bot = bot # Added: access to live_signal_history and latest_prices for reward push
+        self.bot = bot
         self.limit_price_offset = config.get('LIMIT_PRICE_OFFSET', 0.005)
         self.is_paper = config.get('PAPER', True)
+        self.use_extended_hours = config.get('EXTENDED_HOURS', True)
+        self.use_fractional = config.get('FRACTIONAL_SHARES', True)
         self.client = TradingClient(
             config['API_KEY'],
             config['API_SECRET'],
             paper=self.is_paper
         )
-        # ==================== DIAGNOSTIC PRINT (to confirm patched version) ====================
-        logger.info(f"===== CLIENT DEBUG: cancel_order exists: {hasattr(self.client, 'cancel_order')} | type: {type(self.client)} =====")
-        self.last_slippage_adjust = datetime.now(tz=_UTC)
-        self.last_regime = {}
-        # Persistent state
+        # Order tracker (persistent state machine)
+        self.tracker = OrderTracker()
+        # Legacy state (kept for bot.py compatibility)
         self.last_entry_times = self._load_last_entry_times()
         self.regime_cache = self._load_regime_cache()
         self.existing_positions = {}
-        self.last_ratchet_time = {} # tracks last ratchet per symbol for adaptive frequency
-        # M-2 FIX: Positions cache with TTL (30 seconds default)
+        self.last_ratchet_time = {}
+        # Positions cache with TTL
         self._positions_cache = {}
         self._positions_cache_time = None
-        self._positions_cache_ttl = 30  # seconds — matches typical trading cycle length
-        # M-5 FIX: Configurable timeout for cancel/wait sequence in ratchet
-        self.ratchet_cancel_timeout_sec = self.config.get('RATCHET_CANCEL_TIMEOUT_SEC', 8)
+        self._positions_cache_ttl = 30
         # Full dynamic sync on startup
         self.sync_existing_positions()
+        self._reconcile_tracker_on_startup()
         logger.info(
-            f"✅ AlpacaBroker initialized — {len(self.existing_positions)} open positions, "
-            f"{len(self.last_entry_times)} restored entry times, {len(self.regime_cache)} cached regimes"
+            f"AlpacaBroker initialized — {len(self.existing_positions)} open positions, "
+            f"{len(self.tracker.get_open_groups())} tracked groups, "
+            f"extended_hours={self.use_extended_hours}, fractional={self.use_fractional}"
         )
 
     # ====================== PERSISTENT LAST ENTRY TIMES ======================
@@ -85,7 +79,6 @@ class AlpacaBroker:
                 result = {}
                 for sym, ts in data.items():
                     dt = datetime.fromisoformat(ts)
-                    # Ensure tz-aware — attach UTC if naive (prevents TypeError in monitor loop)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=_UTC)
                     result[sym] = dt
@@ -99,63 +92,61 @@ class AlpacaBroker:
             data = {sym: ts.isoformat() for sym, ts in self.last_entry_times.items()}
             with open(LAST_ENTRY_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
-            logger.debug(f"Saved {len(self.last_entry_times)} entry times to disk")
         except Exception as e:
             logger.warning(f"Failed to save last_entry_times.json: {e}")
 
     # ====================== FULL DYNAMIC SYNC ======================
     def sync_existing_positions(self, force_refresh=False):
-        """Full dynamic sync — called on startup and can be called anytime
-        M-2 FIX: Supports force_refresh to invalidate cache after order actions"""
         now = datetime.now(tz=_UTC)
         if not force_refresh and self._positions_cache_time is not None:
             age = (now - self._positions_cache_time).total_seconds()
             if age < self._positions_cache_ttl:
-                logger.debug(f"[POSITIONS CACHE HIT] Using cached positions (age={age:.1f}s < {self._positions_cache_ttl}s)")
                 self.existing_positions = self._positions_cache.copy()
                 return
-
         try:
             positions = self.client.get_all_positions()
             self.existing_positions = {
                 p.symbol: float(p.qty) if p.side == PositionSide.LONG else -float(p.qty)
                 for p in positions if float(p.qty) != 0
             }
-            # Update cache
             self._positions_cache = self.existing_positions.copy()
             self._positions_cache_time = now
-            logger.debug(f"[POSITIONS CACHE REFRESH] Synced {len(self.existing_positions)} positions")
-
             for sym in list(self.existing_positions.keys()):
                 if sym not in self.last_entry_times:
                     self.last_entry_times[sym] = now - timedelta(minutes=30)
-                    logger.info(f"Restored missing entry time for {sym} (default 30min ago)")
             for sym in list(self.last_entry_times.keys()):
                 if sym not in self.existing_positions:
                     self.last_entry_times.pop(sym, None)
-            logger.info(
-                f"✅ Full Alpaca sync: {len(self.existing_positions)} open positions, "
-                f"{len(self.last_entry_times)} tracked entry times"
-            )
             self._save_last_entry_times()
         except Exception as e:
             logger.error(f"Failed to sync existing positions: {e}")
-            # Fallback: keep old cache if possible
             if self._positions_cache:
-                logger.warning("[POSITIONS CACHE FALLBACK] Using stale cache due to sync failure")
                 self.existing_positions = self._positions_cache.copy()
             else:
                 self.existing_positions = {}
+
+    def _reconcile_tracker_on_startup(self):
+        """Reconcile OrderTracker with actual Alpaca positions after restart.
+        - If tracker has a group but no Alpaca position: remove stale group
+        - If Alpaca has a position but no tracker group: create recovery group with protective orders
+        """
+        for sym in list(self.tracker.groups.keys()):
+            group = self.tracker.groups[sym]
+            if sym not in self.existing_positions and group.state != GroupState.CLOSED:
+                logger.info(f"[RECONCILE] Removing stale tracker group for {sym} (no Alpaca position)")
+                self.tracker.remove_group(sym)
+
+        for sym, qty in self.existing_positions.items():
+            if sym not in self.tracker.groups:
+                logger.info(f"[RECONCILE] Position {sym} has no tracker group — will re-attach protective orders in monitor")
 
     def _load_regime_cache(self):
         if os.path.exists(REGIME_CACHE_FILE):
             try:
                 with open(REGIME_CACHE_FILE, 'r') as f:
-                    data = json.load(f)
-                logger.info(f"AlpacaBroker loaded shared regime cache with {len(data)} symbols")
-                return data
+                    return json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load regime cache in AlpacaBroker: {e}")
+                logger.warning(f"Failed to load regime cache: {e}")
         return {}
 
     def get_equity(self):
@@ -167,7 +158,6 @@ class AlpacaBroker:
             return 1000.0
 
     def get_buying_power(self):
-        """Real-time buying power (used for safety clamps)"""
         try:
             account = self.client.get_account()
             return float(account.buying_power)
@@ -176,10 +166,10 @@ class AlpacaBroker:
             return 0.0
 
     def get_positions_dict(self):
-        """M-2 FIX: Cached version — sync only if cache expired"""
-        self.sync_existing_positions()  # Will use cache if not expired
+        self.sync_existing_positions()
         return self.existing_positions.copy()
 
+    # ====================== ATR COMPUTATION ======================
     def _compute_current_atr(self, data_window: pd.DataFrame, lookback: int = 50) -> float:
         if len(data_window) < 14:
             return 0.01
@@ -187,439 +177,470 @@ class AlpacaBroker:
         high_low = recent['high'] - recent['low']
         high_close = (recent['high'] - recent['close'].shift(1)).abs()
         low_close = (recent['low'] - recent['close'].shift(1)).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        tr = tr.dropna()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).dropna()
         if len(tr) == 0:
             return 0.01
-        atr_series = tr.ewm(span=14, adjust=False).mean()
-        atr = atr_series.iloc[-1]
+        atr = tr.ewm(span=14, adjust=False).mean().iloc[-1]
         floor = 0.0005 * recent['close'].iloc[-1]
         return max(atr, floor)
 
-    def has_active_bracket(self, symbol: str) -> bool:
-        try:
-            orders = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
-            return any(o.order_class == OrderClass.BRACKET for o in orders)
-        except:
-            return False
-
-    def place_bracket_order(self, symbol, size, current_price, data, direction=1):
-        if size < 1:
-            return None
-        if self.has_active_bracket(symbol):
-            logger.info(f"Skipping duplicate bracket for {symbol} — active bracket already exists")
-            return None
-        # Regime detection (cached)
+    def _get_regime(self, symbol: str, data=None):
+        """Get regime + persistence for a symbol from cache or fallback."""
         if symbol in self.regime_cache:
             value = self.regime_cache[symbol]
-            regime = value[0] if isinstance(value, (list, tuple)) else value
-        else:
+            if isinstance(value, (list, tuple)):
+                regime = value[0]
+                persistence = value[1] if len(value) >= 2 else 0.5
+            else:
+                regime = value
+                persistence = 0.5
+            return regime, persistence
+        if data is not None and len(data) >= 20:
             recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
             regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
-        logger.info(f"Placing bracket for {symbol} — detected regime: {regime}")
-        # M-5 FIX: Real-time buying power cap before placing order
-        available_bp = self.get_buying_power()
-        notional = abs(size) * current_price
-        safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
-        max_allowed_notional = available_bp * safety_factor
-        if notional > max_allowed_notional and available_bp > 1000:
-            new_size = int(max_allowed_notional / current_price)
-            logger.warning(
-                f"[M-5 BUYING POWER CAP] {symbol}: requested {size} shares (${notional:,.0f}) → reduced to {new_size} shares "
-                f"(buying_power=${available_bp:,.0f}, safety_factor={safety_factor})"
-            )
-            size = max(new_size, 1)
-        atr = self._compute_current_atr(data)
+            return regime, 0.5
+        return 'mean_reverting', 0.5
+
+    def _get_trail_percent(self, current_price: float, atr: float, regime: str) -> float:
+        """Compute trailing stop as a percentage of price (for TrailingStopOrderRequest)."""
         trailing_mult = (
             self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
             if regime == 'trending'
             else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
         )
+        trail_distance = atr * trailing_mult
+        trail_pct = (trail_distance / current_price) * 100  # Alpaca expects percentage
+        # Clamp: at least 0.5%, at most 35%
+        return round(max(0.5, min(35.0, trail_pct)), 2)
+
+    def _get_tp_price(self, current_price: float, atr: float, regime: str, direction: int) -> float:
+        """Compute take-profit limit price."""
         tp_mult = (
             self.config.get('TAKE_PROFIT_ATR_TRENDING', self.config.get('TAKE_PROFIT_ATR', 30.0) * 1.2)
             if regime == 'trending'
             else self.config.get('TAKE_PROFIT_ATR_MEAN_REVERTING', self.config.get('TAKE_PROFIT_ATR', 12.0))
         )
+        tp_price = current_price + direction * tp_mult * atr
+        return round(max(tp_price, 0.01), 2)
+
+    # ====================== DUPLICATE CHECK ======================
+    def has_active_orders(self, symbol: str) -> bool:
+        """Check if symbol already has open orders (entry or exit)."""
+        if symbol in self.tracker.groups:
+            group = self.tracker.groups[symbol]
+            if group.state in (GroupState.PENDING_ENTRY, GroupState.OPEN):
+                return True
+        try:
+            orders = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
+            return len(orders) > 0
+        except Exception as e:
+            logger.warning(f"Failed to check active orders for {symbol}: {e}")
+            return False
+
+    # ====================== ENTRY: SIMPLE LIMIT ORDER ======================
+    def place_bracket_order(self, symbol, size, current_price, data, direction=1):
+        """Submit a limit entry order. Exit orders (trailing stop + TP) are placed
+        on fill via the websocket handler in stream.py."""
+        if self.has_active_orders(symbol):
+            logger.info(f"Skipping entry for {symbol} — active orders or tracker group already exists")
+            return None
+
+        regime, persistence = self._get_regime(symbol, data)
+
+        # Fractional shares: allow float qty, but enforce minimum notional
+        if self.use_fractional:
+            if size * current_price < 1.0:
+                logger.info(f"Skipping {symbol} — notional ${size * current_price:.2f} below $1 minimum")
+                return None
+            qty = round(size, 4)  # Alpaca supports up to 9 decimal places for fractional
+        else:
+            size = int(size)
+            if size < 1:
+                return None
+            qty = size
+
+        # Buying power safety cap
+        available_bp = self.get_buying_power()
+        notional = abs(qty) * current_price
+        safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
+        max_allowed = available_bp * safety_factor
+        if notional > max_allowed and available_bp > 1000:
+            if self.use_fractional:
+                qty = round(max_allowed / current_price, 4)
+            else:
+                qty = int(max_allowed / current_price)
+            if qty * current_price < 1.0:
+                logger.warning(f"[BP CAP] {symbol}: even after cap, qty too small — skipping")
+                return None
+            logger.warning(
+                f"[BP CAP] {symbol}: reduced to {qty} (${qty * current_price:,.0f} / "
+                f"${available_bp:,.0f} BP, safety={safety_factor})"
+            )
+
         side = OrderSide.BUY if direction > 0 else OrderSide.SELL
         limit_price = round(float(current_price) * (1 + direction * self.limit_price_offset), 2)
-        tp_price = round(float(current_price) + direction * tp_mult * atr, 2)
-        trail_stop_price = round(float(current_price) - direction * trailing_mult * atr, 2)
-        if direction > 0:
-            trail_stop_price = max(trail_stop_price, current_price * 0.70)
-        else:
-            trail_stop_price = min(trail_stop_price, current_price * 1.35)
-        trail_stop_price = round(max(float(trail_stop_price), 0.01), 2)
-        tp_price = round(max(float(tp_price), 0.01), 2)
-        bracket_request = LimitOrderRequest(
+        position_intent = PositionIntent.BUY_TO_OPEN if direction > 0 else PositionIntent.SELL_TO_OPEN
+
+        entry_request = LimitOrderRequest(
             symbol=symbol,
-            qty=size,
+            qty=qty,
             side=side,
             time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
             limit_price=limit_price,
-            take_profit=TakeProfitRequest(limit_price=tp_price),
-            stop_loss=StopLossRequest(stop_price=trail_stop_price)
+            extended_hours=self.use_extended_hours,
+            position_intent=position_intent,
         )
+
         try:
-            response = self.client.submit_order(bracket_request)
-            logger.info(
-                f"Submitted bracket {'BUY' if direction > 0 else 'SELL'} {size} {symbol} @ limit {limit_price} | "
-                f"Regime: {regime} | Initial TP: {tp_price:.2f} | Initial Stop: {trail_stop_price:.2f} | "
-                f"BP after: ${self.get_buying_power():,.0f}"
+            response = self.client.submit_order(entry_request)
+            order_id = str(response.id)
+
+            # Register in tracker — exit orders will be submitted on fill via websocket
+            self.tracker.create_group(
+                symbol=symbol,
+                direction=direction,
+                entry_order_id=order_id,
+                regime=regime,
+                persistence=persistence,
+                extended_hours=self.use_extended_hours,
             )
+            # Temporarily store limit_price as entry_price for slippage measurement
+            group = self.tracker.groups[symbol]
+            group.entry_price = limit_price
+            self.tracker._save()
+
             self.last_entry_times[symbol] = datetime.now(tz=_UTC)
             self._save_last_entry_times()
-            # M-2 FIX: Force-refresh positions cache after successful order
             self.sync_existing_positions(force_refresh=True)
+
+            logger.info(
+                f"Entry submitted: {'BUY' if direction > 0 else 'SELL'} {qty} {symbol} @ limit {limit_price} | "
+                f"regime={regime} persist={persistence:.2f} | extended={self.use_extended_hours} | "
+                f"exits on fill via websocket"
+            )
             return response
         except Exception as e:
             err_str = str(e)
             if "40310100" in err_str or "pattern day trading" in err_str.lower():
-                logger.warning(f"PDT protection blocked trade for {symbol} — skipping")
+                logger.warning(f"PDT protection blocked trade for {symbol}")
             elif "40310000" in err_str or "insufficient buying power" in err_str.lower():
-                logger.error(f"Bracket order failed for {symbol}: insufficient buying power (even after clamp)")
+                logger.error(f"Entry failed for {symbol}: insufficient buying power")
             else:
-                logger.error(f"Bracket order failed for {symbol}: {e}")
+                logger.error(f"Entry failed for {symbol}: {e}")
             return None
 
-    # ====================== DYNAMIC HEARTBEAT ======================
+    # ====================== EXIT ORDERS (called by stream.py on entry fill) ======================
+    async def submit_exit_orders(self, symbol: str, group, fill_price: float, filled_qty: float):
+        """Submit trailing stop + limit TP as two independent orders (manual OCO via websocket)."""
+        direction = group.direction
+        regime = group.regime
+
+        # Fetch fresh data for ATR
+        atr = 0.01
+        if self.data_ingestion:
+            data = self.data_ingestion.get_latest_data(symbol)
+            if data is not None and len(data) >= 14:
+                atr = self._compute_current_atr(data)
+
+        trail_pct = self._get_trail_percent(fill_price, atr, regime)
+        tp_price = self._get_tp_price(fill_price, atr, regime, direction)
+
+        close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
+        position_intent = PositionIntent.SELL_TO_CLOSE if direction > 0 else PositionIntent.BUY_TO_CLOSE
+
+        # === 1. Trailing Stop (native Alpaca trailing) ===
+        trailing_stop_id = None
+        try:
+            trail_req = TrailingStopOrderRequest(
+                symbol=symbol,
+                qty=filled_qty,
+                side=close_side,
+                time_in_force=TimeInForce.GTC,
+                trail_percent=trail_pct,
+                extended_hours=self.use_extended_hours,
+                position_intent=position_intent,
+            )
+            trail_resp = await asyncio.to_thread(self.client.submit_order, trail_req)
+            trailing_stop_id = str(trail_resp.id)
+            logger.info(f"[EXIT] {symbol} trailing stop: {trail_pct}% trail | id={trailing_stop_id}")
+        except Exception as e:
+            logger.error(f"[EXIT] Failed to submit trailing stop for {symbol}: {e}")
+
+        # === 2. Take-Profit (limit order) ===
+        tp_order_id = None
+        try:
+            tp_req = LimitOrderRequest(
+                symbol=symbol,
+                qty=filled_qty,
+                side=close_side,
+                time_in_force=TimeInForce.GTC,
+                limit_price=tp_price,
+                extended_hours=self.use_extended_hours,
+                position_intent=position_intent,
+            )
+            tp_resp = await asyncio.to_thread(self.client.submit_order, tp_req)
+            tp_order_id = str(tp_resp.id)
+            logger.info(f"[EXIT] {symbol} take-profit: ${tp_price:.2f} | id={tp_order_id}")
+        except Exception as e:
+            logger.error(f"[EXIT] Failed to submit take-profit for {symbol}: {e}")
+
+        # Compute initial stop_price estimate for logging
+        stop_price_est = round(fill_price * (1 - direction * trail_pct / 100), 2)
+
+        # Update tracker
+        if trailing_stop_id and tp_order_id:
+            self.tracker.mark_entry_filled(
+                symbol=symbol,
+                fill_price=fill_price,
+                filled_qty=filled_qty,
+                trailing_stop_id=trailing_stop_id,
+                take_profit_id=tp_order_id,
+                trail_percent=trail_pct,
+                tp_price=tp_price,
+                stop_price=stop_price_est,
+            )
+        elif trailing_stop_id:
+            # At least we have a stop
+            self.tracker.mark_entry_filled(
+                symbol=symbol, fill_price=fill_price, filled_qty=filled_qty,
+                trailing_stop_id=trailing_stop_id, take_profit_id=tp_order_id or '',
+                trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_price_est,
+            )
+
+    # ====================== RATCHET VIA PATCH (ReplaceOrderRequest) ======================
+    def ratchet_trailing_stop(self, symbol: str, current_price: float, atr: float):
+        """Tighten trailing stop using ReplaceOrderRequest PATCH — no cancel/resubmit needed."""
+        group = self.tracker.groups.get(symbol)
+        if not group or group.state != GroupState.OPEN or not group.trailing_stop_id:
+            return
+
+        now = datetime.now(tz=_UTC)
+        last_ratchet = self.last_ratchet_time.get(symbol, _EPOCH)
+        elapsed = (now - last_ratchet).total_seconds()
+
+        regime = group.regime
+        persistence = group.persistence
+        direction = group.direction
+        entry_price = group.entry_price or current_price
+
+        # Skip losing positions
+        unrealized_pct = (current_price - entry_price) / entry_price * direction if entry_price else 0.0
+        if unrealized_pct <= 0:
+            return
+
+        # Regime-adaptive throttle
+        if regime == 'trending' and persistence >= 0.7:
+            min_interval = self.config.get('RATCHET_TRENDING_INTERVAL_SEC', 180)
+            regime_factor = self.config.get('RATCHET_REGIME_FACTOR_TRENDING', 0.65)
+        else:
+            min_interval = self.config.get('RATCHET_MEAN_REVERTING_INTERVAL_SEC', 540)
+            regime_factor = self.config.get('RATCHET_REGIME_FACTOR_MEAN_REVERTING', 1.35)
+
+        if elapsed < min_interval:
+            return
+
+        # Compute tighter trail percentage
+        profit_protection = max(
+            self.config.get('RATCHET_PROFIT_PROTECTION_MIN', 0.5),
+            min(1.0, 1.0 - unrealized_pct * self.config.get('RATCHET_PROFIT_PROTECTION_SLOPE', 3.0))
+        )
+        trailing_mult = (
+            self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
+            if regime == 'trending'
+            else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
+        )
+        distance = atr * trailing_mult * regime_factor * profit_protection
+        new_trail_pct = round(max(0.5, min(35.0, (distance / current_price) * 100)), 2)
+
+        # Only tighten (lower trail %), never widen
+        old_trail = group.trail_percent or 99.0
+        if new_trail_pct >= old_trail:
+            return
+
+        try:
+            replace_req = ReplaceOrderRequest(trail=new_trail_pct)
+            self.client.replace_order_by_id(group.trailing_stop_id, replace_req)
+            self.last_ratchet_time[symbol] = now
+            self.tracker.update_trail(symbol, new_trail_pct)
+            logger.info(
+                f"[RATCHET] {symbol} trail tightened {old_trail:.2f}% -> {new_trail_pct:.2f}% "
+                f"(profit={unrealized_pct*100:+.1f}%, regime={regime})"
+            )
+        except Exception as e:
+            logger.warning(f"[RATCHET] Failed PATCH for {symbol}: {e} — will retry next cycle")
+
+    # ====================== MONITOR LOOP ======================
     async def monitor_positions(self):
-        logger.info("=== MONITOR TASK STARTED - FULL DYNAMIC HEARTBEAT ENABLED ===")
+        """Heartbeat loop: ratchet trailing stops, re-attach missing exits, slippage adaptation."""
+        logger.info("=== MONITOR TASK STARTED — EVENT-DRIVEN ARCHITECTURE ===")
         while True:
-            self.sync_existing_positions() # M-2: uses cache unless expired
-            open_orders = []
-            positions = []
-            try:
-                open_orders = self.client.get_orders(GetOrdersRequest(status='open'))
-            except Exception as e:
-                logger.warning(f"Failed to fetch open orders: {e}")
-            try:
-                positions = self.client.get_all_positions()
-            except Exception as e:
-                logger.warning(f"Failed to fetch positions: {e}")
+            await asyncio.to_thread(self.sync_existing_positions)
+
             pos_count = len(self.existing_positions)
-            bracket_count = len([o for o in open_orders if o.order_class == OrderClass.BRACKET])
+            tracked = len(self.tracker.get_open_groups())
             heartbeat_msg = (
-                f"[{datetime.now().strftime('%H:%M:%S')}] Monitor heartbeat — "
-                f"{pos_count} open positions | {bracket_count} open brackets | "
+                f"[{datetime.now().strftime('%H:%M:%S')}] Monitor — "
+                f"{pos_count} positions | {tracked} tracked groups | "
                 f"market {'open' if is_market_open() else 'closed'}"
             )
             print(heartbeat_msg)
             logger.info(heartbeat_msg)
-            # Detailed per-position status
-            if pos_count > 0:
-                now = datetime.now(tz=_UTC)
-                for sym, qty in self.existing_positions.items():
+
+            # === Per-position logic ===
+            try:
+                for sym, qty in list(self.existing_positions.items()):
+                    if qty == 0 or self.data_ingestion is None:
+                        continue
+                    data = self.data_ingestion.get_latest_data(sym)
+                    if data is None or len(data) < 50:
+                        continue
+
                     direction = 1 if qty > 0 else -1
+                    current_price = float(data['close'].iloc[-1])
+                    atr = self._compute_current_atr(data)
+
+                    # Log position status
                     last_entry = self.last_entry_times.get(sym)
-                    bars_held = ((now - last_entry) / timedelta(minutes=15)) if last_entry else 9999
-                    if sym in self.regime_cache:
-                        value = self.regime_cache[sym]
-                        regime = value[0] if isinstance(value, (list, tuple)) else value
-                    else:
-                        regime = 'mean_reverting'
+                    bars_held = ((datetime.now(tz=_UTC) - last_entry) / timedelta(minutes=15)) if last_entry else 9999
+                    regime, persistence = self._get_regime(sym, data)
                     min_hold = (
                         self.config.get('MIN_HOLD_BARS_TRENDING', 48)
                         if regime == 'trending'
                         else self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
                     )
                     logger.info(
-                        f" {sym} | {'LONG' if direction > 0 else 'SHORT'} {abs(qty):.1f} shares | "
+                        f"  {sym} | {'LONG' if direction > 0 else 'SHORT'} {abs(qty):.2f} | "
                         f"held {int(bars_held)} bars (min {min_hold}) | regime={regime}"
                     )
-            # === DYNAMIC LOGIC ===
-            try:
-                filled_orders = [
-                    o for o in open_orders
-                    if o.filled_at is not None
-                    and (datetime.now(tz=_UTC) - o.filled_at).total_seconds() < 3600
-                ]
-                slippage_total = 0.0
-                fill_count = 0
-                for o in filled_orders:
-                    if o.filled_avg_price and o.limit_price:
-                        filled_price = float(o.filled_avg_price)
-                        limit_price = float(o.limit_price)
-                        slippage = abs(filled_price - limit_price) / limit_price
-                        slippage_total += slippage
-                        fill_count += 1
-                if fill_count > 0:
-                    avg_slippage = slippage_total / fill_count
-                    new_offset = max(0.001, avg_slippage * 2 + 0.001)
-                    if abs(new_offset - self.limit_price_offset) > 0.0005:
-                        old_offset = self.limit_price_offset
-                        self.limit_price_offset = new_offset
-                        logger.info(
-                            f"Adjusted limit_price_offset {old_offset:.4f} → {new_offset:.4f} "
-                            f"(avg slippage {avg_slippage:.4f})"
-                        )
-                for pos in positions:
-                    qty = float(pos.qty)
-                    if qty == 0:
-                        continue
-                    symbol = pos.symbol
-                    direction = 1 if pos.side == PositionSide.LONG else -1
-                    try:
-                        if self.data_ingestion is None:
-                            continue
-                        data = self.data_ingestion.get_latest_data(symbol)
-                        if len(data) < 50:
-                            continue
-                        current_price = float(data['close'].iloc[-1])
-                        entry_price = float(pos.avg_entry_price)
-                        if symbol in self.regime_cache:
-                            value = self.regime_cache[symbol]
-                            regime = value[0] if isinstance(value, (list, tuple)) else value
-                            persistence = (
-                                value[1]
-                                if isinstance(value, (list, tuple)) and len(value) == 2
-                                else 0.5
-                            )
-                        else:
-                            regime = 'trending'
-                            persistence = 0.5
-                        atr = self._compute_current_atr(data)
-                        trailing_mult = (
-                            self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
-                            if regime == 'trending'
-                            else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
-                        )
-                        tp_mult = (
-                            self.config.get('TAKE_PROFIT_ATR_TRENDING', self.config.get('TAKE_PROFIT_ATR', 30.0) * 1.2)
-                            if regime == 'trending'
-                            else self.config.get('TAKE_PROFIT_ATR_MEAN_REVERTING', self.config.get('TAKE_PROFIT_ATR', 12.0))
-                        )
-                        in_min_hold = False
-                        last_entry = self.last_entry_times.get(symbol)
-                        if last_entry:
-                            bars_held = (datetime.now(tz=_UTC) - last_entry) / timedelta(minutes=15)
-                            min_hold = (
-                                self.config.get('MIN_HOLD_BARS_TRENDING', 48)
-                                if regime == 'trending'
-                                else self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
-                            )
-                            if bars_held < min_hold:
-                                in_min_hold = True
-                                logger.info(
-                                    f"MIN-HOLD ACTIVE {symbol} ({regime}) | "
-                                    f"bars_held={int(bars_held)} < {min_hold} → re-attach suppressed, ratchet active"
-                                )
-                        # ==================== M-5 PROPER TRAILING SL: CANCEL + RE-SUBMIT BRACKET ====================
-                        now = datetime.now(tz=_UTC)
-                        last_ratchet = self.last_ratchet_time.get(symbol, _EPOCH)
-                        elapsed_since_ratchet = (now - last_ratchet).total_seconds()
-                        # Compute candidate new_stop
-                        unrealized_pct = (
-                            (current_price - entry_price) / entry_price * direction
-                            if entry_price != 0 else 0.0
-                        )
-                        # Option 1: Clamp profit_protection so losing positions NEVER widen stop
-                        profit_protection = max(
-                            self.config.get('RATCHET_PROFIT_PROTECTION_MIN', 0.5),
-                            min(1.0, 1.0 - unrealized_pct * self.config.get('RATCHET_PROFIT_PROTECTION_SLOPE', 3.0))
-                        )
-                        if regime == 'trending' and persistence >= 0.7:
-                            min_interval_sec = self.config.get('RATCHET_TRENDING_INTERVAL_SEC', 180)
-                            regime_factor = self.config.get('RATCHET_REGIME_FACTOR_TRENDING', 0.65)
-                            min_atr_move = self.config.get('RATCHET_TRENDING_MIN_ATR_MOVE', 0.4)
-                        else:
-                            min_interval_sec = self.config.get('RATCHET_MEAN_REVERTING_INTERVAL_SEC', 540)
-                            regime_factor = self.config.get('RATCHET_REGIME_FACTOR_MEAN_REVERTING', 1.35)
-                            min_atr_move = self.config.get('RATCHET_MEAN_REVERTING_MIN_ATR_MOVE', 0.8)
-                        distance = atr * trailing_mult * regime_factor * profit_protection
-                        new_stop = current_price - direction * distance
-                        if direction > 0:
-                            new_stop = max(new_stop, current_price * 0.65)
-                        else:
-                            new_stop = min(new_stop, current_price * 1.35)
-                        new_stop = round(max(new_stop, 0.01), 2)
-                        logger.debug(
-                            f"[RATCHET DEBUG] {symbol} | unrealized={unrealized_pct*100:+.2f}% | "
-                            f"profit_protection={profit_protection:.3f} | distance={distance:.4f} | "
-                            f"new_stop={new_stop:.2f} | throttle={elapsed_since_ratchet:.0f}s/{min_interval_sec}s"
-                        )
-                        throttle_passed = elapsed_since_ratchet >= min_interval_sec
-                        if throttle_passed and is_market_open():
-                            bracket_orders = [
-                                o for o in open_orders
-                                if o.symbol == symbol and o.order_class == OrderClass.BRACKET
-                            ]
-                            if bracket_orders:
-                                bracket_order = bracket_orders[0]
-                                # Step 1: Cancel all children first (stop-loss / take-profit)
-                                symbol_orders = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
-                                child_ids = []
-                                for child in symbol_orders:
-                                    if child.parent_order_id == bracket_order.id:
-                                        try:
-                                            self.client.cancel_order_by_id(child.id)
-                                            child_ids.append(child.id)
-                                            logger.debug(f"[RATCHET CANCEL CHILD] {child.id} ({child.side}) for {symbol}")
-                                        except Exception as cancel_err:
-                                            logger.warning(f"Failed to cancel child {child.id} for ratchet: {cancel_err}")
-                                # Wait for children to be cancelled
-                                if child_ids:
-                                    for wait_attempt in range(self.ratchet_cancel_timeout_sec):
-                                        await asyncio.sleep(1.0)
-                                        remaining = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
-                                        still_open_ids = [o.id for o in remaining if o.id in child_ids]
-                                        if not still_open_ids:
-                                            logger.debug(f"[RATCHET] All children cancelled for {symbol} after {wait_attempt+1}s")
-                                            break
-                                    else:
-                                        logger.warning(f"[RATCHET TIMEOUT] Children not cleared for {symbol} after {self.ratchet_cancel_timeout_sec}s — skipping ratchet")
-                                        continue
-                                # Step 2: Cancel parent bracket
-                                try:
-                                    self.client.cancel_order_by_id(bracket_order.id)
-                                    logger.debug(f"[RATCHET CANCEL PARENT] {bracket_order.id} for {symbol}")
-                                    await asyncio.sleep(1.0)  # brief safety pause
-                                except Exception as parent_err:
-                                    logger.warning(f"Failed to cancel parent bracket {bracket_order.id}: {parent_err}")
-                                    continue
-                                # Step 3: Re-submit new bracket with updated stop
-                                new_order = self.place_bracket_order(
-                                    symbol=symbol,
-                                    size=abs(qty),
-                                    current_price=current_price,
-                                    data=data,
-                                    direction=direction
-                                )
-                                if new_order:
-                                    self.last_ratchet_time[symbol] = now
-                                    logger.info(
-                                        f"[RATCHET SUCCESS] {symbol} ratcheted via cancel/re-submit → "
-                                        f"new stop ~{new_stop:.2f} (profit={unrealized_pct*100:+.1f}%, regime={regime}, persistence={persistence:.3f})"
-                                    )
-                                else:
-                                    logger.error(f"[RATCHET FAIL] Re-submit failed for {symbol} — stop not updated")
-                            else:
-                                logger.debug(f"[RATCHET] {symbol} has no active bracket — skipping ratchet")
-                        elif not throttle_passed:
-                            logger.debug(f"[RATCHET] {symbol} throttled — waiting {min_interval_sec - elapsed_since_ratchet:.0f}s")
-                        # ==================== C-1 FIX: bracket_orders is now always defined ====================
-                        # Define bracket_orders here so the re-attach logic below never raises NameError
-                        bracket_orders = [
-                            o for o in open_orders
-                            if o.symbol == symbol and o.order_class == OrderClass.BRACKET
-                        ]
-                        # Re-attach logic
-                        if not bracket_orders and is_market_open():
-                            if in_min_hold:
-                                logger.info(
-                                    f"MIN-HOLD ACTIVE {symbol} — bracket missing but suppressing "
-                                    f"re-attach until hold expires"
-                                )
-                                continue
-                            logger.info(
-                                f"Auto-re-attaching bracket for {symbol} ({regime}) "
-                                f"— bracket was cancelled or missing"
-                            )
-                            size = abs(qty)
-                            available_bp = self.get_buying_power()
-                            notional = size * current_price
-                            # M-5 FIX: Apply buying power cap also on re-attach
-                            safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
-                            max_allowed_notional = available_bp * safety_factor
-                            if notional > max_allowed_notional and available_bp > 1000:
-                                new_size = int(max_allowed_notional / current_price)
-                                logger.warning(
-                                    f"[M-5 BUYING POWER CAP on re-attach] {symbol}: requested {size} shares → reduced to {new_size} "
-                                    f"(buying_power=${available_bp:,.0f}, safety_factor={safety_factor})"
-                                )
-                                size = max(new_size, 1)
-                            order = self.place_bracket_order(
-                                symbol=symbol,
-                                size=size,
-                                current_price=current_price,
-                                data=data,
-                                direction=direction
-                            )
-                            if order:
-                                logger.info(f"Successfully re-attached bracket for {symbol}")
-                            # M-2 FIX: Force-refresh cache after re-attach
-                            self.sync_existing_positions(force_refresh=True)
-                            continue
-                    except Exception as e:
-                        logger.warning(f"Monitor update failed for {symbol}: {e}")
+
+                    # === Ratchet trailing stop via PATCH ===
+                    if is_market_open():
+                        await asyncio.to_thread(self.ratchet_trailing_stop, sym, current_price, atr)
+
+                    # === Re-attach missing exits for untracked positions ===
+                    group = self.tracker.groups.get(sym)
+                    if not group or group.state == GroupState.CLOSED:
+                        # Position exists but no tracker group — re-attach protective orders
+                        if is_market_open() and bars_held >= min_hold:
+                            await self._reattach_exits(sym, qty, direction, current_price, atr, regime)
+
             except Exception as e:
-                logger.error(f"Monitor loop inner error (continuing): {e}", exc_info=True)
-            # ==================== NEW: REWARD PUSH FOR CLOSED POSITIONS ====================
-            current_symbols = set(self.existing_positions.keys())
-            for sym in list(self.last_entry_times.keys()):
-                if sym not in current_symbols:
-                    history = self.bot.live_signal_history.get(sym, []) if hasattr(self, 'bot') else []
-                    if history:
-                        last_entry = history[-1]
-                        if last_entry.get('realized_return') is None:
-                            current_price = self.bot.latest_prices.get(sym) if hasattr(self, 'bot') and hasattr(self.bot, 'latest_prices') else None
-                            if current_price is None:
-                                data = self.data_ingestion.get_latest_data(sym) if self.data_ingestion else None
-                                current_price = float(data['close'].iloc[-1]) if data is not None and len(data) > 0 else last_entry['price']
-                            ret = (current_price - last_entry['price']) / last_entry['price'] * last_entry['direction']
-                            last_entry['realized_return'] = ret
-                            causal_manager = self.bot.signal_gen.portfolio_causal_manager if hasattr(self, 'bot') and hasattr(self.bot.signal_gen, 'portfolio_causal_manager') else None
-                            if causal_manager:
-                                stored_obs = last_entry.get('obs')
-                                if stored_obs:
-                                    obs = np.array(stored_obs, dtype=np.float32).reshape(1, -1)
-                                    action = last_entry['direction'] * last_entry['confidence']
-                                    causal_manager.add_transition(obs, action, ret)
-                                    logger.info(f"[CAUSAL PUSH] Closed {sym} | realized={ret:+.4f} pushed to buffer")
-                                    causal_manager.save_buffer()
-                                else:
-                                    logger.warning(f"[CAUSAL PUSH] No stored obs for closed {sym} — skipping transition")
-                            del self.last_entry_times[sym]
-                            self._save_last_entry_times()
+                logger.error(f"Monitor per-position error: {e}", exc_info=True)
+
+            # === Slippage adaptation from recent fills ===
+            await asyncio.to_thread(self._adapt_slippage)
+
             await asyncio.sleep(self.config.get('MONITOR_INTERVAL', 60))
+
+    async def _reattach_exits(self, symbol: str, qty: float, direction: int,
+                              current_price: float, atr: float, regime: str):
+        """Re-attach trailing stop + TP for orphaned positions (no tracker group)."""
+        logger.info(f"[REATTACH] Creating protective orders for orphaned position {symbol}")
+
+        trail_pct = self._get_trail_percent(current_price, atr, regime)
+        tp_price = self._get_tp_price(current_price, atr, regime, direction)
+        close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
+        position_intent = PositionIntent.SELL_TO_CLOSE if direction > 0 else PositionIntent.BUY_TO_CLOSE
+        abs_qty = abs(qty)
+
+        trailing_stop_id = None
+        tp_order_id = None
+
+        try:
+            trail_req = TrailingStopOrderRequest(
+                symbol=symbol, qty=abs_qty, side=close_side,
+                time_in_force=TimeInForce.GTC, trail_percent=trail_pct,
+                extended_hours=self.use_extended_hours, position_intent=position_intent,
+            )
+            resp = await asyncio.to_thread(self.client.submit_order, trail_req)
+            trailing_stop_id = str(resp.id)
+            logger.info(f"[REATTACH] {symbol} trailing stop @ {trail_pct}%")
+        except Exception as e:
+            logger.error(f"[REATTACH] Failed trailing stop for {symbol}: {e}")
+
+        try:
+            tp_req = LimitOrderRequest(
+                symbol=symbol, qty=abs_qty, side=close_side,
+                time_in_force=TimeInForce.GTC, limit_price=tp_price,
+                extended_hours=self.use_extended_hours, position_intent=position_intent,
+            )
+            resp = await asyncio.to_thread(self.client.submit_order, tp_req)
+            tp_order_id = str(resp.id)
+            logger.info(f"[REATTACH] {symbol} take-profit @ ${tp_price:.2f}")
+        except Exception as e:
+            logger.error(f"[REATTACH] Failed take-profit for {symbol}: {e}")
+
+        # Create a recovery tracker group
+        if trailing_stop_id or tp_order_id:
+            entry_id = f"reattach_{symbol}_{datetime.now(tz=_UTC).strftime('%Y%m%d%H%M%S')}"
+            self.tracker.create_group(symbol, direction, entry_id, regime=regime)
+            stop_est = round(current_price * (1 - direction * trail_pct / 100), 2)
+            self.tracker.mark_entry_filled(
+                symbol=symbol, fill_price=current_price, filled_qty=abs_qty,
+                trailing_stop_id=trailing_stop_id or '', take_profit_id=tp_order_id or '',
+                trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
+            )
+
+    def _adapt_slippage(self):
+        """Adapt limit_price_offset based on recent fill slippage."""
+        try:
+            recent_closed = self.client.get_orders(GetOrdersRequest(
+                status='closed',
+                after=datetime.now(tz=_UTC) - timedelta(hours=1)
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to fetch recent orders for slippage adaptation: {e}")
+            return
+        slippage_total = 0.0
+        fill_count = 0
+        for o in recent_closed:
+            if o.filled_at and o.filled_avg_price and o.limit_price:
+                if (datetime.now(tz=_UTC) - o.filled_at).total_seconds() < 3600:
+                    slippage = abs(float(o.filled_avg_price) - float(o.limit_price)) / float(o.limit_price)
+                    slippage_total += slippage
+                    fill_count += 1
+        if fill_count > 0:
+            avg_slippage = slippage_total / fill_count
+            new_offset = max(0.001, avg_slippage * 2 + 0.001)
+            if abs(new_offset - self.limit_price_offset) > 0.0005:
+                old = self.limit_price_offset
+                self.limit_price_offset = new_offset
+                logger.info(f"Slippage adaptation: offset {old:.4f} -> {new_offset:.4f} (avg={avg_slippage:.4f})")
 
     # ====================== SAFE POSITION CLOSE ======================
     async def close_position_safely(self, symbol: str) -> bool:
-        """Safely close a position by first cancelling any active bracket orders,
-        then waiting for Alpaca to process the cancels before closing.
-        Fixes 'insufficient qty available' (held_for_orders) caused by firing
-        close_position immediately after cancel requests (async race condition).
-        CRIT-13 FIX: Made async + await sleeps to prevent event-loop blocking.
-        M-2 FIX: Force-refresh positions cache after successful close"""
+        """Cancel all open orders for symbol, then close position."""
         try:
-            all_open = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
+            all_open = await asyncio.to_thread(
+                self.client.get_orders, GetOrdersRequest(status='open', symbols=[symbol]))
             cancelled_ids = []
             for o in all_open:
                 try:
-                    logger.info(f"===== PATCHED CANCEL_BY_ID EXECUTING for close {symbol} (order_id={o.id}) =====")
-                    self.client.cancel_order_by_id(order_id=o.id)
+                    await asyncio.to_thread(self.client.cancel_order_by_id, o.id)
                     cancelled_ids.append(o.id)
-                    logger.info(
-                        f"[CLOSE PREP] Cancelled order {o.id} ({_order_type_str(o)}) "
-                        f"for {symbol} before flattening"
-                    )
+                    logger.info(f"[CLOSE PREP] Cancelled {o.id} ({_order_type_str(o)}) for {symbol}")
                 except Exception as cancel_e:
                     logger.warning(f"Failed to cancel order {o.id} for {symbol}: {cancel_e}")
+
             if cancelled_ids:
-                max_attempts = 5
-                for attempt in range(max_attempts):
+                for attempt in range(5):
                     await asyncio.sleep(1.0)
-                    still_open = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
+                    still_open = await asyncio.to_thread(
+                        self.client.get_orders, GetOrdersRequest(status='open', symbols=[symbol]))
                     if not still_open:
-                        logger.info(f"[CLOSE PREP] All orders cleared for {symbol} — proceeding to close")
                         break
-                    logger.info(
-                        f"[CLOSE PREP] {len(still_open)} orders still open for {symbol} "
-                        f"(attempt {attempt + 1}/{max_attempts}) — waiting..."
-                    )
                 else:
-                    logger.warning(
-                        f"[CLOSE PREP] Orders for {symbol} may not be fully cancelled after "
-                        f"{max_attempts} attempts — proceeding anyway"
-                    )
-            self.client.close_position(symbol)
-            logger.info(f"✅ Successfully closed position in {symbol} (flat signal)")
-            if symbol in self.last_entry_times:
-                del self.last_entry_times[symbol]
-                self._save_last_entry_times()
-            # M-2 FIX: Force-refresh positions cache after successful close
+                    logger.warning(f"[CLOSE PREP] Orders may not be fully cancelled for {symbol}")
+
+            await asyncio.to_thread(self.client.close_position, symbol)
+            logger.info(f"Closed position in {symbol}")
+
+            # Clean up tracker and entry times
+            self.tracker.remove_group(symbol)
+            self.last_entry_times.pop(symbol, None)
+            self._save_last_entry_times()
             self.sync_existing_positions(force_refresh=True)
             return True
         except Exception as e:
-            logger.error(f"Failed to safely close position in {symbol}: {e}")
+            logger.error(f"Failed to close position in {symbol}: {e}")
             return False

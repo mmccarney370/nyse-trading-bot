@@ -86,21 +86,23 @@ def _fetch_macro_features() -> dict:
     except Exception:
         tnx_yield = 4.0
     try:
-        vix_front = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
+        # FIX: Reuse vix_close from above instead of making a duplicate API call
+        vix_front = vix_close
         vix_back = yf.Ticker("VXZ").history(period="1d")['Close'].iloc[-1]
         vix_contango = (vix_back / vix_front) - 1
-    except:
+    except Exception:
         vix_contango = 0.0
     try:
-        tnx = yf.Ticker("^TNX").history(period="1d")['Close'].iloc[-1] / 100
+        # FIX: Reuse tnx_yield from above instead of re-fetching ^TNX
+        tnx = tnx_yield
         twoy = yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
         yield_spread = tnx - twoy
-    except:
+    except Exception:
         yield_spread = 0.0
     try:
         spx = yf.Ticker("^GSPC").history(period="5d")['Close']
         spx_mom = (spx.iloc[-1] / spx.iloc[-5]) - 1 if len(spx) >= 5 else 0.0
-    except:
+    except Exception:
         spx_mom = 0.0
     _macro_cache.update({
         'date': today,
@@ -124,7 +126,7 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
             if np.allclose(cached.values, 0.0, atol=1e-6):
                 os.remove(cache_path)
                 logger.info(f"[TFT CACHE CLEANUP] Deleted zero-filled cache for {symbol} — forcing fresh precompute")
-        except:
+        except Exception:
             pass
    
     # === CLEANUP: Delete old/out-of-date cache files ===
@@ -167,7 +169,7 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
         df = full_df.copy().tail(MAX_TFT_CACHE_ROWS * 2)
         # === STRONGER CLEANING TO PREVENT COLLAPSE ===
         df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        df = df.ffill().bfill().fillna(0)
         df['volume'] = df['volume'].clip(lower=1)
         df['close'] = df['close'].clip(lower=0.01)
         logger.debug(f"[TFT INPUT DEBUG] {symbol} | rows={len(df)} | close_mean={df['close'].mean():.2f} | vol_mean={df['volume'].mean():.0f} | NaN after clean={df.isna().sum().sum()}")
@@ -175,9 +177,10 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
         df['time_idx'] = np.arange(len(df))
         df['symbol'] = 'stock'
         max_encoder_length = min(200, len(df) // 2)
-        max_prediction_length = len(df) - max_encoder_length
+        max_prediction_length = 24  # ~1 trading day of 15min bars; kept small for stable TFT windowing
+        training_cutoff = len(df) - max_prediction_length
         training = TimeSeriesDataSet(
-            df.iloc[:max_encoder_length + max_prediction_length // 2],
+            df.iloc[:training_cutoff],
             time_idx="time_idx",
             target="close",
             group_ids=["symbol"],
@@ -304,12 +307,12 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     min_liquidity = CONFIG.get('MIN_LIQUIDITY', 100000) / 10
     if avg_volume < min_liquidity:
         logger.warning(f"[FEATURES LOW VOLUME] {symbol} — avg_volume={avg_volume:.0f} < {min_liquidity:.0f} — continuing anyway (not skipping)")
-    close_changes = data['close'].pct_change(fill_method=None).fillna(0.0)
+    close_changes = data['close'].pct_change().fillna(0.0)
     recent_vol_series = close_changes.tail(100)
     recent_vol = recent_vol_series.std(ddof=0)
     if np.isnan(recent_vol) or recent_vol <= 0:
         recent_vol = 1e-6
-    vol_changes = data['volume'].pct_change(fill_method=None).fillna(0.0)
+    vol_changes = data['volume'].pct_change().fillna(0.0)
     recent_vol_vol_series = vol_changes.tail(100)
     recent_vol_vol = recent_vol_vol_series.std(ddof=0)
     if np.isnan(recent_vol_vol) or recent_vol_vol <= 0:
@@ -322,8 +325,9 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     bb_lband_ind = (data['close'] - bb_lband) / bb_std
     delta = data['close'].diff()
     up = delta.clip(lower=0).rolling(14).mean()
-    down = -delta.clip(upper=0).rolling(14).mean() + 1e-8
-    rs = up / down
+    # FIX: Add epsilon only in division, not to the rolling mean (was biasing RSI downward)
+    down = -delta.clip(upper=0).rolling(14).mean()
+    rs = up / (down + 1e-8)
     rsi = 100 - (100 / (1 + rs)).fillna(50.0)
     ema12 = data['close'].ewm(span=12, adjust=False).mean()
     ema26 = data['close'].ewm(span=26, adjust=False).mean()
@@ -338,7 +342,8 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     typical_price = (data['high'] + data['low'] + data['close']) / 3
     tp_sma = typical_price.rolling(20).mean()
     mad = typical_price.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    cci = (typical_price - tp_sma) / (0.015 * mad.replace(0, 1e28))
+    # FIX: Was replace(0, 1e28) which made CCI vanish when MAD=0. Use small epsilon instead.
+    cci = (typical_price - tp_sma) / (0.015 * mad.replace(0, 1e-8))
     obv = (np.sign(data['close'].diff()) * data['volume']).cumsum()
     obv_z = (obv - obv.rolling(50).mean()) / (obv.rolling(50).std(ddof=0) + 1e-8)
     obv_z = obv_z.fillna(0.0)
@@ -367,8 +372,9 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     imbalance = (up_vol - down_vol).rolling(20).sum() / data['volume'].rolling(20).sum().replace(0, 1e-8)
     price_high = data['close'].rolling(20).max()
     rsi_high = rsi.rolling(20).max()
-    bear_div = (price_high > price_high.shift(1)) & (rsi_high < rsi_high.shift(1)).astype(float)
-    bull_div = (price_high < price_high.shift(1)) & (rsi_high > rsi_high.shift(1)).astype(float)
+    # FIX: Operator precedence — .astype(float) was binding only to the second operand
+    bear_div = ((price_high > price_high.shift(1)) & (rsi_high < rsi_high.shift(1))).astype(float)
+    bull_div = ((price_high < price_high.shift(1)) & (rsi_high > rsi_high.shift(1))).astype(float)
     try:
         vol_q = pd.qcut(data['volume'], q=10, duplicates='drop')
         vol_probs = vol_q.value_counts(normalize=True).values
@@ -389,7 +395,7 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     tft_features = np.zeros((len(data), 20))
     if CONFIG.get('USE_TFT_ENCODER', False) and full_hist_df is not None:
         cached_df = _precompute_and_cache_tft(symbol, full_hist_df)
-        aligned = cached_df.reindex(data.index, method='nearest')
+        aligned = cached_df.reindex(data.index).ffill().bfill()
         aligned = aligned.ffill().bfill()
         if aligned.isna().any().any():
             logger.debug(f"TFT cache misalignment for {symbol} — using neutral features")
@@ -408,22 +414,25 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     if np.isnan(recent_vol) or recent_vol <= 0:
         recent_vol = 1e-6
     annual_vol = recent_vol * np.sqrt(252 * 96)
+    # FIX: RSI, MACD, CCI, Stochastic are in indicator-space (0-100 or unbounded),
+    # NOT in return-space. Dividing by recent_vol (~0.005) saturates them at clip limits.
+    # Use dimensionally appropriate normalization instead.
     features = np.column_stack([
         bb_hband_ind.fillna(0.0),
         bb_lband_ind.fillna(0.0),
-        (rsi - 50) / recent_vol,
-        macd_line / recent_vol,
-        macd_signal / recent_vol,
-        macd_diff / recent_vol,
-        atr / recent_vol,
-        close_changes / recent_vol,
+        (rsi - 50) / 50.0,                             # RSI: normalize to [-1, 1]
+        macd_line / (data['close'] * recent_vol + 1e-8),  # MACD: normalize by price * vol
+        macd_signal / (data['close'] * recent_vol + 1e-8),
+        macd_diff / (data['close'] * recent_vol + 1e-8),
+        atr / (data['close'] * recent_vol + 1e-8),     # ATR: normalize by price * vol
+        close_changes / recent_vol,                      # Returns: already in vol-space (correct)
         vol_changes / recent_vol_vol,
         np.full(len(data), 1.0 if regime == 'trending' else 0.0),
-        cci / recent_vol,
+        cci / 200.0,                                     # CCI: typical range [-200, 200]
         obv_z,
         chaikin_vol,
-        (stoch_k - 50) / recent_vol,
-        (stoch_d - 50) / recent_vol,
+        (stoch_k - 50) / 50.0,                          # Stochastic: normalize to [-1, 1]
+        (stoch_d - 50) / 50.0,
         ret_1,
         ret_4,
         ret_26,

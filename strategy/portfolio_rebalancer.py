@@ -7,7 +7,7 @@ Returns normalized target_weights_dict for order execution
 import logging
 import numpy as np
 from typing import Dict, Any
-from datetime import datetime                  # ← BUG-05 FIX: added for datetime.now()
+from datetime import datetime, timedelta       # ← BUG-05 FIX: added for datetime.now()
 from dateutil import tz                        # ← BUG-05 FIX: added for tz.gettz('UTC')
 from models.portfolio_env import PortfolioEnv # ISSUE #6: import for persistent env
 
@@ -98,15 +98,19 @@ class PortfolioRebalancer:
         # ==================== CRIT-11 FIX: CAUSAL PENALTY (now BEFORE final renorm) ====================
         if hasattr(self.signal_gen, 'portfolio_causal_manager') and self.signal_gen.portfolio_causal_manager is not None:
             try:
-                # ISSUE #6 FIX: Pass the real normalized observation (already computed above)
-                scaled_action, _ = self.signal_gen.portfolio_causal_manager.predict(
-                    obs, # ← REAL obs from persistent PortfolioEnv
-                    deterministic=True
-                )
-                scaled_action = scaled_action.flatten()
+                # FIX: Use causal as a MULTIPLICATIVE adjustment, not a full replacement
+                # This preserves the CVaR-optimized weights while applying causal penalty/boost
                 for i, sym in enumerate(symbols):
-                    target_weights_dict[sym] = float(scaled_action[i])
-                logger.info(f"✅ [CAUSAL FINAL SCALING] Applied after CVaR & sentiment — causal penalty is now final")
+                    penalty_factor = self.signal_gen.portfolio_causal_manager.compute_penalty_factor(
+                        obs.reshape(1, -1) if hasattr(obs, 'reshape') else obs,
+                        target_weights_dict.get(sym, 0.0)
+                    )
+                    old_weight = target_weights_dict[sym]
+                    target_weights_dict[sym] *= penalty_factor
+                    if penalty_factor != 1.0:
+                        logger.debug(f"[CAUSAL ADJUST] {sym}: {old_weight:.4f} * {penalty_factor:.4f} = {target_weights_dict[sym]:.4f}")
+                logger.info(f"[CAUSAL FINAL SCALING] Applied as multiplicative adjustment to CVaR weights")
+                # Renormalize after causal adjustment
                 total_abs_weight_causal = sum(abs(v) for v in target_weights_dict.values())
                 if total_abs_weight_causal > 0:
                     scale_causal = 1.0 / total_abs_weight_causal
@@ -120,7 +124,7 @@ class PortfolioRebalancer:
             for sym in symbols:
                 last_entry = self.signal_gen.broker.last_entry_times.get(sym)
                 if last_entry:
-                    bars_since = (datetime.now(tz=tz.gettz('UTC')) - last_entry) / pd.Timedelta(minutes=15)
+                    bars_since = (datetime.now(tz=tz.gettz('UTC')) - last_entry) / timedelta(minutes=15)
                     regime = regimes.get(sym, 'mean_reverting')
                     regime_name = regime[0] if isinstance(regime, (list, tuple)) else regime
                     if regime_name == 'trending':
@@ -131,6 +135,9 @@ class PortfolioRebalancer:
                         current_weight = target_weights_dict.get(sym, 0.0)
                         if current_weight != 0:  # only log if we tried to change
                             logger.debug(f"MIN-HOLD ACTIVE {sym} (portfolio) → skipping rebalance (Gemini-tuned {min_hold} bars)")
-                        target_weights_dict[sym] = positions.get(sym, 0) / (current_equity / prices.get(sym, 1))  # keep existing position
+                        sym_price = prices.get(sym)
+                        if sym_price and sym_price > 0:
+                            target_weights_dict[sym] = positions.get(sym, 0) * sym_price / current_equity
+                        # else: keep current target weight (no price to compute position weight)
         # Return final normalized weights (ready for min-hold / order placement in bot.py)
         return target_weights_dict

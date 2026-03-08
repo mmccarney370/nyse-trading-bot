@@ -4,13 +4,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import os
 import joblib
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor
-from typing import Optional, Dict, Any, List, Type, Callable
+from typing import Optional
 import gymnasium as gym # Critical import for type hints
 import logging
 from config import CONFIG
@@ -44,9 +42,9 @@ class NaNStopCallback(BaseCallback):
         return True
 
 def cosine_annealing_schedule(progress_remaining: float) -> float:
-    initial_lr = 3e-4
-    min_lr = 1e-6
-    return min_lr + 0.5 * (initial_lr - min_lr) * (1 + np.cos(np.pi * progress_remaining))
+    initial_lr = CONFIG.get('PPO_LEARNING_RATE', 3e-4)
+    min_lr = CONFIG.get('PPO_LEARNING_RATE_MIN', 1e-6)
+    return min_lr + 0.5 * (initial_lr - min_lr) * (1 + np.cos(np.pi * (1 - progress_remaining)))
 
 def save_ppo_model(trainer, key: str):
     """
@@ -105,8 +103,8 @@ def load_ppo_model(trainer, key: str):
         import zipfile
         with zipfile.ZipFile(ppo_path, 'r') as zf:
             if 'policy.pth' in zf.namelist():
-                # Rough heuristic: check if 'lstm' or 'recurrent' appears in policy file names or metadata
-                is_recurrent_hint = any('lstm' in name.lower() or 'recurrent' in name.lower() for name in zf.namelist())
+                # Rough heuristic: check if 'lstm', 'recurrent', or 'gtrxl' appears in policy file names or metadata
+                is_recurrent_hint = any('lstm' in name.lower() or 'recurrent' in name.lower() or 'gtrxl' in name.lower() for name in zf.namelist())
             else:
                 is_recurrent_hint = False
 
@@ -166,7 +164,8 @@ def train_ppo(trainer, symbol: str, data: pd.DataFrame, incremental: bool = Fals
         else:
             incremental = False # ← FIXED: Set incremental=False BEFORE setting LR schedule
     # Now set LR schedule based on final incremental decision
-    lr_schedule = cosine_annealing_schedule if not incremental else lambda _: 1e-5 # Fixed low LR for online updates
+    online_lr = CONFIG.get('PPO_ONLINE_LEARNING_RATE', 5e-5)
+    lr_schedule = cosine_annealing_schedule if not incremental else lambda _: online_lr
     if use_recurrent:
         nan_callback = NaNStopCallback()
         if use_custom_gtrxl:
@@ -191,15 +190,15 @@ def train_ppo(trainer, symbol: str, data: pd.DataFrame, incremental: bool = Fals
                 device=device,
                 tensorboard_log="./ppo_tensorboard/" if CONFIG.get('USE_TENSORBOARD', False) else None,
                 learning_rate=lr_schedule,
-                n_steps=128, # Smaller batches for recurrent stability
-                batch_size=64,
-                n_epochs=4,
-                gamma=CONFIG.get('PPO_GAMMA', 0.95),
-                gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.92),
+                n_steps=CONFIG.get('PPO_N_STEPS', 128),
+                batch_size=CONFIG.get('PPO_BATCH_SIZE', 64),
+                n_epochs=CONFIG.get('PPO_N_EPOCHS', 5),
+                gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
                 clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
-                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.02),
-                vf_coef=CONFIG.get('vf_coef', 0.8),
-                max_grad_norm=0.3,
+                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.04),
+                vf_coef=CONFIG.get('vf_coef', 0.5),
+                max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5),
             )
         logger.info(f"Training RecurrentPPO ({'GTrXL' if use_custom_gtrxl else 'LSTM'}) for {symbol} ({timesteps} timesteps)")
         model.learn(total_timesteps=timesteps, callback=nan_callback, reset_num_timesteps=not incremental)
@@ -228,15 +227,16 @@ def train_ppo(trainer, symbol: str, data: pd.DataFrame, incremental: bool = Fals
                 device=device,
                 tensorboard_log="./ppo_tensorboard/" if CONFIG.get('USE_TENSORBOARD', False) else None,
                 learning_rate=lr_schedule,
-                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.02),
-                gamma=CONFIG.get('PPO_GAMMA', 0.95),
-                gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.92),
+                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.04),
+                gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
                 clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
-                vf_coef=CONFIG.get('vf_coef', 0.8),
-                max_grad_norm=0.3
+                vf_coef=CONFIG.get('vf_coef', 0.5),
+                max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5)
             )
+        nan_callback = NaNStopCallback()
         logger.info(f"Training PPO for {symbol} ({timesteps} timesteps)")
-        model.learn(total_timesteps=timesteps, reset_num_timesteps=not incremental)
+        model.learn(total_timesteps=timesteps, callback=[nan_callback], reset_num_timesteps=not incremental)
     logger.info(f"PPO training completed for {symbol}")
     trainer.ppo_models[symbol] = model
     trainer.vec_norms[symbol] = vec_env

@@ -5,8 +5,6 @@ import sys
 import os
 os.environ["TQDM_DISABLE"] = "1"
 os.environ["DISABLE_TQDM"] = "1"
-os.environ["TQDM_DISABLE"] = "True" # extra safety for different tqdm versions
-print(sys.path)
 import asyncio
 import warnings
 import logging
@@ -71,7 +69,8 @@ async def main():
             except Exception as e:
                 print(f"[TFT CACHE CLEANUP] Failed to delete {f}: {e}")
     # Extra memory cleanup at startup
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     import gc
     gc.collect()
     print("[STARTUP] Cleanup completed + GPU/RAM cleared")

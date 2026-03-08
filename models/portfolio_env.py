@@ -87,7 +87,7 @@ class PortfolioEnv(gym.Env):
       
             self.precomputed_regimes[sym] = np.array(regimes)
       
-            last_regime_tuple = regimes[-1] if regimes else 'trending'
+            last_regime_tuple = regimes[-1] if regimes else cached_regime or 'trending'
             last_regime = last_regime_tuple[0] if isinstance(last_regime_tuple, tuple) else last_regime_tuple
             features = generate_features(
                 data=full_data,
@@ -158,8 +158,6 @@ class PortfolioEnv(gym.Env):
         if self.current_step >= len(self.timeline) - 1:
             return self._get_observation(), 0.0, True, False, {}
 
-        obs_before = self._get_observation().copy()
-
         raw_targets = np.clip(action, -2.0, 2.0)
         abs_sum = np.sum(np.abs(raw_targets))
         if abs_sum > self.max_leverage:
@@ -173,7 +171,8 @@ class PortfolioEnv(gym.Env):
                 close_series = self.data_dict[sym]['close']
                 prev_close = close_series.asof(timestamp - pd.Timedelta(minutes=15))
                 curr_close = close_series.asof(timestamp)
-                if prev_close > 0:
+                # Guard against NaN from asof() on index gaps
+                if pd.notna(prev_close) and pd.notna(curr_close) and prev_close > 0:
                     returns[i] = (curr_close - prev_close) / prev_close
 
         # =====================================================================
@@ -196,7 +195,7 @@ class PortfolioEnv(gym.Env):
         drawdown = (self.equity - self.peak_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
 
         recent_rets = []
-        lookback = min(60, self.current_step + 1)
+        lookback = min(60, self.current_step + 1, len(self.weight_history))
         for offset in range(1, lookback + 1):
             past_step = self.current_step - offset + 1
             if past_step < 0:
@@ -204,7 +203,8 @@ class PortfolioEnv(gym.Env):
             past_ret = self._compute_portfolio_return_at_step(past_step)
             recent_rets.append(past_ret)
 
-        annual_vol = np.std(recent_rets) * np.sqrt(365 * 24 * 4) if len(recent_rets) > 10 else 0.0
+        # FIX: Use 252 trading days * 96 fifteen-min bars per day (not 365*24*4 which assumes 24/7 trading)
+        annual_vol = np.std(recent_rets) * np.sqrt(252 * 96) if len(recent_rets) > 10 else 0.0
 
         reward = portfolio_return
         reward -= CONFIG.get('VOL_PENALTY_COEF', 0.03) * annual_vol
@@ -229,10 +229,11 @@ class PortfolioEnv(gym.Env):
                 close_series = self.data_dict[sym]['close']
                 prev_close = close_series.asof(timestamp - pd.Timedelta(minutes=15))
                 curr_close = close_series.asof(timestamp)
-                if prev_close > 0:
+                if pd.notna(prev_close) and pd.notna(curr_close) and prev_close > 0:
                     returns[i] = (curr_close - prev_close) / prev_close
 
-        history_idx = len(self.weight_history) - (self.current_step - step_idx) - 1
+        # Deque-safe index: clamp to valid range within the deque
+        history_idx = len(self.weight_history) - 1 - (self.current_step - step_idx)
         if 0 <= history_idx < len(self.weight_history):
             past_weights = self.weight_history[history_idx]
         else:
@@ -291,5 +292,6 @@ class PortfolioEnv(gym.Env):
         ])
 
         obs = np.concatenate([per_symbol_obs, portfolio_extra])
-        obs = obs.astype(np.float32)
+        obs = np.nan_to_num(obs, nan=0.0, posinf=20.0, neginf=-20.0).astype(np.float32)
+        obs = np.clip(obs, -20.0, 20.0)
         return obs

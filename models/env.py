@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 class TradingEnv(gym.Env):
     # Class-level cache for TFT features (shared across instances if needed)
-    tft_cache = {} # {symbol: cached_full_df}
+    tft_cache = {} # {symbol: (timestamp, cached_full_df)}
+    _tft_cache_ttl = 3600  # 1 hour TTL for TFT cache entries
 
     def __init__(self, data_ingestion, symbol: str, initial_balance: float = 1000.0):
         super().__init__()
@@ -44,13 +45,12 @@ class TradingEnv(gym.Env):
         dummy_regime = 'mean_reverting'
         try:
             dummy_features = generate_features(dummy_window, dummy_regime, symbol="DUMMY", full_hist_df=dummy_window)
-            feature_dim = dummy_features.shape[1] if dummy_features is not None and dummy_features.size > 0 else 30
-            feature_dim += 1 # P-9 FIX: +1 for vol_target column
+            feature_dim = dummy_features.shape[1] if dummy_features is not None and dummy_features.size > 0 else 52
         except Exception as e:
-            logger.warning(f"Failed to compute feature dim dynamically ({e}) — falling back to 30")
-            feature_dim = 31 # +1 for vol_target (UPGRADE #6)
+            logger.warning(f"Failed to compute feature dim dynamically ({e}) — falling back to 52")
+            feature_dim = 52
         self.observation_space = Box(low=-np.inf, high=np.inf, shape=(feature_dim,), dtype=np.float32)
-        logger.info(f"Observation space dynamically set to shape=({feature_dim},) for symbol {symbol} (includes vol_target)")
+        logger.info(f"Observation space dynamically set to shape=({feature_dim},) for symbol {symbol}")
         self.action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
         # BUG-08 FIX: track whether we've already warned about dimension mismatch
         self._logged_dim_warning = False
@@ -72,11 +72,22 @@ class TradingEnv(gym.Env):
         self.data = data
         # TFT CACHING
         if CONFIG.get('USE_TFT_ENCODER', False):
-            if self.symbol not in TradingEnv.tft_cache or len(TradingEnv.tft_cache[self.symbol]) < len(self.data):
-                print(f"Updating TFT cache for {self.symbol} ({len(self.data)} bars)")
-                TradingEnv.tft_cache[self.symbol] = _precompute_and_cache_tft(self.symbol, self.data)
+            import time as _time
+            cached = TradingEnv.tft_cache.get(self.symbol)
+            cache_stale = (cached is None or
+                           len(cached[1]) < len(self.data) or
+                           (_time.time() - cached[0]) > TradingEnv._tft_cache_ttl)
+            if cache_stale:
+                logger.info(f"Updating TFT cache for {self.symbol} ({len(self.data)} bars)")
+                TradingEnv.tft_cache[self.symbol] = (_time.time(), _precompute_and_cache_tft(self.symbol, self.data))
+                # Evict symbols no longer in universe to prevent memory bloat
+                active_symbols = set(CONFIG.get('SYMBOLS', []))
+                stale_keys = [k for k in TradingEnv.tft_cache if k not in active_symbols]
+                for k in stale_keys:
+                    del TradingEnv.tft_cache[k]
+                    logger.debug(f"TFT cache evicted stale symbol: {k}")
             else:
-                print(f"TFT cache already up-to-date for {self.symbol}")
+                logger.debug(f"TFT cache already up-to-date for {self.symbol}")
         return self._get_observation(), {}
 
     def step(self, action):
@@ -91,14 +102,13 @@ class TradingEnv(gym.Env):
             data_ingestion=self.data_ingestion,
             lookback=CONFIG.get('LOOKBACK', 900)
         )
-        # Capture observation BEFORE taking the action (standard RL convention)
-        obs_before = self._get_observation(regime=regime, persistence=persistence).copy()
         target_pos = np.clip(float(action[0]), -1.0, 1.0)
         current_price = self.data['close'].iloc[self.current_step]
         trade_pos = target_pos - self.position
         trade_shares = trade_pos * self.max_shares
         turnover_cost = abs(trade_shares) * current_price * (CONFIG['SLIPPAGE'] + CONFIG['COMMISSION_PER_SHARE'] / current_price)
         self.position = target_pos
+        self.cash -= trade_shares * current_price  # pay for (or receive from) the shares
         self.cash -= turnover_cost
         self.equity = self.cash + self.position * current_price * self.max_shares
         ret = (self.equity - self.equity_prev) / self.equity_prev if self.equity_prev > 0 else 0
@@ -107,7 +117,7 @@ class TradingEnv(gym.Env):
         # Update drawdown tracking
         self.cummax_equity = max(self.cummax_equity, self.equity)
         # Base reward
-        reward = ret - 0.0005 * abs(trade_pos) * 1000
+        reward = ret - CONFIG.get('TURNOVER_COST_MULT', 0.3) * abs(trade_pos)
         # Existing Sortino component
         if len(self.returns) > 20:
             recent_returns = np.array(self.returns[-20:])
@@ -117,9 +127,9 @@ class TradingEnv(gym.Env):
                 downside_std = max(downside_std, 1e-8)
                 mean_return = np.mean(recent_returns)
                 sortino = mean_return / downside_std * np.sqrt(252 * 96)
-                reward += sortino * 0.25
+                reward += sortino * CONFIG.get('SORTINO_WEIGHT', 0.20)
             else:
-                reward += 0.05
+                reward += CONFIG.get('SORTINO_ZERO_DD_BONUS', 0.03)
         # Risk-aware penalties
         annual_vol = 0.0
         if len(self.returns) > 50:
@@ -139,19 +149,22 @@ class TradingEnv(gym.Env):
                 full_hist_df=self.data
             )
             latest_features = features[-1].astype(np.float32) if features is not None and features.shape[0] > 0 else np.zeros(self.observation_space.shape[0])
-            penalty = self.causal_wrapper.get_causal_penalty(
-                latest_features,
-                float(action[0]),
-                regime
+            # FIX: CausalSignalManager has compute_penalty_factor() (returns multiplier), not get_causal_penalty()
+            penalty_factor = self.causal_wrapper.compute_penalty_factor(
+                latest_features.reshape(1, -1),
+                float(action[0])
             )
+            # Convert multiplier to penalty: factor > 1.0 means causal signal is strong (reward amplification)
+            # factor == 1.0 means no effect
+            penalty = (penalty_factor - 1.0) * abs(reward) * CONFIG.get('CAUSAL_REWARD_FACTOR', 0.7)
             reward -= penalty
-            logger.debug(f"[CAUSAL REWARD] {self.symbol} | regime={regime} | action={action[0]:.3f} | penalty={penalty:.4f}")
+            logger.debug(f"[CAUSAL REWARD] {self.symbol} | regime={regime} | action={action[0]:.3f} | factor={penalty_factor:.4f} | penalty={penalty:.4f}")
         # ─────────────────────────────────────────────────────────────────────
         # UPGRADE #4: Continuous persistence score in reward shaping
         # High persistence (strong trends) boosts reward; low persistence penalizes
         # ─────────────────────────────────────────────────────────────────────
         # P-4 FIX: persistence already computed above — reuse (no second detect_regime call)
-        persistence_bonus = (persistence - 0.5) * 1.0
+        persistence_bonus = (persistence - 0.5) * CONFIG.get('PERSISTENCE_BONUS_SCALE', 0.4)
         reward += persistence_bonus
         logger.debug(f"[PERSISTENCE REWARD] {self.symbol} | regime={regime} | persistence={persistence:.3f} | bonus={persistence_bonus:.4f}")
         # ─────────────────────────────────────────────────────────────────────
@@ -217,25 +230,21 @@ class TradingEnv(gym.Env):
 
         # ────────────────────────────────────────────────────────────────
         # BUG-08 FIX: Enforce dimension safety on BOTH cached and fresh paths
-        # ────────────────────────────────────────────────────────────────
-        if latest.shape[0] != self.observation_space.shape[0] - 1:  # -1 because we append vol_target later
+        expected_dim = self.observation_space.shape[0]
+        if latest.shape[0] != expected_dim:
             if not self._logged_dim_warning:
                 logger.warning(
-                    f"[TFT/FEATURE DIM MISMATCH] {self.symbol} | "
-                    f"computed features len={latest.shape[0]} but expected {self.observation_space.shape[0]-1} "
+                    f"[FEATURE DIM MISMATCH] {self.symbol} | "
+                    f"computed features len={latest.shape[0]} but expected {expected_dim} "
                     f"(step={step_idx}, regime={regime}) → forcing alignment"
                 )
                 self._logged_dim_warning = True
 
-            if latest.shape[0] < self.observation_space.shape[0] - 1:
-                pad_width = self.observation_space.shape[0] - 1 - latest.shape[0]
+            if latest.shape[0] < expected_dim:
+                pad_width = expected_dim - latest.shape[0]
                 latest = np.pad(latest, (0, pad_width), mode='constant', constant_values=0.0)
             else:
-                latest = latest[:self.observation_space.shape[0] - 1]
-
-        # P-9 FIX: Append vol_target as the final column (teacher-forcing)
-        vol_feature = np.array([self.vol_target], dtype=np.float32)
-        latest = np.concatenate([latest, vol_feature])
+                latest = latest[:expected_dim]
 
         if np.any(np.isnan(latest)) or np.any(np.isinf(latest)):
             latest = np.nan_to_num(latest, nan=0.0, posinf=20.0, neginf=-20.0)

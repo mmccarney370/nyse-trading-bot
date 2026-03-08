@@ -90,11 +90,12 @@ def detect_regime(
             trending_votes = 0
             self_probs = []
 
+            # FIX: Compute dynamic_min_covar ONCE outside loop (observations don't change per seed)
+            data_std = np.std(observations, axis=0).mean()
+            dynamic_min_covar = max(1e-3, min(5e-2, data_std * 2.0))
+
             for i, seed in enumerate(seeds):
                 try:
-                    # NEW: Adaptive min_covar — larger when data is quiet
-                    data_std = np.std(observations, axis=0).mean()
-                    dynamic_min_covar = max(1e-3, min(5e-2, data_std * 2.0))  # scales up to 0.05 if very low vol
 
                     model = GaussianHMM(
                         n_components=n_components,
@@ -163,7 +164,7 @@ def detect_regime(
     try:
         poly = np.polyfit(log_lags, log_tau, 1)
         hurst = poly[0]
-    except:
+    except Exception:
         return 'mean_reverting', 0.45
 
     regime = 'trending' if hurst > CONFIG.get('HURST_TREND_THRESHOLD', 0.45) else 'mean_reverting'
@@ -173,15 +174,27 @@ def detect_regime(
     # ==================== FIXED DIVERGENCE DETECTION (B-05 PATCH) ====================
     if len(prices) >= 50 and CONFIG.get('USE_DIVERGENCE', True):
         try:
-            rsi = pd.Series(prices).rolling(14).apply(
-                lambda x: 100 - 100 / (1 + (x.diff().clip(lower=0).sum() / abs(x.diff().clip(upper=0).sum()))), raw=True
-            )
-            price_high = prices.rolling(20).max()
-            price_low = prices.rolling(20).min()
-            rsi_high = rsi.rolling(20).max()
-            rsi_low = rsi.rolling(20).min()
-            bull_div = (((prices < price_low) & (rsi > rsi_low)).astype(float).fillna(0)).iloc[-1]
-            bear_div = (((prices > price_high) & (rsi < rsi_high)).astype(float).fillna(0)).iloc[-1]
+            # FIX: raw=True passes numpy array which lacks .diff()/.clip() — use raw=False
+            # FIX: Divergence conditions were tautological — use proper new-high/new-low detection
+            def _rsi_func(x):
+                d = x.diff()
+                up_sum = d.clip(lower=0).sum()
+                down_sum = abs(d.clip(upper=0).sum())
+                if down_sum < 1e-10:
+                    return 100.0
+                return 100 - 100 / (1 + up_sum / down_sum)
+            rsi = pd.Series(prices).rolling(14).apply(_rsi_func, raw=False)
+            # Proper divergence: compare current vs lookback-period high/low
+            price_curr = prices.iloc[-1]
+            price_prev_high = prices.iloc[-20:-5].max() if len(prices) >= 25 else prices.iloc[-20:].max()
+            price_prev_low = prices.iloc[-20:-5].min() if len(prices) >= 25 else prices.iloc[-20:].min()
+            rsi_curr = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50.0
+            rsi_prev_high = rsi.iloc[-20:-5].max() if len(rsi) >= 25 else 50.0
+            rsi_prev_low = rsi.iloc[-20:-5].min() if len(rsi) >= 25 else 50.0
+            # Bullish div: price makes new low but RSI makes higher low
+            bull_div = 1.0 if (price_curr < price_prev_low and rsi_curr > rsi_prev_low) else 0.0
+            # Bearish div: price makes new high but RSI makes lower high
+            bear_div = 1.0 if (price_curr > price_prev_high and rsi_curr < rsi_prev_high) else 0.0
             if bull_div == 1.0:
                 regime = 'trending'
                 persistence = min(1.0, persistence + 0.15)
@@ -191,7 +204,7 @@ def detect_regime(
                 persistence = min(1.0, persistence + 0.15)
                 logger.debug(f"BEARISH DIVERGENCE detected for {symbol} — boosting persistence")
         except Exception as e:
-            logger.debug(f"Divergence check skipped: {e}")
+            logger.warning(f"Divergence check failed for {symbol}: {e}")
 
     return regime, persistence
 

@@ -59,8 +59,10 @@ class DataHandler:
             logger.warning(f"Redis connection failed: {e}. Falling back to file + in-memory cache.")
             self.redis_client = None
             self.use_redis = False
-            self.in_memory_cache = {} # historical data
-            self.in_memory_daily_cache = {} # daily data
+        # Always init in-memory cache attributes (fallback used even when Redis is primary)
+        self.in_memory_cache = {}
+        self.in_memory_daily_cache = {}
+        self._mem_cache_max = 50
 
         # === ARCTICDB LOCAL TICK DATABASE (NEW + FIXED) ===
         self.use_local_tickdb = config.get('USE_LOCAL_TICKDB', False)
@@ -158,10 +160,17 @@ class DataHandler:
             return
         symbol_key = f"{symbol}_{timeframe}"
         try:
-            lib.write(symbol_key, df)
+            # FIX: Merge with existing data instead of overwriting (was losing historical data)
+            if lib.has_symbol(symbol_key):
+                existing = lib.read(symbol_key).data
+                merged = pd.concat([existing, df])
+                merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+                lib.write(symbol_key, merged)
+            else:
+                lib.write(symbol_key, df)
             logger.debug(f"✅ Saved {symbol} {timeframe} to ArcticDB")
         except Exception as e:
-            logger.debug(f"ArcticDB write failed for {symbol}: {e}")
+            logger.warning(f"ArcticDB write failed for {symbol}: {e}")
 
     # ==================== EXISTING METHODS (unchanged) ====================
 
@@ -211,6 +220,9 @@ class DataHandler:
                 logger.error(f"Redis daily cache save error: {e}")
         else:
             self.in_memory_daily_cache[key] = (datetime.now(tz=tz.gettz('UTC')), df)
+            if len(self.in_memory_daily_cache) > self._mem_cache_max:
+                oldest_key = min(self.in_memory_daily_cache, key=lambda k: self.in_memory_daily_cache[k][0])
+                del self.in_memory_daily_cache[oldest_key]
             date_str = key.split(':')[-1]
             cache_file = os.path.join(self.cache_dir, f"daily_{symbol}_{date_str}.pkl")
             try:
@@ -231,8 +243,14 @@ class DataHandler:
                 logger.error(f"Redis historical load error: {e}")
         else:
             if key in self.in_memory_cache:
-                logger.debug(f"In-memory historical cache HIT: {key}")
-                return self.in_memory_cache[key]
+                cached_ts, cached_df = self.in_memory_cache[key]
+                # Evict if older than 2 hours
+                if (datetime.now(tz=tz.gettz('UTC')) - cached_ts).total_seconds() < 7200:
+                    logger.debug(f"In-memory historical cache HIT: {key}")
+                    return cached_df
+                else:
+                    del self.in_memory_cache[key]
+                    logger.debug(f"In-memory historical cache EXPIRED: {key}")
             cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}.pkl")
             if os.path.exists(cache_file):
                 ttl_days = 1 if 'Min' in timeframe else self.config.get('CACHE_TTL_DAYS', 30)
@@ -259,7 +277,12 @@ class DataHandler:
             except Exception as e:
                 logger.error(f"Redis historical cache save error: {e}")
         else:
-            self.in_memory_cache[key] = df
+            self.in_memory_cache[key] = (datetime.now(tz=tz.gettz('UTC')), df)
+            # Evict oldest entries if cache exceeds max size
+            if len(self.in_memory_cache) > self._mem_cache_max:
+                oldest_key = min(self.in_memory_cache, key=lambda k: self.in_memory_cache[k][0])
+                del self.in_memory_cache[oldest_key]
+                logger.debug(f"In-memory cache evicted oldest: {oldest_key}")
             cache_file = os.path.join(self.cache_dir, f"{symbol}_{timeframe}.pkl")
             try:
                 df.to_pickle(cache_file)
@@ -323,7 +346,8 @@ class DataHandler:
                     df = self._normalize_columns(df, symbol)
                     dfs.append(df)
                     break
-                wait = (2 ** attempt * 5) + (30 if e and "429" in str(e) else 0)
+                # FIX: Cap backoff at 120s (was growing to 10240s on attempt 11)
+                wait = min(2 ** attempt * 5, 120) + (30 if e and "429" in str(e) else 0)
                 logger.warning(f"Chunk fetch failed ({symbol} {current_start.date()}-{current_end.date()}), retry {attempt+1}/12 after {wait}s: {e or 'empty data'}")
                 time.sleep(wait)
             else:
@@ -431,7 +455,12 @@ class DataHandler:
     def _fetch_alpaca_data(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
         time.sleep(self.config['REQUEST_INTERVAL'])
         try:
-            tf = TimeFrame.Day if timeframe == '1d' else TimeFrame(15, TimeFrameUnit.Minute)
+            if timeframe == '1d':
+                tf = TimeFrame.Day
+            elif timeframe == '1H':
+                tf = TimeFrame(1, TimeFrameUnit.Hour)
+            else:
+                tf = TimeFrame(15, TimeFrameUnit.Minute)
             request = StockBarsRequest(
                 symbol_or_symbols=symbol,
                 timeframe=tf,
@@ -461,8 +490,12 @@ class DataHandler:
                 time.sleep(sleep_needed)
             self.last_polygon_call_time = time.time()
             try:
-                multiplier = 1 if timeframe == '1d' else 15
-                timespan = 'day' if timeframe == '1d' else 'minute'
+                if timeframe == '1d':
+                    multiplier, timespan = 1, 'day'
+                elif timeframe == '1H':
+                    multiplier, timespan = 1, 'hour'
+                else:
+                    multiplier, timespan = 15, 'minute'
                 aggs = self.polygon_client.get_aggs(
                     ticker=symbol,
                     multiplier=multiplier,
@@ -490,7 +523,7 @@ class DataHandler:
     def _fetch_finnhub_data(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
         time.sleep(self.config['REQUEST_INTERVAL'])
         try:
-            resolution = '15' if timeframe != '1d' else 'D'
+            resolution = 'D' if timeframe == '1d' else ('60' if timeframe == '1H' else '15')
             from_ts = int(start.timestamp())
             to_ts = int(end.timestamp())
             res = self.finnhub_client.stock_candles(symbol, resolution, from_ts, to_ts)
@@ -551,18 +584,18 @@ class DataHandler:
 
     def get_bid_ask_spread(self, symbol: str) -> float:
         try:
-            quote = self.data_client.get_stock_latest_quote(symbol)
-            if hasattr(quote, 'bid_price') and hasattr(quote, 'ask_price'):
-                bid = quote.bid_price
-                ask = quote.ask_price
-            elif isinstance(quote, dict):
-                bid = quote.get('bid_price', 0)
-                ask = quote.get('ask_price', 0)
-            else:
-                raise ValueError("Unexpected quote format")
-            if bid > 0 and ask > 0 and ask > bid:
-                return (ask - bid) / ((ask + bid) / 2)
-        except (requests.exceptions.RequestException, MaxRetryError, ValueError, TypeError) as e:
+            # FIX: Use proper alpaca-py API with request object (was passing bare string)
+            from alpaca.data.requests import StockLatestQuoteRequest
+            quote_request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            quotes = self.data_client.get_stock_latest_quote(quote_request)
+            # Response is a dict keyed by symbol
+            quote = quotes.get(symbol) if isinstance(quotes, dict) else quotes
+            if quote is not None:
+                bid = float(getattr(quote, 'bid_price', 0) or 0)
+                ask = float(getattr(quote, 'ask_price', 0) or 0)
+                if bid > 0 and ask > 0 and ask > bid:
+                    return (ask - bid) / ((ask + bid) / 2)
+        except Exception as e:
             logger.debug(f"Alpaca quote failed for {symbol}: {e}")
         try:
             ticker = yf.Ticker(symbol)

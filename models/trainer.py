@@ -235,13 +235,17 @@ class Trainer:
                 final_long_thresh = max(0.50, min(0.85, final_long_thresh))
                 final_short_thresh = max(0.15, min(0.50, final_short_thresh))
                 chunk_start_time = df.index[chunk_start]
-                self.confidence_thresholds.setdefault(symbol, []).append({
+                thresh_list = self.confidence_thresholds.setdefault(symbol, [])
+                thresh_list.append({
                     'valid_from': chunk_start_time,
                     'long': final_long_thresh,
                     'short': final_short_thresh,
                     'sharpe_is': best_score_is,
                     'sharpe_oos': oos_sharpe
                 })
+                # Prune to last 12 entries inline to prevent memory bloat
+                if len(thresh_list) > 12:
+                    self.confidence_thresholds[symbol] = thresh_list[-12:]
                 logger.info(
                     f"{symbol} walk-forward window {w+1}/{n_windows} ({chunk_start_time.date()}): "
                     f"long>{final_long_thresh:.3f}, short<{final_short_thresh:.3f} (IS {best_score_is:.2f} | OOS {oos_sharpe:.2f})"
@@ -370,7 +374,7 @@ class Trainer:
                             action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                             reward = entry.get('realized_return', 0.0)
                             self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
-                        except:
+                        except Exception:
                             pass
                 loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
                 logger.info(f"[CAUSAL WARMUP AFTER LOAD] Loaded {loaded_count} historical rewards into portfolio causal buffer")
@@ -426,13 +430,13 @@ class Trainer:
                         learning_rate=CONFIG.get('PPO_LEARNING_RATE', 3e-4),
                         n_steps=CONFIG.get('PPO_N_STEPS', 2048),
                         batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
-                        n_epochs=4,
-                        gamma=CONFIG.get('PPO_GAMMA', 0.95),
-                        gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.92),
-                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.2),
-                        ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.08),
-                        vf_coef=CONFIG.get('vf_coef', 0.8),
-                        max_grad_norm=0.3,
+                        n_epochs=CONFIG.get('PPO_N_EPOCHS', 5),
+                        gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                        gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
+                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
+                        ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.04),
+                        vf_coef=CONFIG.get('vf_coef', 0.5),
+                        max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5),
                         device="auto"
                     )
                 else:
@@ -447,12 +451,12 @@ class Trainer:
                         learning_rate=CONFIG.get('PPO_LEARNING_RATE', 3e-4),
                         n_steps=CONFIG.get('PPO_N_STEPS', 2048),
                         batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
-                        n_epochs=10,
-                        gamma=CONFIG.get('PPO_GAMMA', 0.95),
-                        gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.92),
-                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.2),
-                        vf_coef=CONFIG.get('vf_coef', 0.8),
-                        max_grad_norm=0.3,
+                        n_epochs=CONFIG.get('PPO_N_EPOCHS', 5),
+                        gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                        gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
+                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
+                        vf_coef=CONFIG.get('vf_coef', 0.5),
+                        max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5),
                         device="auto"
                     )
                 nan_callback = NaNStopCallback()
@@ -506,7 +510,7 @@ class Trainer:
                                 action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                                 reward = entry.get('realized_return', 0.0)
                                 self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
-                            except:
+                            except Exception:
                                 pass
                     loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
                     logger.info(f"[CAUSAL WARMUP] Loaded {loaded_count} historical rewards into portfolio causal buffer")
@@ -570,8 +574,9 @@ class Trainer:
             model.set_env(new_vec_env)
             # Lower learning rate for safe online fine-tuning
             original_lr = model.learning_rate
-            model.learning_rate = 1e-5 # Conservative fixed low LR for online updates
-            logger.info(f"Reduced learning rate to 1e-5 for online portfolio update (original was {original_lr})")
+            online_lr = CONFIG.get('PPO_ONLINE_LEARNING_RATE', 5e-5)
+            model.learning_rate = online_lr
+            logger.info(f"Reduced learning rate to {online_lr} for online portfolio update (original was {original_lr})")
             nan_callback = NaNStopCallback()
             profit_callback = ProfitLoggingCallback() # Enhanced profit logging
             logger.info(f"Continuing portfolio PPO training for {timesteps} timesteps (incremental)")
@@ -616,7 +621,7 @@ class Trainer:
                                     action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                                     reward = entry.get('realized_return', 0.0)
                                     self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
-                                except:
+                                except Exception:
                                     pass
                         logger.info(f"[CAUSAL WARMUP AFTER UPDATE] Portfolio causal buffer refreshed")
             # Save updated model

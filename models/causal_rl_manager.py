@@ -46,7 +46,7 @@ class CausalRLManager:
         for sym in added:
             if sym not in getattr(self.signal_gen, 'causal_wrappers', {}):
                 # ISSUE #4 FIX: Updated class name from old CausalSignalWrapper → current CausalSignalManager
-                self.signal_gen.causal_wrappers[sym] = CausalSignalManager(self.config, sym)
+                self.signal_gen.causal_wrappers[sym] = CausalSignalManager(base_model=None, symbol=sym)
                 logger.info(f"[B-23] Initialized new per-symbol causal wrapper for added symbol {sym}")
     def sync_daily_rewards(self):
         """Bug #21: After daily graph refresh, force-push any pending realized rewards from live_signal_history."""

@@ -21,7 +21,7 @@ import tempfile # ← Priority 1: for atomic writes
 import shutil # ← Priority 1: for atomic rename
 from config import CONFIG
 from dowhy import CausalModel
-import pgmpy.estimators.GES as GES
+from pgmpy.estimators.GES import GES
 import networkx as nx
 from collections import deque
 from models.features import generate_features
@@ -232,11 +232,13 @@ class CausalSignalManager:
             self.causal_graph = ges.estimate()
             # === BUILD DoWhy CausalModel FIRST (now with correct action/reward columns) ===
             logger.info(f"[CAUSAL DOWHY] Building DoWhy CausalModel with {len(self.causal_graph.edges)} edges")
+            # DoWhy expects a GML string for the graph parameter, not a networkx DiGraph
+            graph_gml = ''.join(nx.generate_gml(self.causal_graph))
             self.causal_model = CausalModel(
-                data=data, # ← FIXED: now contains 'action' and 'reward'
+                data=data,
                 treatment='action',
                 outcome='reward',
-                graph=self.causal_graph
+                graph=graph_gml
             )
             # P-20 FIX: Explicitly identify the estimand (missing step causing AttributeError)
             identified_estimand = self.causal_model.identify_effect()
@@ -262,12 +264,27 @@ class CausalSignalManager:
                         method_name="random_common_cause",
                         num_simulations=10
                     )
-                    if refuter.refutation_passed:
+                    # FIX: DoWhy CausalRefutation uses 'refutation_result' not 'refutation_passed'
+                    # Check if the new effect estimate is close to the original (p-value > 0.05)
+                    passed = True
+                    if hasattr(refuter, 'refutation_result'):
+                        result = refuter.refutation_result
+                        if isinstance(result, dict) and result.get('is_statistically_significant', False):
+                            passed = False  # significant change means edge is spurious
+                        elif hasattr(result, 'p_value') and result.p_value < 0.05:
+                            passed = False
+                    elif hasattr(refuter, 'new_effect') and estimate is not None:
+                        # Fallback: compare effect magnitudes — if perturbation changes effect by >50%, reject
+                        orig_val = abs(estimate.value) if hasattr(estimate, 'value') else 0
+                        new_val = abs(refuter.new_effect) if hasattr(refuter, 'new_effect') else orig_val
+                        if orig_val > 0 and abs(new_val - orig_val) / orig_val > 0.5:
+                            passed = False
+                    if passed:
                         refined_edges.append((u, v))
                         logger.debug(f"Edge {u}→{v} PASSED statistical refutation")
                     else:
                         logger.debug(f"Edge {u}→{v} FAILED refutation")
-                except:
+                except Exception:
                     refined_edges.append((u, v)) # keep edge if test fails gracefully
             if refined_edges:
                 self.causal_graph = nx.DiGraph(refined_edges)

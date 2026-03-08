@@ -113,6 +113,9 @@ class Backtester:
         close_prices = pd.concat(price_series, axis=1, join='outer')
         close_prices = close_prices.ffill().bfill().dropna(how='all')
         common_index = close_prices.index
+        if len(common_index) == 0:
+            logger.error("No common data found across symbols for backtest")
+            return {'stats': {}, 'per_symbol': {}, 'equity_curve': pd.DataFrame()}
         logger.info(f"Common index length after fill: {len(common_index)} bars from {common_index[0]} to {common_index[-1]}")
         # Reset signal generator state
         self.signal_gen.prev_signals = {}
@@ -427,7 +430,9 @@ class Backtester:
                 logger.debug(f"Bar {timestamp} | cash={cash:.2f} | portfolio_value={portfolio_value:.2f} | "
                              f"positions sum={sum(p.get('signed_qty', 0) for p in positions.values())}")
                 equity_curve.append((timestamp, portfolio_value))
-            # Force close remaining positions at end
+            # Force close remaining positions at end — use final index timestamp
+            timestamp = common_index[-1]
+            current_prices = close_prices.loc[timestamp] if timestamp in close_prices.index else close_prices.iloc[-1]
             for sym in list(positions.keys()):
                 if positions.get(sym, {}).get('signed_qty', 0) != 0 and sym in current_prices:
                     price = current_prices[sym]
@@ -496,7 +501,7 @@ class Backtester:
                             is_backtest=True
                         )
                         try:
-                            signal_output = self.signal_gen.generate_signal(
+                            signal_output = self.signal_gen.generate_signal_sync(
                                 symbol=sym,
                                 timestamp=prev_timestamp,
                                 data=signal_data_window,
@@ -724,7 +729,13 @@ class Backtester:
                     for sym, pos in positions.items()
                 )
                 equity_curve.append((timestamp, portfolio_value))
-            # Force close remaining positions at end
+            # Force close remaining positions at end — use final index timestamp
+            timestamp = common_index[-1]
+            # Rebuild current_prices from final bar (loop variable may be stale from continue)
+            current_prices = {}
+            for sym in symbols_config:
+                if sym in full_dfs_15m and not full_dfs_15m[sym].empty:
+                    current_prices[sym] = full_dfs_15m[sym]['close'].iloc[-1]
             for sym in list(positions.keys()):
                 if sym in current_prices:
                     quoted_price = current_prices[sym]
