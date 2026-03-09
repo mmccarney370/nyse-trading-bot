@@ -451,12 +451,15 @@ class TradingBot:
                             # M-5 FIX: Cap size by real-time buying power before placing order
                             buying_power = self.broker.get_buying_power()
                             safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
-                            max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
+                            if self.config.get('FRACTIONAL_SHARES', True):
+                                max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
+                            else:
+                                max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
                             if size > max_affordable:
                                 logger.warning(f"[M-5 BUYING POWER CAP] {sym}: requested {size} shares → reduced to {max_affordable} "
                                                f"(buying_power=${buying_power:,.0f}, safety_factor={safety_factor})")
                                 size = max(max_affordable, 0)
-                            if size < 1:
+                            if size < (0.001 if self.config.get('FRACTIONAL_SHARES', True) else 1):
                                 logger.warning(f"[BUYING POWER] {sym}: insufficient buying power — skipping order")
                                 continue
                             order = self.broker.place_bracket_order(
@@ -532,12 +535,15 @@ class TradingBot:
                             # M-5 FIX: Cap size by real-time buying power before placing order
                             buying_power = self.broker.get_buying_power()
                             safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
-                            max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
+                            if self.config.get('FRACTIONAL_SHARES', True):
+                                max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
+                            else:
+                                max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
                             if size > max_affordable:
                                 logger.warning(f"[M-5 BUYING POWER CAP] {symbol}: requested {size} shares → reduced to {max_affordable} "
                                                f"(buying_power=${buying_power:,.0f}, safety_factor={safety_factor})")
                                 size = max(max_affordable, 0)
-                            if size < 1:
+                            if size < (0.001 if self.config.get('FRACTIONAL_SHARES', True) else 1):
                                 logger.warning(f"[BUYING POWER] {symbol}: insufficient buying power — skipping order")
                                 continue
                             order = self.broker.place_bracket_order(

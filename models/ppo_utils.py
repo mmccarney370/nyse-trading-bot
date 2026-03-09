@@ -7,6 +7,7 @@ import torch.nn as nn
 import os
 import joblib
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
 from typing import Optional
 import gymnasium as gym # Critical import for type hints
@@ -150,8 +151,8 @@ def train_ppo(trainer, symbol: str, data: pd.DataFrame, incremental: bool = Fals
     use_custom_gtrxl = CONFIG.get('USE_CUSTOM_GTRXL', True) and use_recurrent
     use_aux = CONFIG.get('PPO_AUX_TASK', True)
     device = CONFIG.get('DEVICE', 'cpu')
-    # Create environment
-    env = DummyVecEnv([lambda: TradingEnv(trainer.data_ingestion, symbol)])
+    # Create environment (Monitor wrapper enables episode stat tracking)
+    env = DummyVecEnv([lambda: Monitor(TradingEnv(trainer.data_ingestion, symbol))])
     vec_env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
     # Load existing if incremental
     if incremental:
@@ -190,15 +191,15 @@ def train_ppo(trainer, symbol: str, data: pd.DataFrame, incremental: bool = Fals
                 device=device,
                 tensorboard_log="./ppo_tensorboard/" if CONFIG.get('USE_TENSORBOARD', False) else None,
                 learning_rate=lr_schedule,
-                n_steps=CONFIG.get('PPO_N_STEPS', 128),
-                batch_size=CONFIG.get('PPO_BATCH_SIZE', 64),
-                n_epochs=CONFIG.get('PPO_N_EPOCHS', 5),
-                gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                n_steps=CONFIG.get('PPO_N_STEPS', 2048),
+                batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
+                n_epochs=CONFIG.get('PPO_N_EPOCHS', 4),
+                gamma=CONFIG.get('PPO_GAMMA', 0.97),
                 gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
-                clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
-                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.04),
-                vf_coef=CONFIG.get('vf_coef', 0.5),
-                max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5),
+                clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.18),
+                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.03),
+                vf_coef=CONFIG.get('vf_coef', 1.0),
+                max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.4),
             )
         logger.info(f"Training RecurrentPPO ({'GTrXL' if use_custom_gtrxl else 'LSTM'}) for {symbol} ({timesteps} timesteps)")
         model.learn(total_timesteps=timesteps, callback=nan_callback, reset_num_timesteps=not incremental)
@@ -227,12 +228,12 @@ def train_ppo(trainer, symbol: str, data: pd.DataFrame, incremental: bool = Fals
                 device=device,
                 tensorboard_log="./ppo_tensorboard/" if CONFIG.get('USE_TENSORBOARD', False) else None,
                 learning_rate=lr_schedule,
-                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.04),
-                gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.03),
+                gamma=CONFIG.get('PPO_GAMMA', 0.97),
                 gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
-                clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
-                vf_coef=CONFIG.get('vf_coef', 0.5),
-                max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5)
+                clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.18),
+                vf_coef=CONFIG.get('vf_coef', 1.0),
+                max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.4)
             )
         nan_callback = NaNStopCallback()
         logger.info(f"Training PPO for {symbol} ({timesteps} timesteps)")

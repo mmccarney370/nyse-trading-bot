@@ -185,11 +185,11 @@ Trade Statistics:
 
 Regime State:
   Dominant Regime: {context_data.get('regime', 'mixed')} | Avg Persistence: {context_data.get('avg_persistence', 0.5)}
-  Regime Distribution: {json.dumps(context_data.get('regime_counts', {{}}))}
+  Regime Distribution: {json.dumps(context_data.get('regime_counts', {}))}
   Universe Size: {context_data.get('symbols_in_universe', 0)} symbols
 
 PPO Training State:
-  {json.dumps(context_data.get('ppo_scalars', {{}}))}
+  {json.dumps(context_data.get('ppo_scalars', {}))}
   Tuning Focus (entropy-gated): {context_data.get('tuning_focus', 'balanced')}
 
 Per-Symbol Breakdown (regime, persistence, sharpe, win_rate, pnl_dollars, recent_10_win_rate, current_price):
@@ -266,7 +266,7 @@ GROUP 5: PPO / RL Hyperparameters (max ±15% — RL is sensitive)
   PPO_GAMMA            [0.93 – 0.98]  current: {current_config.get('PPO_GAMMA')}
   PPO_GAE_LAMBDA       [0.90 – 0.97]  current: {current_config.get('PPO_GAE_LAMBDA')}
   PPO_CLIP_RANGE       [0.10 – 0.25]  current: {current_config.get('PPO_CLIP_RANGE')}
-  vf_coef              [0.3 – 0.7]    current: {current_config.get('vf_coef')}
+  vf_coef              [0.3 – 1.5]    current: {current_config.get('vf_coef')}
   PPO_AUX_LOSS_WEIGHT  [0.10 – 0.40]  current: {current_config.get('PPO_AUX_LOSS_WEIGHT')}
 
 GROUP 6: Reward Shaping (max ±25%)

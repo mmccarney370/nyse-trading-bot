@@ -139,5 +139,10 @@ class PortfolioRebalancer:
                         if sym_price and sym_price > 0:
                             target_weights_dict[sym] = positions.get(sym, 0) * sym_price / current_equity
                         # else: keep current target weight (no price to compute position weight)
+        # Final renormalization after min-hold adjustments
+        total_abs = sum(abs(v) for v in target_weights_dict.values())
+        if total_abs > 0:
+            for sym in target_weights_dict:
+                target_weights_dict[sym] /= total_abs
         # Return final normalized weights (ready for min-hold / order placement in bot.py)
         return target_weights_dict

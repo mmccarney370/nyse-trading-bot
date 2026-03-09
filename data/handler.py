@@ -475,8 +475,8 @@ class DataHandler:
                     df = df.droplevel('symbol')
                 df = df[['open', 'high', 'low', 'close', 'volume']]
                 return df
-        except (requests.exceptions.RequestException, MaxRetryError, ValueError, TypeError) as e:
-            logger.error(f"Alpaca fetch error for {symbol} {timeframe}: {e}")
+        except Exception as e:
+            logger.error(f"Alpaca fetch error for {symbol} {timeframe}: {type(e).__name__}: {e}")
             self.api_failures += 1
         return pd.DataFrame()
 
@@ -546,7 +546,7 @@ class DataHandler:
     def _fetch_tiingo_data(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
         time.sleep(self.config['REQUEST_INTERVAL'])
         try:
-            freq = 'daily' if timeframe == '1d' else '15min'
+            freq = 'daily' if timeframe == '1d' else ('1hour' if timeframe == '1H' else '15min')
             data = self.tiingo_client.get_dataframe(
                 symbol,
                 startDate=start.strftime('%Y-%m-%d'),

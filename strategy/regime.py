@@ -133,49 +133,52 @@ def detect_regime(
                     f"HMM Ensemble | {symbol} | regime={regime} | persistence={avg_self_prob:.3f}"
                 )
 
-            return regime, float(avg_self_prob)
+            regime, persistence = regime, float(avg_self_prob)
 
         except Exception as e:
             logger.warning(f"HMM ensemble failed ({e}) — falling back to Hurst")
+            regime, persistence = None, None  # signal Hurst fallback needed
 
-    # Hurst fallback
-    log_returns = np.log(prices / prices.shift(1)).dropna()
-    if len(log_returns) < 50:
-        return 'trending', 0.70
+    else:
+        regime, persistence = None, None  # GaussianHMM not available
 
-    max_lag = min(100, len(log_returns) // 2)
-    lags = range(2, max_lag + 1)
-    tau = []
-    valid_lags = []
-    for lag in lags:
-        diff = log_returns.diff(lag).dropna()
-        if len(diff) < 10:
-            continue
-        std_val = np.std(diff)
-        if std_val > 1e-8:
-            tau.append(std_val)
-            valid_lags.append(lag)
+    # Hurst fallback (only if HMM didn't produce a result)
+    if regime is None:
+        log_returns = np.log(prices / prices.shift(1)).dropna()
+        if len(log_returns) < 50:
+            return 'trending', 0.70
 
-    if len(tau) < 10:
-        return 'mean_reverting', 0.45
+        max_lag = min(100, len(log_returns) // 2)
+        lags = range(2, max_lag + 1)
+        tau = []
+        valid_lags = []
+        for lag in lags:
+            diff = log_returns.diff(lag).dropna()
+            if len(diff) < 10:
+                continue
+            std_val = np.std(diff)
+            if std_val > 1e-8:
+                tau.append(std_val)
+                valid_lags.append(lag)
 
-    log_lags = np.log(valid_lags)
-    log_tau = np.log(tau)
-    try:
-        poly = np.polyfit(log_lags, log_tau, 1)
-        hurst = poly[0]
-    except Exception:
-        return 'mean_reverting', 0.45
+        if len(tau) < 10:
+            return 'mean_reverting', 0.45
 
-    regime = 'trending' if hurst > CONFIG.get('HURST_TREND_THRESHOLD', 0.45) else 'mean_reverting'
-    persistence = min(max((hurst - 0.3) / 0.4, 0.0), 1.0)
-    logger.info(f"Hurst fallback | {symbol} | Hurst={hurst:.3f} | persistence={persistence:.3f} | regime={regime}")
+        log_lags = np.log(valid_lags)
+        log_tau = np.log(tau)
+        try:
+            poly = np.polyfit(log_lags, log_tau, 1)
+            hurst = poly[0]
+        except Exception:
+            return 'mean_reverting', 0.45
 
-    # ==================== FIXED DIVERGENCE DETECTION (B-05 PATCH) ====================
+        regime = 'trending' if hurst > CONFIG.get('HURST_TREND_THRESHOLD', 0.45) else 'mean_reverting'
+        persistence = min(max((hurst - 0.3) / 0.4, 0.0), 1.0)
+        logger.info(f"Hurst fallback | {symbol} | Hurst={hurst:.3f} | persistence={persistence:.3f} | regime={regime}")
+
+    # ==================== DIVERGENCE DETECTION (applies to BOTH HMM and Hurst results) ====================
     if len(prices) >= 50 and CONFIG.get('USE_DIVERGENCE', True):
         try:
-            # FIX: raw=True passes numpy array which lacks .diff()/.clip() — use raw=False
-            # FIX: Divergence conditions were tautological — use proper new-high/new-low detection
             def _rsi_func(x):
                 d = x.diff()
                 up_sum = d.clip(lower=0).sum()
@@ -184,25 +187,22 @@ def detect_regime(
                     return 100.0
                 return 100 - 100 / (1 + up_sum / down_sum)
             rsi = pd.Series(prices).rolling(14).apply(_rsi_func, raw=False)
-            # Proper divergence: compare current vs lookback-period high/low
             price_curr = prices.iloc[-1]
             price_prev_high = prices.iloc[-20:-5].max() if len(prices) >= 25 else prices.iloc[-20:].max()
             price_prev_low = prices.iloc[-20:-5].min() if len(prices) >= 25 else prices.iloc[-20:].min()
             rsi_curr = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50.0
             rsi_prev_high = rsi.iloc[-20:-5].max() if len(rsi) >= 25 else 50.0
             rsi_prev_low = rsi.iloc[-20:-5].min() if len(rsi) >= 25 else 50.0
-            # Bullish div: price makes new low but RSI makes higher low
             bull_div = 1.0 if (price_curr < price_prev_low and rsi_curr > rsi_prev_low) else 0.0
-            # Bearish div: price makes new high but RSI makes lower high
             bear_div = 1.0 if (price_curr > price_prev_high and rsi_curr < rsi_prev_high) else 0.0
             if bull_div == 1.0:
-                regime = 'trending'
+                regime = 'mean_reverting'
                 persistence = min(1.0, persistence + 0.15)
-                logger.debug(f"BULLISH DIVERGENCE detected for {symbol} — boosting persistence")
+                logger.debug(f"BULLISH DIVERGENCE detected for {symbol} — reversion signal, setting mean_reverting")
             elif bear_div == 1.0:
                 regime = 'mean_reverting'
                 persistence = min(1.0, persistence + 0.15)
-                logger.debug(f"BEARISH DIVERGENCE detected for {symbol} — boosting persistence")
+                logger.debug(f"BEARISH DIVERGENCE detected for {symbol} — reversion signal, setting mean_reverting")
         except Exception as e:
             logger.warning(f"Divergence check failed for {symbol}: {e}")
 

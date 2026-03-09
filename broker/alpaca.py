@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from dateutil import tz
 import json
 import os
+import tempfile
+import shutil
 
 from utils.helpers import is_market_open
 from alpaca.trading.client import TradingClient
@@ -61,6 +63,7 @@ class AlpacaBroker:
         self._positions_cache = {}
         self._positions_cache_time = None
         self._positions_cache_ttl = 30
+        self._last_known_equity = 100000.0
         # Full dynamic sync on startup
         self.sync_existing_positions()
         self._reconcile_tracker_on_startup()
@@ -90,8 +93,10 @@ class AlpacaBroker:
     def _save_last_entry_times(self):
         try:
             data = {sym: ts.isoformat() for sym, ts in self.last_entry_times.items()}
-            with open(LAST_ENTRY_FILE, 'w') as f:
+            fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(LAST_ENTRY_FILE) or '.', suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
                 json.dump(data, f, indent=2)
+            shutil.move(tmp_path, LAST_ENTRY_FILE)
         except Exception as e:
             logger.warning(f"Failed to save last_entry_times.json: {e}")
 
@@ -152,10 +157,12 @@ class AlpacaBroker:
     def get_equity(self):
         try:
             account = self.client.get_account()
-            return float(account.equity)
+            equity = float(account.equity)
+            self._last_known_equity = equity
+            return equity
         except Exception as e:
-            logger.error(f"Equity fetch error: {e}")
-            return 1000.0
+            logger.error(f"Equity fetch error: {e} — returning last known equity {self._last_known_equity}")
+            return self._last_known_equity
 
     def get_buying_power(self):
         try:
@@ -406,6 +413,12 @@ class AlpacaBroker:
                 trailing_stop_id=trailing_stop_id, take_profit_id=tp_order_id or '',
                 trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_price_est,
             )
+        elif tp_order_id:
+            self.tracker.mark_entry_filled(
+                symbol=symbol, fill_price=fill_price, filled_qty=filled_qty,
+                trailing_stop_id='', take_profit_id=tp_order_id,
+                trail_percent=0.0, tp_price=tp_price, stop_price=0.0,
+            )
 
     # ====================== RATCHET VIA PATCH (ReplaceOrderRequest) ======================
     def ratchet_trailing_stop(self, symbol: str, current_price: float, atr: float):
@@ -595,7 +608,8 @@ class AlpacaBroker:
         fill_count = 0
         for o in recent_closed:
             if o.filled_at and o.filled_avg_price and o.limit_price:
-                if (datetime.now(tz=_UTC) - o.filled_at).total_seconds() < 3600:
+                filled_at_utc = o.filled_at.astimezone(_UTC) if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=_UTC)
+                if (datetime.now(tz=_UTC) - filled_at_utc).total_seconds() < 3600:
                     slippage = abs(float(o.filled_avg_price) - float(o.limit_price)) / float(o.limit_price)
                     slippage_total += slippage
                     fill_count += 1

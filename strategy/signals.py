@@ -157,7 +157,9 @@ class SignalGenerator:
             for symbol in config.get('SYMBOLS', []):
                 data = self.data_ingestion.get_latest_data(symbol)
                 if len(data) >= 200:
-                    features = generate_features(data, 'trending', symbol, data)
+                    regime_tuple = self.trainer.get_cached_regime(symbol, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                    regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                    features = generate_features(data, regime, symbol, data)
                     features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
                     if symbol in self.trainer.ppo_models and self.trainer.ppo_models[symbol]:
                         self.causal_manager[symbol] = CausalSignalManager(
@@ -173,7 +175,9 @@ class SignalGenerator:
                 total_rows = 0
                 for sym in config.get('SYMBOLS', []):
                     data = self.data_ingestion.get_latest_data(sym)
-                    features = generate_features(data, 'trending', sym, data)
+                    regime_tuple = self.trainer.get_cached_regime(sym, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                    regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                    features = generate_features(data, regime, sym, data)
                     if features is not None and features.shape[0] > 0:
                         rows = features.shape[0]
                         total_rows += rows
@@ -280,6 +284,8 @@ class SignalGenerator:
             weight_short=CONFIG.get('REGIME_SHORT_WEIGHT', 0.6),
             cache=self.regime_cache
         )
+        # FIX 1: Initialize action before the if/else so it's always defined
+        action = None
         # P-16 / Critical #8 FIX: Reuse precomputed values if provided (zero extra cost)
         if precomputed is not None:
             features = precomputed.get('features')
@@ -294,7 +300,6 @@ class SignalGenerator:
             features = generate_features(data, regime, symbol, data)
             ppo_prob = 0.5
             ppo_strength = 0.5
-            action = None
             meta_prob = 0.5
             sentiment_score = 0.5
             causal_factor = 1.0
@@ -322,17 +327,18 @@ class SignalGenerator:
                             action, _ = model.predict(obs, deterministic=True)
                     else:
                         action, _ = model.predict(obs, deterministic=True)
-                ppo_prob = (action[0][0] + 1) / 2 if hasattr(action, '__getitem__') else (float(action) + 1) / 2
-                ppo_strength = abs(action[0][0]) if hasattr(action, '__getitem__') else abs(float(action))
+                raw_action = float(action.flat[0]) if hasattr(action, 'flat') else float(action)
+                ppo_prob = (raw_action + 1) / 2
+                ppo_strength = abs(raw_action)
         # Stacking meta-prob
         if precomputed is None:
             stacking_probs = []
-            for model in self.trainer.stacking_models.get(symbol, []):
-                if hasattr(model, 'predict_proba'):
-                    prob = model.predict_proba(latest_features)[0]
+            for stacking_model in self.trainer.stacking_models.get(symbol, []):
+                if hasattr(stacking_model, 'predict_proba'):
+                    prob = stacking_model.predict_proba(latest_features)[0]
                     stacking_probs.append(float(prob[1] if prob.shape[0] > 1 else prob[0]))
                 else:
-                    prob = model.predict(latest_features)[0]
+                    prob = stacking_model.predict(latest_features)[0]
                     stacking_probs.append(float(prob))
             meta_prob = np.mean(stacking_probs) if stacking_probs else 0.5
         # Causal factor (renamed for clarity)
@@ -373,7 +379,7 @@ class SignalGenerator:
                 direction = -1
                 confidence = (short_thresh - combined_meta) / short_thresh
         if direction != 0:
-            conviction_boost = 0.7 + 0.3 * persistence
+            conviction_boost = 0.7 + 0.4 * persistence
             confidence = min(1.0, confidence * conviction_boost)
         # Breakout boost (same as in generate_signal)
         if direction != 0 and len(data) >= 22:
@@ -524,6 +530,11 @@ class SignalGenerator:
                     score = 0.0
   
             # Cache result (now per hour)
+            if len(self.sentiment_cache) > 5000:
+                # Evict oldest entries (keep most recent 2500)
+                keys = sorted(self.sentiment_cache.keys())
+                for k in keys[:len(keys) - 2500]:
+                    del self.sentiment_cache[k]
             self.sentiment_cache[cache_key] = score
             logger.debug(f"[SENTIMENT COMPUTED] {symbol} for {cache_key}: {score:.3f}")
             return score
@@ -651,7 +662,9 @@ class SignalGenerator:
         for symbol in self.config.get('SYMBOLS', []):
             data = self.data_ingestion.get_latest_data(symbol)
             if len(data) >= 200:
-                features = generate_features(data, 'trending', symbol, data)
+                regime_tuple = self.trainer.get_cached_regime(symbol, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                features = generate_features(data, regime, symbol, data)
                 features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
                 if symbol in self.trainer.ppo_models and self.trainer.ppo_models[symbol]:
                     self.causal_manager[symbol] = CausalSignalManager(
@@ -667,7 +680,9 @@ class SignalGenerator:
             total_rows = 0
             for sym in self.config.get('SYMBOLS', []):
                 data = self.data_ingestion.get_latest_data(sym)
-                features = generate_features(data, 'trending', sym, data)
+                regime_tuple = self.trainer.get_cached_regime(sym, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                features = generate_features(data, regime, sym, data)
                 if features is not None and features.shape[0] > 0:
                     rows = features.shape[0]
                     total_rows += rows
@@ -713,7 +728,9 @@ class SignalGenerator:
         for symbol in self.config.get('SYMBOLS', []):
             data = self.data_ingestion.get_latest_data(symbol)
             if len(data) >= 200:
-                features = generate_features(data, 'trending', symbol, data)
+                regime_tuple = self.trainer.get_cached_regime(symbol, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                features = generate_features(data, regime, symbol, data)
                 features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
                 if symbol in self.trainer.ppo_models and self.trainer.ppo_models[symbol]:
                     self.causal_manager[symbol] = CausalSignalManager(
@@ -728,7 +745,9 @@ class SignalGenerator:
             symbol_ids = []
             for sym in self.config.get('SYMBOLS', []):
                 data = self.data_ingestion.get_latest_data(sym)
-                features = generate_features(data, 'trending', sym, data)
+                regime_tuple = self.trainer.get_cached_regime(sym, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                features = generate_features(data, regime, sym, data)
                 if features is not None and features.shape[0] > 0:
                     all_features.append(features)
                     symbol_ids.extend([sym] * features.shape[0])
@@ -771,7 +790,7 @@ class SignalGenerator:
         Unrealized P&L is now tracked separately — no more contamination of Gemini tuning data.
         Broker-side reward push now handles the heavy lifting — this method only does monitoring/pruning."""
         try:
-            for symbol in self.config['SYMBOLS']:
+            for symbol in self.config.get('SYMBOLS', []):
                 history = getattr(self, 'live_signal_history', {}).get(symbol, [])
                 if not history:
                     continue
@@ -792,6 +811,13 @@ class SignalGenerator:
                     win_rate = sum(r > 0 for r in recent_rets) / len(recent_rets)
                     if win_rate < 0.4:
                         logger.warning(f"{symbol} OOS degradation detected: recent win rate {win_rate:.1%} — capping conviction")
+                        # Actually apply the cap by boosting the confidence threshold (fewer entries)
+                        if symbol in self.trainer.confidence_thresholds:
+                            thresholds = self.trainer.confidence_thresholds[symbol]
+                            if thresholds:
+                                latest = thresholds[-1]
+                                latest['long'] = min(latest.get('long', 0.6) + 0.05, 0.85)
+                                latest['short'] = max(latest.get('short', 0.4) - 0.05, 0.15)
                 # B-25 FIX: Runtime prune old realized entries to prevent memory bloat (keep last 2000 per symbol)
                 if len(history) > 2000:
                     history[:] = history[-2000:]
@@ -807,6 +833,6 @@ class SignalGenerator:
             await asyncio.sleep(update_interval_seconds)
             try:
                 logger.info("Running dynamic walk-forward threshold re-optimization")
-                self.trainer.dynamic_walk_forward_update()
+                await asyncio.to_thread(self.trainer.dynamic_walk_forward_update)
             except Exception as e:
                 logger.error(f"Dynamic threshold update failed: {e}", exc_info=True)

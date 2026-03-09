@@ -25,6 +25,23 @@ def _is_nyse_holiday(d: datetime.date) -> bool:
     if d.weekday() >= 5:
         return True  # weekend (handled separately in callers, but safe)
 
+    # Good Friday: NYSE is closed but it's not a US federal holiday
+    # Easter algorithm (Anonymous Gregorian) to find Good Friday
+    a = d.year % 19
+    b, c = divmod(d.year, 100)
+    e, f = divmod(b, 4)
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - e - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * f + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    easter = datetime(d.year, month, day).date()
+    good_friday = easter - timedelta(days=2)
+    if d == good_friday:
+        return True
+
     us_hols = holidays.US(years=d.year, observed=True)
     if d not in us_hols:
         return False

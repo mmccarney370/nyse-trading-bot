@@ -95,6 +95,13 @@ class BotInitializer:
                     logger.info(f"[BUFFER RESTORE ON STARTUP] Loaded {buffer_size} samples")
                 else:
                     logger.info("[BUFFER RESTORE ON STARTUP] No portfolio buffer to log")
+        # === CAUSAL RL: Also handle non-portfolio mode ===
+        if not self.bot.portfolio_ppo and CONFIG.get('USE_CAUSAL_RL', False):
+            logger.info("[CAUSAL STARTUP] Portfolio PPO disabled but Causal RL enabled — warming up per-symbol causal buffers")
+            if self.bot.live_signal_history:
+                for sym, manager in getattr(self.bot.signal_gen, 'causal_manager', {}).items():
+                    manager.warmup_from_history(self.bot.live_signal_history.get(sym, []))
+                logger.info("[CAUSAL WARMUP] Per-symbol replay complete")
         # === CAUSAL RL STATUS ===
         if CONFIG.get('USE_CAUSAL_RL', False):
             logger.info("CAUSAL RL ENABLED — full stacked feature matrix built in SignalGenerator at startup + daily 3:30 AM refresh")

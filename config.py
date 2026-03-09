@@ -83,7 +83,7 @@ class TradingBotConfig(BaseModel):
     MAX_POSITION_VALUE_FRACTION: float = 0.25          # Was 0.20 — bigger conviction bets
     RISK_BUDGET_MULTIPLIER: float = 2.0                # Was 1.8 — more capital deployed
     # ==================== Signal Generation ====================
-    MIN_CONFIDENCE: float = 0.82                       # Was 0.88 — take more trades with decent confidence
+    MIN_CONFIDENCE: float = 0.78                       # Signals are much better with fixed stacking — take more trades
     PORTFOLIO_SENTIMENT_WEIGHT: float = 0.35           # Was 0.40 — slightly less sentiment dependency
     SENTIMENT_WEIGHT: float = 0.25                     # Was 0.20 — sentiment more integrated
     USE_LLM_DEBATE: bool = True
@@ -114,39 +114,41 @@ class TradingBotConfig(BaseModel):
     MOM_THRESHOLD_MEAN_REVERTING: float = 0.03
     BREAKOUT_BOOST_FACTOR: float = 1.2
     # ==================== Model Training (Stacking + PPO) ====================
-    PPO_TIMESTEPS: int = 150_000                       # Was 100k — more training with fresh features
+    PPO_TIMESTEPS: int = 200_000                       # More training for proper GTrXL convergence
     PPO_RECURRENT: bool = True
     USE_CUSTOM_GTRXL: bool = True
     GTRXL_HIDDEN_SIZE: int = 256
-    GTRXL_NUM_LAYERS: int = 4
-    GTRXL_NUM_HEADS: int = 16
+    GTRXL_NUM_LAYERS: int = 2                           # Was 4 — fewer layers = less sensitivity to weight changes
+    GTRXL_NUM_HEADS: int = 8                            # Was 16 — 256/8=32 dims per head (was 16, too small)
+    GTRXL_MEMORY_LENGTH: int = 64                       # XL memory: past hidden states per layer retained across chunks
+    GTRXL_EVAL_CHUNK_SIZE: int = 64                     # Chunk size for batched evaluate_actions (~64x speedup)
     PPO_LSTM_HIDDEN_SIZE: int = 512
     PPO_N_LSTM_LAYERS: int = 4
-    PPO_LEARNING_RATE: float = 3e-4                    # Was 7.8e-5 — align with cosine schedule initial_lr
-    PPO_LEARNING_RATE_MIN: float = 1e-6                # NEW — cosine schedule floor
-    PPO_ONLINE_LEARNING_RATE: float = 5e-5             # NEW — was hardcoded 1e-5 (too conservative)
-    PPO_ENTROPY_COEFF: float = 0.04                    # Was 0.023 — more exploration, especially early
-    PPO_GAMMA: float = 0.96                            # Was 0.95 — slightly longer horizon
-    PPO_GAE_LAMBDA: float = 0.93                       # Was 0.92 — slightly more bootstrapping
-    PPO_CLIP_RANGE: float = 0.15                       # Was 0.13 — slightly wider clipping
-    PPO_OVERRIDE_CONF: float = 0.93                    # Was 0.95 — let PPO override more often
-    vf_coef: float = 0.5                               # Was 0.6 — reduce value function dominance
+    PPO_LEARNING_RATE: float = 8e-5                    # Slightly lower for GTrXL stability
+    PPO_LEARNING_RATE_MIN: float = 5e-6                # Higher floor — don't decay to near-zero
+    PPO_ONLINE_LEARNING_RATE: float = 3e-5             # Conservative online updates to preserve learned policy
+    PPO_ENTROPY_COEFF: float = 0.03                    # Higher for fresh start exploration, Gemini can lower later
+    PPO_GAMMA: float = 0.97                            # Longer horizon — GTrXL can handle temporal credit assignment
+    PPO_GAE_LAMBDA: float = 0.93                       # Good balance of bias/variance
+    PPO_CLIP_RANGE: float = 0.18                       # Wider for fresh training — allows larger policy updates
+    PPO_OVERRIDE_CONF: float = 0.90                    # Let PPO override more with better signals
+    vf_coef: float = 1.0                               # Critic needs equal weight with GTrXL architecture
     RISK_PENALTY_COEF: float = 0.10
-    VOL_PENALTY_COEF: float = 0.015                    # Was 0.0005 — unified for env.py and portfolio_env.py
-    DD_PENALTY_COEF: float = 1.5                       # Was 0.065 — unified, moderate (env.py had 3.0!)
+    VOL_PENALTY_COEF: float = 0.02                     # Moderate vol penalty — discourages erratic sizing
+    DD_PENALTY_COEF: float = 2.0                       # Stronger DD penalty — teach risk management from fresh start
     PPO_AUX_TASK: bool = True
     PPO_AUX_LOSS_WEIGHT: float = 0.25                  # Was 0.2 — slightly stronger aux signal
     NUM_BASE_MODELS: int = 20                          # Was 15 — larger ensemble for better stacking
     PPO_ONLINE_UPDATE_TIMESTEPS: int = 75_000          # Was 100k — faster online adaptation
-    PPO_MAX_GRAD_NORM: float = 0.5                     # NEW — was hardcoded 0.3 (too tight for recurrent)
-    PPO_N_STEPS: int = 2048                            # Rollout buffer — must be large enough for episodes to complete
-    PPO_BATCH_SIZE: int = 128                          # Minibatch size (n_steps/batch_size = 16 minibatches per epoch)
-    PPO_N_EPOCHS: int = 3                              # Fewer epochs prevents overfitting per rollout
+    PPO_MAX_GRAD_NORM: float = 0.4                     # Slightly tighter for GTrXL gradient stability
+    PPO_N_STEPS: int = 2048                            # Rollout buffer — full episodes fit within
+    PPO_BATCH_SIZE: int = 256                          # Larger batches = more stable gradients for transformer
+    PPO_N_EPOCHS: int = 4                              # More epochs to extract value from each rollout
     MAX_EPISODE_STEPS: int = 2048                      # Truncate portfolio episodes so they complete within rollouts
     # ==================== PORTFOLIO-LEVEL PPO ====================
     PORTFOLIO_PPO: bool = True
     MAX_LEVERAGE: float = 2.0                          # Was 2.15 — slightly more conservative
-    PORTFOLIO_TIMESTEPS: int = 1_200_000               # Was 1M — more training for 8-symbol portfolio
+    PORTFOLIO_TIMESTEPS: int = 1_500_000               # More portfolio training — GTrXL converges slower but better
     PORTFOLIO_ONLINE_TIMESTEPS: int = 75_000           # Was 100k — faster online updates
     ONLINE_PPO_UPDATE_HOURS: int = 4                   # Was 6 — more frequent adaptation
     LIGHTGBM_PARAMS: Dict[str, Any] = Field(
@@ -171,10 +173,10 @@ class TradingBotConfig(BaseModel):
     OPTUNA_TIMEOUT: int = 900
     THRESHOLD_PENALTY_WEIGHT: float = 0.50
     # ==================== Reward Shaping (env.py / portfolio_env.py) ====================
-    TURNOVER_COST_MULT: float = 0.3                    # NEW — was hardcoded 0.0005*1000=0.5 in env.py
-    SORTINO_WEIGHT: float = 0.20                       # NEW — was hardcoded 0.25 in env.py
-    SORTINO_ZERO_DD_BONUS: float = 0.03                # NEW — was hardcoded 0.05 in env.py
-    PERSISTENCE_BONUS_SCALE: float = 0.4               # NEW — was hardcoded 1.0 in env.py (way too high)
+    TURNOVER_COST_MULT: float = 0.05                   # Was 0.3 but turnover was bugged (always 0) — introduce gradually
+    SORTINO_WEIGHT: float = 0.25                       # Stronger Sortino emphasis for risk-adjusted returns
+    SORTINO_ZERO_DD_BONUS: float = 0.02                # Small bonus for no-drawdown steps
+    PERSISTENCE_BONUS_SCALE: float = 0.15              # Low — avoid reward noise from persistence signal
     CURRENT_REGIME: str = 'mean_reverting'
     # ==================== Operational & Misc ====================
     TRADING_INTERVAL: int = 45                         # Was 60 — faster trading cycles

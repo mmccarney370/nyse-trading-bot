@@ -20,10 +20,14 @@ from models.features import generate_features
 from models.portfolio_env import PortfolioEnv # NEW: Portfolio environment
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env.vec_normalize import VecNormalize
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
 import torch
 import json
 import os
+import tempfile
+import shutil
+import threading
 # NEW: Share the same persistent regime cache file as bot.py
 REGIME_CACHE_FILE = "regime_cache.json"
 # NEW: Use the modern CausalSignalManager from the extracted module (Phase 1 modularization)
@@ -88,6 +92,8 @@ class Trainer:
         # Portfolio-level models (single shared policy)
         self.portfolio_ppo_model = None
         self.portfolio_vec_norm = None
+        # Thread lock for shared state mutations during parallel training
+        self._lock = threading.Lock()
         # NEW: Use the SAME persistent regime cache as bot.py
         self.regime_cache = self._load_regime_cache()
 
@@ -104,10 +110,13 @@ class Trainer:
         return {}
 
     def _save_regime_cache(self):
-        """Save cache to the same file as bot.py"""
+        """Save cache atomically via tempfile + rename (crash-safe, thread-safe)."""
         try:
-            with open(REGIME_CACHE_FILE, 'w') as f:
-                json.dump(self.regime_cache, f, default=str)
+            with self._lock:
+                fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(REGIME_CACHE_FILE) or '.', suffix='.tmp')
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(self.regime_cache, f, default=str)
+                shutil.move(tmp_path, REGIME_CACHE_FILE)
             logger.debug(f"Saved regime cache with {len(self.regime_cache)} symbols")
         except Exception as e:
             logger.warning(f"Failed to save regime cache: {e}")
@@ -185,11 +194,19 @@ class Trainer:
                 ensemble_prob = np.mean(meta_probs, axis=0) if meta_probs else np.full(len(features), 0.5)
             else:
                 ensemble_prob = np.full(len(features), 0.5)
-            ensemble_prob = ensemble_prob[:-1] # align with returns
+            ensemble_prob = ensemble_prob[:-1] # drop last (no future return for it)
+        # Compute forward returns for alignment
         returns = data['close'].pct_change().shift(-1).dropna()
-        aligned_returns = returns.iloc[:len(ensemble_prob)]
+        # Features correspond to the TAIL of data (rolling windows drop leading rows)
+        # Align by taking the last len(ensemble_prob) returns to match feature positions
+        n_probs = len(ensemble_prob)
+        if len(returns) > n_probs:
+            aligned_returns = returns.iloc[-n_probs:]
+        else:
+            aligned_returns = returns.iloc[:n_probs]
+            ensemble_prob = ensemble_prob[:len(aligned_returns)]
         df = pd.DataFrame({
-            'meta_prob': ensemble_prob,
+            'meta_prob': ensemble_prob[:len(aligned_returns)],
             'return': aligned_returns.values
         }, index=aligned_returns.index)
         n_windows = 6
@@ -198,10 +215,14 @@ class Trainer:
             chunk_start = w * window_size
             chunk_end = (w + 1) * window_size if w < n_windows - 1 else len(df)
             chunk_df = df.iloc[chunk_start:chunk_end]
-            # ==================== TRUE OOS VALIDATION (70/30 split per window) ====================
+            # ==================== TRUE OOS VALIDATION (70/30 split per window, 1-bar embargo) ====================
             train_size = int(len(chunk_df) * 0.70)
+            embargo = 1  # Prevent forward-return leakage at the train/OOS boundary
             train_df = chunk_df.iloc[:train_size]
-            oos_df = chunk_df.iloc[train_size:]
+            oos_df = chunk_df.iloc[train_size + embargo:]
+            if len(train_df) < 20 or len(oos_df) < 10:
+                logger.warning(f"{symbol} window {w+1} too small (train={len(train_df)}, oos={len(oos_df)}) — skipping")
+                continue
             logger.debug(f"{symbol} window {w+1}/{n_windows} — train:{len(train_df)} | OOS:{len(oos_df)}")
             def objective(trial):
                 long_thresh = trial.suggest_float('long_thresh', 0.55, 0.85)
@@ -223,12 +244,16 @@ class Trainer:
                                    np.where(oos_df['meta_prob'] < best.params['short_thresh'], -1, 0))
             strat_returns_oos = signals_oos * oos_df['return']
             oos_sharpe = strat_returns_oos.mean() / (strat_returns_oos.std() + 1e-8) * np.sqrt(252 * 96)
+            is_oos_gap = best_score_is - oos_sharpe
             logger.info(
                 f"{symbol} window {w+1}/{n_windows} — IS Sharpe: {best_score_is:.3f} | "
-                f"OOS Sharpe: {oos_sharpe:.3f} (long={best.params['long_thresh']:.3f}, short={best.params['short_thresh']:.3f})"
+                f"OOS Sharpe: {oos_sharpe:.3f} | gap: {is_oos_gap:.3f} "
+                f"(long={best.params['long_thresh']:.3f}, short={best.params['short_thresh']:.3f})"
             )
-            # Only accept if OOS is reasonable (prevents pure in-sample overfitting)
-            if oos_sharpe > -0.5: # reasonable filter
+            if is_oos_gap > 1.0:
+                logger.warning(f"{symbol} window {w+1} shows significant overfitting — IS/OOS gap {is_oos_gap:.2f}")
+            # Only accept if OOS is non-negative (prevents accepting money-losing thresholds)
+            if oos_sharpe > 0.0:
                 final_long_thresh = best.params['long_thresh']
                 final_short_thresh = best.params['short_thresh']
                 # Small safety clamp
@@ -395,13 +420,13 @@ class Trainer:
             return
         # Use configurable timesteps (fallback to large number for portfolio problems)
         timesteps = timesteps or self.config.get('PORTFOLIO_TIMESTEPS', 1_000_000)
-        # Create vectorized PortfolioEnv
-        env = DummyVecEnv([lambda: PortfolioEnv(
+        # Create vectorized PortfolioEnv wrapped with Monitor for episode tracking
+        env = DummyVecEnv([lambda: Monitor(PortfolioEnv(
             data_dict=data_dict,
             symbols=symbols,
             initial_balance=self.config.get('INITIAL_BALANCE', 100_000.0),
             max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
-        )])
+        ))])
         vec_env = VecNormalize(env, norm_obs=True, norm_reward=True)
         success = False
         for attempt in range(3):
@@ -411,7 +436,7 @@ class Trainer:
                 # FIXED: Removed use_sde=False to avoid duplicate argument error
                 policy_kwargs = dict(
                     features_extractor_class=None, # PortfolioEnv handles features internally
-                    net_arch=dict(pi=[512, 512], vf=[512, 512]), # Larger nets for portfolio complexity
+                    net_arch=dict(pi=[256, 256], vf=[512, 256]), # Asymmetric: bigger critic for randomized starts
                 )
                 if use_recurrent:
                     if use_custom_gtrxl:
@@ -427,16 +452,16 @@ class Trainer:
                         policy_kwargs=policy_kwargs,
                         verbose=1,
                         tensorboard_log="./ppo_tensorboard/portfolio" if CONFIG.get('USE_TENSORBOARD') else None,
-                        learning_rate=CONFIG.get('PPO_LEARNING_RATE', 3e-4),
+                        learning_rate=cosine_annealing_schedule,
                         n_steps=CONFIG.get('PPO_N_STEPS', 2048),
                         batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
-                        n_epochs=CONFIG.get('PPO_N_EPOCHS', 5),
-                        gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                        n_epochs=CONFIG.get('PPO_N_EPOCHS', 4),
+                        gamma=CONFIG.get('PPO_GAMMA', 0.97),
                         gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
-                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
-                        ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.04),
-                        vf_coef=CONFIG.get('vf_coef', 0.5),
-                        max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5),
+                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.18),
+                        ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.03),
+                        vf_coef=CONFIG.get('vf_coef', 1.0),
+                        max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.4),
                         device="auto"
                     )
                 else:
@@ -448,15 +473,16 @@ class Trainer:
                         policy_kwargs=policy_kwargs,
                         verbose=1,
                         tensorboard_log="./ppo_tensorboard/portfolio" if CONFIG.get('USE_TENSORBOARD') else None,
-                        learning_rate=CONFIG.get('PPO_LEARNING_RATE', 3e-4),
+                        learning_rate=cosine_annealing_schedule,
                         n_steps=CONFIG.get('PPO_N_STEPS', 2048),
                         batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
-                        n_epochs=CONFIG.get('PPO_N_EPOCHS', 5),
-                        gamma=CONFIG.get('PPO_GAMMA', 0.96),
+                        n_epochs=CONFIG.get('PPO_N_EPOCHS', 4),
+                        gamma=CONFIG.get('PPO_GAMMA', 0.97),
                         gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
-                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.15),
-                        vf_coef=CONFIG.get('vf_coef', 0.5),
-                        max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.5),
+                        clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.18),
+                        ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.03),
+                        vf_coef=CONFIG.get('vf_coef', 1.0),
+                        max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.4),
                         device="auto"
                     )
                 nan_callback = NaNStopCallback()
@@ -553,13 +579,13 @@ class Trainer:
             return
         timesteps = timesteps or self.config.get('PORTFOLIO_ONLINE_TIMESTEPS', 100_000)
         try:
-            # Recreate environment with latest data
-            env = DummyVecEnv([lambda: PortfolioEnv(
+            # Recreate environment with latest data (Monitor for episode tracking)
+            env = DummyVecEnv([lambda: Monitor(PortfolioEnv(
                 data_dict=data_dict,
                 symbols=symbols,
                 initial_balance=self.config.get('INITIAL_BALANCE', 100_000.0),
                 max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
-            )])
+            ))])
             new_vec_env = VecNormalize(env, norm_obs=True, norm_reward=True)
             # Transfer normalization statistics from previous VecNormalize if exists
             if self.portfolio_vec_norm is not None:
@@ -585,6 +611,9 @@ class Trainer:
                 callback=[nan_callback, profit_callback],
                 reset_num_timesteps=False # Crucial: continue from previous timesteps
             )
+            # Restore original learning rate after online fine-tuning
+            model.learning_rate = original_lr
+            logger.info(f"Restored learning rate to {original_lr} after online portfolio update")
             # Update stored references
             self.portfolio_vec_norm = new_vec_env
             # CRIT-14 FIX: Rebuild/restore portfolio causal manager after online update
@@ -621,8 +650,8 @@ class Trainer:
                                     action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                                     reward = entry.get('realized_return', 0.0)
                                     self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Causal warmup entry failed: {e}")
                         logger.info(f"[CAUSAL WARMUP AFTER UPDATE] Portfolio causal buffer refreshed")
             # Save updated model
             save_ppo_model(self, "portfolio")

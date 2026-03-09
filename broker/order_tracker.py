@@ -58,7 +58,10 @@ class OrderGroup:
 
     @classmethod
     def from_dict(cls, d: dict) -> 'OrderGroup':
-        return cls(**d)
+        import dataclasses
+        valid_keys = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in d.items() if k in valid_keys}
+        return cls(**filtered)
 
 
 class OrderTracker:
@@ -189,6 +192,6 @@ class OrderTracker:
         group = self.groups.get(symbol)
         if group:
             group.trail_percent = new_trail_percent
-            if new_stop_price:
+            if new_stop_price is not None:
                 group.stop_price = new_stop_price
             self._save()

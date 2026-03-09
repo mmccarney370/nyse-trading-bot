@@ -47,9 +47,16 @@ class LocalLLMDebate:
             # P-8 FIX: Only fallback on actual failure (NaN), not on valid neutral score (0.0)
             if np.isnan(score):
                 score = await asyncio.to_thread(self._call_ollama, self.fallback, prompt)
-         
+
+            # Skip NaN scores entirely — don't let them poison the average
+            if np.isnan(score):
+                logger.warning(f"Local LLM {role} returned NaN even after fallback — skipping")
+                continue
             opinions.append(score)
             logger.debug(f"Local LLM {role} score: {score:.3f}")
+        if not opinions:
+            logger.warning("All LLM opinions were NaN — returning neutral 0.0")
+            return 0.0
         final = sum(opinions) / len(opinions)
         logger.info(f"Local LLM debate final: {final:.3f} ({len(news_texts)} headlines)")
         return final

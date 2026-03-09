@@ -211,9 +211,30 @@ class PortfolioEnv(gym.Env):
         # FIX: Use 252 trading days * 96 fifteen-min bars per day (not 365*24*4 which assumes 24/7 trading)
         annual_vol = np.std(recent_rets) * np.sqrt(252 * 96) if len(recent_rets) > 10 else 0.0
 
+        # ─── Base reward: portfolio return ───
         reward = portfolio_return
-        reward -= CONFIG.get('VOL_PENALTY_COEF', 0.03) * annual_vol
+
+        # ─── Turnover penalty ───
+        turnover = np.sum(np.abs(target_weights - self.last_weights))
+        reward -= CONFIG.get('TURNOVER_COST_MULT', 0.05) * turnover
+
+        # ─── Sortino component (matches env.py) ───
+        if len(recent_rets) > 20:
+            recent_arr = np.array(recent_rets[-20:])
+            downside = recent_arr[recent_arr < 0]
+            if len(downside) > 1:
+                ds_std = max(np.std(downside), 1e-8)
+                sortino = np.mean(recent_arr) / ds_std
+                reward += sortino * CONFIG.get('SORTINO_WEIGHT', 0.25)
+            else:
+                reward += CONFIG.get('SORTINO_ZERO_DD_BONUS', 0.02)
+
+        # ─── Volatility penalty ───
+        reward -= CONFIG.get('VOL_PENALTY_COEF', 0.02) * annual_vol
+
+        # ─── Drawdown penalty ───
         reward -= CONFIG.get('DD_PENALTY_COEF', 2.0) * max(-drawdown, 0.0)
+
         reward = np.clip(reward, -10.0, 10.0)
 
         self.current_step += 1

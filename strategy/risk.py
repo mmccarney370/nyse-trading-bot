@@ -96,7 +96,7 @@ class RiskManager:
             else 'RISK_PER_TRADE_MEAN_REVERTING' if regime == 'mean_reverting'
             else 'RISK_PER_TRADE'
         )
-        base_risk_pct = self.config.get(base_risk_pct_key, self.config['RISK_PER_TRADE'])
+        base_risk_pct = self.config.get(base_risk_pct_key, self.config.get('RISK_PER_TRADE', 0.02))
         if risk_amount is None:
             risk_amount = equity * base_risk_pct
         if len(data) < 50:
@@ -139,10 +139,16 @@ class RiskManager:
         if conviction < conv_threshold:
             logger.debug(f"Low conviction skip for {symbol}: {conviction:.2f} < {conv_threshold}")
             scaled_shares = 0
-        shares = int(scaled_shares)
+        if self.config.get('FRACTIONAL_SHARES', True):
+            shares = round(scaled_shares, 4)  # Keep fractional precision
+        else:
+            shares = int(scaled_shares)
         max_value = equity * self.config.get('MAX_POSITION_VALUE_FRACTION', 0.2)
         if shares * price > max_value:
-            shares = int(max_value / price)
+            if self.config.get('FRACTIONAL_SHARES', True):
+                shares = round(max_value / price, 4)
+            else:
+                shares = int(max_value / price)
             logger.debug(f"Position capped by MAX_POSITION_VALUE_FRACTION for {symbol}: {shares} shares")
 
         # M-5 FIX: Real-time buying power safety cap — prevents sizing beyond available cash/margin
@@ -150,7 +156,10 @@ class RiskManager:
             try:
                 buying_power = self.broker.get_buying_power()
                 safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)  # e.g. 85% of BP to leave buffer
-                max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
+                if self.config.get('FRACTIONAL_SHARES', True):
+                    max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
+                else:
+                    max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
                 if shares > max_affordable:
                     logger.warning(f"[M-5 BUYING POWER CAP] {symbol}: requested {shares} shares → reduced to {max_affordable} "
                                    f"(buying_power=${buying_power:,.0f}, safety_factor={safety_factor})")
@@ -324,6 +333,13 @@ class RiskManager:
         else:
             weights = np.ones(n) / n
         alloc = {sym: total_risk_budget * weights[i] for i, sym in enumerate(symbols)}
+        # Apply safety caps even in fallback mode
+        max_per_symbol_frac = self.config.get('MAX_POSITION_VALUE_FRACTION', 0.20)
+        max_total_risk = self.config.get('MAX_TOTAL_RISK_PCT', 0.12) * equity
+        for sym in alloc:
+            max_dollar = max_per_symbol_frac * equity
+            if abs(alloc[sym]) > max_dollar:
+                alloc[sym] = np.sign(alloc[sym]) * max_dollar
         logger.info(f"[CVaR FALLBACK] Using conviction-weighted allocations: {alloc}")
         return alloc
 
@@ -336,7 +352,7 @@ class RiskManager:
             daily_equity[today] = equity
         daily_loss = (equity - daily_equity[today]) / daily_equity[today] if daily_equity[today] > 0 else 0.0
         api_failures = getattr(self.data_ingestion.data_handler, 'api_failures', 0)
-        immediate_trigger = daily_loss < self.config['DAILY_LOSS_THRESHOLD'] or api_failures > self.config['API_FAILURE_THRESHOLD']
+        immediate_trigger = daily_loss < self.config.get('DAILY_LOSS_THRESHOLD', -0.03) or api_failures > self.config.get('API_FAILURE_THRESHOLD', 5)
         if immediate_trigger and not self.immediate_pause_active:
             logger.warning("Trading paused due to daily loss threshold or excessive API failures")
             self.immediate_pause_active = True

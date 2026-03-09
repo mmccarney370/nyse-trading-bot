@@ -22,6 +22,7 @@
 import logging
 import numpy as np
 import pandas as pd
+import asyncio
 import random
 from datetime import datetime, timedelta
 from dateutil import tz
@@ -126,6 +127,7 @@ class Backtester:
         daily_equity = {}
         equity_history = {}
         current_day = None
+        last_logged_day = None
         last_pause_state = False
         # === PORTFOLIO PPO MODE ===
         if self.config.get('PORTFOLIO_PPO', False):
@@ -186,19 +188,22 @@ class Backtester:
                     equity_history=equity_history,
                     is_backtest=True
                 )
-                if self.debug_mode and (pause != last_pause_state or current_day != current_day):
+                if self.debug_mode and (pause != last_pause_state or current_day != last_logged_day):
                     logger.info(f"[PAUSE CHECK] pause={pause} at {timestamp.date()}")
                     last_pause_state = pause
+                    last_logged_day = current_day
                 if pause:
                     equity_curve.append((timestamp, pre_trade_equity))
                     continue
                 # Generate portfolio actions
-                target_weights = self.signal_gen.generate_portfolio_actions(
-                    symbols=symbols_config,
-                    data_dict=data_dict,
-                    current_equity=pre_trade_equity,
-                    precomputed_env=precomputed_env,
-                    timestamp=timestamp
+                target_weights = asyncio.get_event_loop().run_until_complete(
+                    self.signal_gen.generate_portfolio_actions(
+                        symbols=symbols_config,
+                        data_dict=data_dict,
+                        current_equity=pre_trade_equity,
+                        precomputed_env=precomputed_env,
+                        timestamp=timestamp
+                    )
                 )
                 # Regime detection
                 regimes = {}
@@ -213,13 +218,14 @@ class Backtester:
                     else:
                         regime_window = data_dict[sym]
                     if len(regime_window) >= 50:
-                        regimes[sym] = detect_regime(
+                        regime_result = detect_regime(
                             data=regime_window,
                             symbol=sym,
                             data_ingestion=self.data_ingestion,
                             lookback=CONFIG.get('LOOKBACK', 900),
                             is_backtest=True
                         )
+                        regimes[sym] = regime_result[0] if isinstance(regime_result, (list, tuple)) else regime_result
                         actual_last_bar = regime_window.index[-1] if not regime_window.empty else "No data"
                         logger.info(f"Regime for {sym} at {timestamp} | using last_bar={actual_last_bar}")
                     else:
@@ -246,7 +252,7 @@ class Backtester:
                     max_notional = pre_trade_equity * 0.25
                     max_shares = int(max_notional / price) if price > 0 else 0
                     target_qty_raw = np.clip(target_qty_raw, -max_shares, max_shares)
-                    target_qty = int(target_qty_raw)
+                    target_qty = round(target_qty_raw)
                     current_qty = positions.get(sym, {}).get('signed_qty', 0)
                     direction = 1 if target_qty > 0 else (-1 if target_qty < 0 else 0)
                     target_qty = abs(target_qty) * direction
@@ -310,7 +316,7 @@ class Backtester:
                             stop_price = max(stop_price, effective_entry_price * 0.65)
                         else:
                             stop_price = min(stop_price, effective_entry_price * 1.35)
-                        tp_distance = tp_mult * atr if regime != 'trending' else tp_mult * atr * 50
+                        tp_distance = tp_mult * atr
                         tp_price = effective_entry_price + direction * tp_distance
                         positions[sym] = {
                             'signed_qty': target_qty,
@@ -340,12 +346,12 @@ class Backtester:
                     if signed_qty == 0:
                         continue
                     quoted_price = current_prices.get(sym)
-                    if quoted_price is None:
+                    if quoted_price is None or quoted_price <= 0:
                         continue
                     direction = np.sign(signed_qty)
                     regime = pos['regime']
                     data_window = data_dict.get(sym)
-                    if len(data_window) < 14:
+                    if data_window is None or len(data_window) < 14:
                         continue
                     atr = self._compute_current_atr(data_window)
                     trailing_mult = self.config.get(
@@ -493,13 +499,14 @@ class Backtester:
                         regime_data_window = full_dfs_1h.get(sym, pd.DataFrame()).loc[:prev_timestamp]
                         if len(regime_data_window) < 50:
                             regime_data_window = signal_data_window
-                        regime = detect_regime(
+                        regime_result = detect_regime(
                             data=regime_data_window,
                             symbol=sym,
                             data_ingestion=self.data_ingestion,
                             lookback=CONFIG.get('LOOKBACK', 900),
                             is_backtest=True
                         )
+                        regime = regime_result[0] if isinstance(regime_result, (list, tuple)) else regime_result
                         try:
                             signal_output = self.signal_gen.generate_signal_sync(
                                 symbol=sym,
@@ -526,9 +533,10 @@ class Backtester:
                     equity_history=equity_history,
                     is_backtest=True
                 )
-                if self.debug_mode and (pause != last_pause_state or day != current_day):
+                if self.debug_mode and (pause != last_pause_state or day != last_logged_day):
                     logger.info(f"[PAUSE CHECK] pause={pause} at {day}")
                     last_pause_state = pause
+                    last_logged_day = day
                 alloc_dollars = {}
                 if signals and not pause:
                     signal_symbols = list(signals.keys())
@@ -600,7 +608,7 @@ class Backtester:
                             stop_price = max(stop_price, price * 0.65)
                         else:
                             stop_price = min(stop_price, price * 1.35)
-                        tp_distance = tp_mult * atr if regime != 'trending' else tp_mult * atr * 50
+                        tp_distance = tp_mult * atr
                         tp_price = price + direction * tp_distance
                         positions[sym] = {
                             'signed_qty': signed_size,

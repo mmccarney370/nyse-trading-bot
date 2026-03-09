@@ -211,7 +211,11 @@ class CausalSignalManager:
                 logger.info(f"[CAUSAL] Seeded DoWhy with {len(data)} REAL (obs, action, reward) transitions")
             else:
                 data = features_df.copy()
-                logger.warning("[CAUSAL] Buffer sample returned None — using features only (no action/reward)")
+                if 'action' not in data.columns:
+                    data['action'] = 0.0
+                if 'reward' not in data.columns:
+                    data['reward'] = 0.0
+                logger.warning("[CAUSAL] Buffer sample returned None — using features only (synthetic action/reward)")
             # BUG-3 FIX: Preserve symbol_id (convert to numeric codes) so it survives select_dtypes
             if 'symbol_id' in data.columns:
                 data['symbol_id'] = pd.Categorical(data['symbol_id']).codes
@@ -289,12 +293,15 @@ class CausalSignalManager:
             if refined_edges:
                 self.causal_graph = nx.DiGraph(refined_edges)
                 # Rebuild CausalModel with refined graph so they stay in sync
+                refined_gml = ''.join(nx.generate_gml(self.causal_graph))
                 self.causal_model = CausalModel(
                     data=data,
                     treatment='action',
                     outcome='reward',
-                    graph=self.causal_graph
+                    graph=refined_gml
                 )
+                # Re-identify estimand after rebuilding (old one is stale)
+                self.identified_estimand = self.causal_model.identify_effect(proceed_when_unidentifiable=True)
                 logger.info(f"✅ [CAUSAL REFINED] {len(refined_edges)} edges passed statistical refutation")
             else:
                 logger.warning("[CAUSAL REFINED] No edges passed refutation — keeping original GES graph")
@@ -381,6 +388,7 @@ class CausalSignalManager:
             logger.debug(f"[CAUSAL] Penalty computation failed — using neutral factor=1.0")
             penalty_factor = 1.0
         action = action * penalty_factor
+        action = np.clip(action, -1.0, 1.0)
         # B-10: Always log the penalty so we can confirm it's being applied live
         if penalty_factor != 1.0:
             logger.info(f"✅ [CAUSAL PENALTY APPLIED] {self.symbol} | raw={float(original_action):.4f} → adjusted={float(action):.4f} (factor={penalty_factor:.4f})")
@@ -437,7 +445,7 @@ class CausalSignalManager:
             if obs is None or not isinstance(obs, list) or len(obs) == 0:
                 continue # skip invalid/missing obs
             try:
-                obs_array = np.array(obs, dtype=np.float32).reshape(1, -1)
+                obs_array = np.array(obs, dtype=np.float32).flatten()
                 action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                 reward = entry.get('realized_return', 0.0)
                 self.replay_buffer.push(obs_array, action, reward)

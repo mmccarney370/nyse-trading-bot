@@ -129,6 +129,11 @@ class TradeStreamHandler:
         if order_id == group.entry_order_id and group.state.value == 'pending_entry':
             logger.warning(f"[STREAM] Entry order {event} for {symbol} — removing group")
             tracker.remove_group(symbol)
+        elif order_id in (group.trailing_stop_id, group.take_profit_id) and group.state.value == 'open':
+            logger.warning(
+                f"[STREAM] Exit order {event} for {symbol} (order={order_id}) — "
+                f"position may be UNPROTECTED. Monitor loop will re-attach exits."
+            )
 
     async def _handle_replaced(self, order, order_id: str, symbol: str):
         """Handle order replacement (e.g. ratchet tightening trailing stop via PATCH).
@@ -156,6 +161,8 @@ class TradeStreamHandler:
         """Push realized return to causal buffer if bot context is available."""
         bot = self.broker.bot
         if bot is None:
+            return
+        if not hasattr(bot, 'live_signal_history'):
             return
         entry_price = group.entry_price
         if not entry_price:

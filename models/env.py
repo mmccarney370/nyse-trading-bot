@@ -106,7 +106,7 @@ class TradingEnv(gym.Env):
         current_price = self.data['close'].iloc[self.current_step]
         trade_pos = target_pos - self.position
         trade_shares = trade_pos * self.max_shares
-        turnover_cost = abs(trade_shares) * current_price * (CONFIG['SLIPPAGE'] + CONFIG['COMMISSION_PER_SHARE'] / current_price)
+        turnover_cost = abs(trade_shares) * current_price * (CONFIG.get('SLIPPAGE', 0.0005) + CONFIG.get('COMMISSION_PER_SHARE', 0.005) / current_price)
         self.position = target_pos
         self.cash -= trade_shares * current_price  # pay for (or receive from) the shares
         self.cash -= turnover_cost
@@ -116,31 +116,38 @@ class TradingEnv(gym.Env):
         self.equity_prev = self.equity
         # Update drawdown tracking
         self.cummax_equity = max(self.cummax_equity, self.equity)
-        # Base reward
-        reward = ret - CONFIG.get('TURNOVER_COST_MULT', 0.3) * abs(trade_pos)
-        # Existing Sortino component
+        # ─── Base reward: log return (scale-invariant, additive over time) ───
+        reward = ret
+
+        # ─── Turnover penalty: penalize position CHANGES, not absolute position ───
+        reward -= CONFIG.get('TURNOVER_COST_MULT', 0.05) * abs(trade_pos)
+
+        # ─── Sortino component: risk-adjusted return quality ───
         if len(self.returns) > 20:
             recent_returns = np.array(self.returns[-20:])
             downside_returns = recent_returns[recent_returns < 0]
-            if len(downside_returns) > 0:
+            if len(downside_returns) > 1:
                 downside_std = np.std(downside_returns)
                 downside_std = max(downside_std, 1e-8)
                 mean_return = np.mean(recent_returns)
-                sortino = mean_return / downside_std * np.sqrt(252 * 96)
-                reward += sortino * CONFIG.get('SORTINO_WEIGHT', 0.20)
+                sortino = mean_return / downside_std
+                # Scale to per-step magnitude (no annualization — keeps reward scale consistent)
+                reward += sortino * CONFIG.get('SORTINO_WEIGHT', 0.25)
             else:
-                reward += CONFIG.get('SORTINO_ZERO_DD_BONUS', 0.03)
-        # Risk-aware penalties
+                reward += CONFIG.get('SORTINO_ZERO_DD_BONUS', 0.02)
+
+        # ─── Volatility penalty: penalize erratic equity curves ───
         annual_vol = 0.0
         if len(self.returns) > 50:
             recent_vol = np.std(self.returns[-100:])
             annual_vol = recent_vol * np.sqrt(252 * 96)
             reward -= annual_vol * CONFIG.get('VOL_PENALTY_COEF', 0.02)
+
+        # ─── Drawdown penalty: proportional to current drawdown depth ───
         drawdown = (self.equity - self.cummax_equity) / self.cummax_equity if self.cummax_equity > 0 else 0
-        reward += drawdown * CONFIG.get('DD_PENALTY_COEF', 3.0)
-        # ─────────────────────────────────────────────────────────────────────
-        # UPGRADE #1: Causal penalty now in reward shaping (regime + action as treatments)
-        # ─────────────────────────────────────────────────────────────────────
+        reward -= CONFIG.get('DD_PENALTY_COEF', 2.0) * max(-drawdown, 0.0)
+
+        # ─── Causal penalty: counterfactual reward adjustment ───
         if self.causal_wrapper is not None:
             features = generate_features(
                 data=window,
@@ -149,22 +156,18 @@ class TradingEnv(gym.Env):
                 full_hist_df=self.data
             )
             latest_features = features[-1].astype(np.float32) if features is not None and features.shape[0] > 0 else np.zeros(self.observation_space.shape[0])
-            # FIX: CausalSignalManager has compute_penalty_factor() (returns multiplier), not get_causal_penalty()
             penalty_factor = self.causal_wrapper.compute_penalty_factor(
                 latest_features.reshape(1, -1),
                 float(action[0])
             )
-            # Convert multiplier to penalty: factor > 1.0 means causal signal is strong (reward amplification)
-            # factor == 1.0 means no effect
-            penalty = (penalty_factor - 1.0) * abs(reward) * CONFIG.get('CAUSAL_REWARD_FACTOR', 0.7)
-            reward -= penalty
-            logger.debug(f"[CAUSAL REWARD] {self.symbol} | regime={regime} | action={action[0]:.3f} | factor={penalty_factor:.4f} | penalty={penalty:.4f}")
-        # ─────────────────────────────────────────────────────────────────────
-        # UPGRADE #4: Continuous persistence score in reward shaping
-        # High persistence (strong trends) boosts reward; low persistence penalizes
-        # ─────────────────────────────────────────────────────────────────────
-        # P-4 FIX: persistence already computed above — reuse (no second detect_regime call)
-        persistence_bonus = (persistence - 0.5) * CONFIG.get('PERSISTENCE_BONUS_SCALE', 0.4)
+            # factor > 1.0 = strong causal signal → amplify reward direction
+            # factor < 1.0 = weak causal signal → dampen reward
+            # factor = 1.0 = no effect
+            reward *= penalty_factor
+            logger.debug(f"[CAUSAL REWARD] {self.symbol} | regime={regime} | action={action[0]:.3f} | factor={penalty_factor:.4f}")
+
+        # ─── Persistence bonus: reward holding in strong regimes ───
+        persistence_bonus = (persistence - 0.5) * CONFIG.get('PERSISTENCE_BONUS_SCALE', 0.15)
         reward += persistence_bonus
         logger.debug(f"[PERSISTENCE REWARD] {self.symbol} | regime={regime} | persistence={persistence:.3f} | bonus={persistence_bonus:.4f}")
         # ─────────────────────────────────────────────────────────────────────

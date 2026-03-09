@@ -237,11 +237,14 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
             encoder_vars = encoder_cont.detach().cpu().numpy()
             logger.debug(f"[TFT SHAPE DEBUG] {symbol} raw shape: {encoder_vars.shape} ndim={encoder_vars.ndim}")
             if encoder_vars.ndim == 3:
-                encoder_vars = encoder_vars.mean(axis=2)
+                # Average across sequence dimension (axis=1), not features (axis=2)
+                encoder_vars = encoder_vars.mean(axis=1)
             elif encoder_vars.ndim == 1:
                 encoder_vars = encoder_vars.reshape(1, -1)
             elif encoder_vars.ndim == 2 and encoder_vars.shape[0] == 1:
-                encoder_vars = encoder_vars.squeeze(0)
+                pass  # Already 2D [1, features] — keep as-is for padding below
+            if encoder_vars.ndim == 1:
+                encoder_vars = encoder_vars.reshape(1, -1)
             if encoder_vars.ndim != 2:
                 raise ValueError(f"Unexpected final shape: {encoder_vars.shape}")
             if encoder_vars.shape[0] > MAX_TFT_CACHE_ROWS:
@@ -297,10 +300,11 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
         logger.warning(f"[FEATURES SKIP] {symbol} — data too short or all NaN (len={len(data)})")
         return None
     required = ['open', 'high', 'low', 'close', 'volume']
+    data = data.copy()
     for col in required:
         if col not in data.columns:
             data[col] = np.nan
-    data = data[required].copy()
+    data = data[required]
     data = data.ffill().bfill()
     data['volume'] = data['volume'].replace(0, np.nan).ffill().bfill().fillna(0)
     avg_volume = data['volume'].mean()

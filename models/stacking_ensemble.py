@@ -62,11 +62,22 @@ def train_stacking(
         return []
    
     # Prepare labels: next bar direction (1 = up, 0 = down)
+    # pct_change() produces NaN at index 0; shift(-1) produces NaN at last index
+    # dropna() removes both → labels has len(data)-2 rows starting from index 1
     returns = data['close'].pct_change().shift(-1).dropna()
     labels = (returns > 0).astype(int).values
-   
-    # Align features with labels (drop last row of features since labels are shifted)
-    features = features[:-1]
+
+    # Align features with labels:
+    # labels[i] = future return from bar i → i+1 (indices 0..N-2)
+    # features[i] = features at bar i (indices 0..N-1)
+    # Drop first feature row (may have NaN from rolling windows) AND first label
+    # so features[1] pairs with labels[1] (= future return from bar 1 → 2)
+    features = features[1:-1]   # bars 1..N-2
+    labels = labels[1:]         # future returns from bar 1..N-2
+    # Final safety: truncate to shorter of the two
+    min_len = min(len(features), len(labels))
+    features = features[:min_len]
+    labels = labels[:min_len]
    
     models = []
     n_models = CONFIG.get('NUM_BASE_MODELS', 15)
