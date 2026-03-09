@@ -358,7 +358,8 @@ class Trainer:
                 self.ppo_models[symbol] = None
             # ==================== MODERN CAUSAL MANAGER (unified with signals.py) ====================
             if success and symbol in self.ppo_models and self.ppo_models[symbol] is not None:
-                features = generate_features(data, 'trending', symbol, data)
+                cached_regime, _ = self.get_cached_regime(symbol, data)
+                features = generate_features(data, cached_regime, symbol, data)
                 if features is not None and features.shape[0] > 0:
                     features_df = pd.DataFrame(
                         features,
@@ -399,11 +400,15 @@ class Trainer:
                             obs_array = np.array(obs, dtype=np.float32).reshape(1, -1)
                             action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                             reward = entry.get('realized_return', 0.0)
-                            self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
+                            if self.portfolio_causal_manager is not None:
+                                self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
                         except Exception:
                             pass
-                loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
-                logger.info(f"[CAUSAL WARMUP AFTER LOAD] Loaded {loaded_count} historical rewards into portfolio causal buffer")
+                if self.portfolio_causal_manager is not None:
+                    loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
+                    logger.info(f"[CAUSAL WARMUP AFTER LOAD] Loaded {loaded_count} historical rewards into portfolio causal buffer")
+                else:
+                    logger.debug("[CAUSAL WARMUP AFTER LOAD] portfolio_causal_manager is None — skipping warmup")
             return
         logger.info(f"Starting portfolio-level PPO training on {len(symbols)} symbols: {symbols}")
         # Fetch full data for all symbols
@@ -509,7 +514,8 @@ class Trainer:
             symbol_ids = []
             for sym in symbols:
                 data = self.data_ingestion.get_latest_data(sym)
-                features = generate_features(data, 'trending', sym, data)
+                sym_regime, _ = self.get_cached_regime(sym, data)
+                features = generate_features(data, sym_regime, sym, data)
                 if features is not None and features.shape[0] > 0:
                     rows = features.shape[0]
                     all_features.append(features)
@@ -625,7 +631,8 @@ class Trainer:
                 symbol_ids = []
                 for sym in symbols:
                     data = self.data_ingestion.get_latest_data(sym)
-                    features = generate_features(data, 'trending', sym, data)
+                    sym_regime, _ = self.get_cached_regime(sym, data)
+                    features = generate_features(data, sym_regime, sym, data)
                     if features is not None and features.shape[0] > 0:
                         rows = features.shape[0]
                         all_features.append(features)

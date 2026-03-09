@@ -237,7 +237,9 @@ class TradingBot:
                 cleaned[key] = (value, 0.5)
             else:
                 cleaned[key] = ('mean_reverting', 0.5)
-        self.regime_cache = cleaned
+        with self._regime_lock:
+            self.regime_cache.clear()
+            self.regime_cache.update(cleaned)
         logger.debug(f"Regime cache cleaned — now keeping only latest entry per symbol ({len(cleaned)} entries)")
     def time_until_market_open(self):
         """Delegates to the fixed version in helpers.py (Bug #1 patched)."""
@@ -272,13 +274,16 @@ class TradingBot:
         logger.info(f"Universe rotation triggered: {self.config['SYMBOLS']} → {new_symbols}")
         self.config['SYMBOLS'] = new_symbols
         self.data_ingestion.symbols = new_symbols
-        self.data_ingestion.initialize_data()
+        await asyncio.to_thread(self.data_ingestion.initialize_data)
         self.live_signal_history = {s: self.live_signal_history.get(s, []) for s in new_symbols}
         # B-24 FIX: Also prune last_entry_times and save file to prevent stale timestamps/bloat for removed symbols
         self.broker.last_entry_times = {s: self.broker.last_entry_times.get(s) for s in new_symbols if s in self.broker.last_entry_times}
         self._save_last_entry_times()
         # B-26 FIX: Also prune regime_cache for removed symbols and save to prevent stale regimes
-        self.regime_cache = {s: self.regime_cache.get(s) for s in new_symbols if s in self.regime_cache}
+        with self._regime_lock:
+            pruned = {s: self.regime_cache.get(s) for s in new_symbols if s in self.regime_cache}
+            self.regime_cache.clear()
+            self.regime_cache.update(pruned)
         self._save_regime_cache()
         # BUG #16 PATCH: Also prune latest_prices for removed symbols to prevent stale prices + memory leak on rotation
         self.latest_prices = {s: self.latest_prices.get(s) for s in new_symbols if s in self.latest_prices}
@@ -287,11 +292,11 @@ class TradingBot:
             self.portfolio_env.data_dict = {sym: self.data_ingestion.get_latest_data(sym, timeframe='15Min') for sym in new_symbols}
             logger.debug("[PORTFOLIO ENV] Updated data_dict after universe rotation (persistent env refreshed)")
         logger.info("Starting full retrain on new universe...")
-        self.trainer.train_symbols_parallel(new_symbols, full_ppo=True)
+        await asyncio.to_thread(self.trainer.train_symbols_parallel, new_symbols, True)
         # BUG #19 PATCH: Rebuild causal wrappers for the new universe (new symbols must get causal graph + ReplayBuffer)
         if CONFIG.get('USE_CAUSAL_RL', False):
-            self.signal_gen.refresh_causal_wrappers()
-            logger.info("✅ Causal wrappers refreshed for new universe symbols after rotation")
+            await asyncio.to_thread(self.signal_gen.refresh_causal_wrappers)
+            logger.info("Causal wrappers refreshed for new universe symbols after rotation")
             # C-3 SAFETY: Ensure graphs are ready right after refresh/warmup
             if self.signal_gen.portfolio_causal_manager:
                 self.signal_gen.portfolio_causal_manager._ensure_graph_exists()
@@ -323,7 +328,7 @@ class TradingBot:
                 logger.info(f"Market closed — sleeping {sleep_seconds / 3600:.1f} hours until next open")
                 await asyncio.sleep(sleep_seconds)
                 continue
-            current_equity = self.broker.get_equity()
+            current_equity = await asyncio.to_thread(self.broker.get_equity)
             today = datetime.now(tz=tz.gettz('UTC')).date()
             if today not in self.daily_equity:
                 self.daily_equity[today] = current_equity
@@ -344,8 +349,8 @@ class TradingBot:
                 logger.warning("Trading paused due to risk conditions")
                 await asyncio.sleep(300)
                 continue
-            regimes = self._get_all_regimes()
-            positions = self.broker.get_positions_dict()
+            regimes = await asyncio.to_thread(self._get_all_regimes)
+            positions = await asyncio.to_thread(self.broker.get_positions_dict)
             if self.portfolio_ppo and self.trainer.portfolio_ppo_model is not None:
                 logger.debug("Generating portfolio-level actions via multi-asset PPO")
                 try:
@@ -399,15 +404,15 @@ class TradingBot:
                         last_entry = self.broker.last_entry_times.get(sym)
                         if last_entry:
                             bars_since = (datetime.now(tz=tz.gettz('UTC')) - last_entry) / pd.Timedelta(minutes=15)
-                            regime = regimes.get(sym, 'mean_reverting')
+                            regime = regimes.get(sym, ('mean_reverting', 0.5))
                             # Defensive tuple unpack for regime
                             if isinstance(regime, (list, tuple)):
                                 regime = regime[0]
                             # FIX: Add fallback defaults — config.get() returns None if key missing, causing TypeError on < comparison
                             if regime == 'trending':
-                                min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 48)
+                                min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 6)
                             else:
-                                min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
+                                min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
                             if bars_since < min_hold:
                                 if abs(target_qty) != abs(current_qty) or np.sign(target_qty) != np.sign(current_qty):
                                     logger.debug(f"MIN-HOLD ACTIVE {sym} → skipping rebalance (Gemini-tuned {min_hold} bars)")
@@ -437,8 +442,12 @@ class TradingBot:
                                 logger.error(f"Failed to safely close {sym}: {e}")
                         min_qty = 0.01 if self.config.get('FRACTIONAL_SHARES', False) else 1
                         if target_qty != 0 and current_qty * direction <= 0 and abs(target_qty) >= min_qty:
+                            # MAX_POSITIONS enforcement: skip new entries when at capacity
+                            if len(self.broker.existing_positions) >= self.config.get('MAX_POSITIONS', 6):
+                                logger.info(f"Max positions reached ({len(self.broker.existing_positions)}/{self.config.get('MAX_POSITIONS', 6)}) — skipping entry for {sym}")
+                                continue
                             size = abs(target_qty)
-                            regime = regimes.get(sym, 'mean_reverting')
+                            regime = regimes.get(sym, ('mean_reverting', 0.5))
                             # Defensive tuple unpack for regime
                             if isinstance(regime, (list, tuple)):
                                 regime = regime[0]
@@ -449,7 +458,7 @@ class TradingBot:
                             conviction = confidence
                             # ====================== BUG #1 FIX END ======================
                             # M-5 FIX: Cap size by real-time buying power before placing order
-                            buying_power = self.broker.get_buying_power()
+                            buying_power = await asyncio.to_thread(self.broker.get_buying_power)
                             safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
                             if self.config.get('FRACTIONAL_SHARES', True):
                                 max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
@@ -462,7 +471,8 @@ class TradingBot:
                             if size < (0.001 if self.config.get('FRACTIONAL_SHARES', True) else 1):
                                 logger.warning(f"[BUYING POWER] {sym}: insufficient buying power — skipping order")
                                 continue
-                            order = self.broker.place_bracket_order(
+                            order = await asyncio.to_thread(
+                                self.broker.place_bracket_order,
                                 symbol=sym,
                                 size=size,
                                 current_price=price,
@@ -522,6 +532,10 @@ class TradingBot:
                     conviction = 0.3 * confidence + 0.7 * ppo_strength
                     conviction = np.clip(conviction, 0.0, 1.0)
                     if direction != 0 and prev_direction == 0:
+                        # MAX_POSITIONS enforcement: skip new entries when at capacity
+                        if len(self.broker.existing_positions) >= self.config.get('MAX_POSITIONS', 6):
+                            logger.info(f"Max positions reached ({len(self.broker.existing_positions)}/{self.config.get('MAX_POSITIONS', 6)}) — skipping entry for {symbol}")
+                            continue
                         size = self.risk_manager.calculate_position_size(
                             equity=current_equity,
                             price=price,
@@ -533,7 +547,7 @@ class TradingBot:
                         )
                         if size >= 1:
                             # M-5 FIX: Cap size by real-time buying power before placing order
-                            buying_power = self.broker.get_buying_power()
+                            buying_power = await asyncio.to_thread(self.broker.get_buying_power)
                             safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
                             if self.config.get('FRACTIONAL_SHARES', True):
                                 max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
@@ -546,7 +560,8 @@ class TradingBot:
                             if size < (0.001 if self.config.get('FRACTIONAL_SHARES', True) else 1):
                                 logger.warning(f"[BUYING POWER] {symbol}: insufficient buying power — skipping order")
                                 continue
-                            order = self.broker.place_bracket_order(
+                            order = await asyncio.to_thread(
+                                self.broker.place_bracket_order,
                                 symbol=symbol,
                                 size=size,
                                 current_price=price,
@@ -595,12 +610,12 @@ class TradingBot:
                             logger.error(f"Failed to safely close position in {symbol}: {e}")
             self.cycle_count += 1
             if self.cycle_count % self.performance_check_interval == 0:
-                self.signal_gen._monitor_oos_decay()
+                await asyncio.to_thread(self.signal_gen._monitor_oos_decay)
             await asyncio.sleep(self.config['TRADING_INTERVAL'])
     async def run(self):
         """Now extremely clean — only orchestration (Phase 3)"""
         logger.info("=== Starting Bot Initialization ===")
-        self.initializer.perform_full_startup()
+        await asyncio.to_thread(self.initializer.perform_full_startup)
         # ISSUE #6 PATCH: Create persistent PortfolioEnv once after data init
         if self.portfolio_ppo and self.trainer.portfolio_ppo_model is not None:
             logger.info("Creating persistent PortfolioEnv instance (ISSUE #6)")
@@ -608,7 +623,7 @@ class TradingBot:
             self.portfolio_env = PortfolioEnv(
                 data_dict=data_dict,
                 symbols=self.config['SYMBOLS'],
-                initial_balance=self.broker.get_equity(),
+                initial_balance=await asyncio.to_thread(self.broker.get_equity),
                 max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
             )
             logger.info(f"Persistent PortfolioEnv created with {len(self.portfolio_env.timeline)} steps")
@@ -652,9 +667,9 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Emergency save failed: {e}")
             try:
-                open_orders = self.broker.client.get_orders(GetOrdersRequest(status='open'))
+                open_orders = await asyncio.to_thread(self.broker.client.get_orders, GetOrdersRequest(status='open'))
                 for order in open_orders:
-                    self.broker.client.cancel_order_by_id(order.id)
+                    await asyncio.to_thread(self.broker.client.cancel_order_by_id, order.id)
                 logger.info(f"All {len(open_orders)} open orders cancelled on shutdown")
             except Exception as e:
                 logger.error(f"Failed to cancel orders on shutdown: {e}")
@@ -717,6 +732,8 @@ class TradingBot:
     def _get_all_regimes(self):
         regimes = {}
         symbols = self.config['SYMBOLS']
+        cache_misses = []
+        # Phase 1: Read from cache (lock held briefly)
         with self._regime_lock:
             for sym in symbols:
                 if sym in self.regime_cache:
@@ -728,19 +745,26 @@ class TradingBot:
                         regime = str(value)
                         persistence = 0.5
                     regimes[sym] = (regime, persistence)
-                    continue
-                data = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
-                if len(data) > 0:
-                    self.latest_prices[sym] = data['close'].iloc[-1]
-                if len(data) < 50:
-                    regime = 'mean_reverting'
-                    persistence = 0.5
                 else:
-                    recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
-                    regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
-                    persistence = 0.5
-                regimes[sym] = (regime, persistence)
-                self.regime_cache[sym] = (regime, persistence)
+                    cache_misses.append(sym)
+        # Phase 2: Fetch data outside lock (no I/O under lock)
+        for sym in cache_misses:
+            data = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
+            if data is not None and len(data) > 0:
+                self.latest_prices[sym] = data['close'].iloc[-1]
+            if data is None or len(data) < 50:
+                regime = 'mean_reverting'
+                persistence = 0.5
+            else:
+                recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
+                regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
+                persistence = 0.5
+            regimes[sym] = (regime, persistence)
+        # Phase 3: Update cache (lock held briefly)
+        if cache_misses:
+            with self._regime_lock:
+                for sym in cache_misses:
+                    self.regime_cache[sym] = regimes[sym]
         return regimes
     # ==================== GEMINI + CAUSAL REFRESH (3:30 AM) ====================
     async def gemini_scheduled_task(self):
@@ -762,10 +786,10 @@ class TradingBot:
                 # Gemini tuning (enhanced with real dollar P&L)
                 for attempt in range(3):
                     try:
-                        current_equity = self.broker.get_equity()
-                        buying_power = self.broker.get_buying_power()
+                        current_equity = await asyncio.to_thread(self.broker.get_equity)
+                        buying_power = await asyncio.to_thread(self.broker.get_buying_power)
                         starting_equity = list(self.equity_history.values())[0] if self.equity_history else current_equity
-                        positions = self.broker.get_positions_dict()
+                        positions = await asyncio.to_thread(self.broker.get_positions_dict)
                         # === Aggregate trade statistics ===
                         all_closed = []
                         for hist in self.live_signal_history.values():
@@ -818,7 +842,7 @@ class TradingBot:
                         avg_hold_bars = round(np.mean(hold_times), 1) if hold_times else 0.0
                         # === Per-symbol performance with regime breakdown ===
                         symbol_performance = {}
-                        regimes = self._get_all_regimes()
+                        regimes = await asyncio.to_thread(self._get_all_regimes)
                         for sym in self.config['SYMBOLS']:
                             history = self.live_signal_history.get(sym, [])
                             closed = [e for e in history if e.get('realized_return') is not None]
@@ -951,7 +975,7 @@ class TradingBot:
                 if CONFIG.get('USE_CAUSAL_RL', False):
                     try:
                         logger.info("Refreshing causal graph with latest full data...")
-                        self.signal_gen.refresh_causal_wrappers()
+                        await asyncio.to_thread(self.signal_gen.refresh_causal_wrappers)
                         # C-3 SAFETY: Ensure graphs are ready right after daily refresh
                         if self.signal_gen.portfolio_causal_manager:
                             self.signal_gen.portfolio_causal_manager._ensure_graph_exists()
@@ -986,12 +1010,12 @@ class TradingBot:
                 await asyncio.sleep(sleep_seconds)
                 logger.info("=== Starting PPO Nightly Retrain at 6:00 PM ET ===")
                 if self.portfolio_ppo:
-                    self.trainer.update_portfolio_weights(timesteps=self.config.get('PORTFOLIO_ONLINE_TIMESTEPS', 100_000))
+                    await asyncio.to_thread(self.trainer.update_portfolio_weights, self.config.get('PORTFOLIO_ONLINE_TIMESTEPS', 100_000))
                 else:
                     for symbol in self.config['SYMBOLS']:
                         latest_data = self.data_ingestion.get_latest_data(symbol)
                         if len(latest_data) >= 500:
-                            self.trainer.update_model_weights(symbol, latest_data)
+                            await asyncio.to_thread(self.trainer.update_model_weights, symbol, latest_data)
                 logger.info("PPO nightly retrain completed")
             except asyncio.CancelledError:
                 break

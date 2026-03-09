@@ -32,8 +32,20 @@ class DataIngestion:
         }
         self.last_bar_time = {symbol: None for symbol in symbols}
 
+    def _ensure_symbol_in_store(self, symbol: str):
+        """Lazily initialize data_store entry for a symbol added via universe rotation."""
+        if symbol not in self.data_store:
+            all_timeframes = set(self.timeframes + ['1d'])
+            self.data_store[symbol] = {
+                tf: pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+                for tf in all_timeframes
+            }
+            self.last_bar_time[symbol] = None
+            logger.info(f"[LAZY INIT] Created data_store entry for new symbol {symbol}")
+
     async def handle_alpaca_bar(self, bar):
         symbol = bar.symbol
+        self._ensure_symbol_in_store(symbol)
         timestamp = pd.to_datetime(bar.timestamp, utc=True).floor('15min')
         data = {
             'open': bar.open,
@@ -164,6 +176,7 @@ class DataIngestion:
         )
 
     def get_latest_data(self, symbol: str, timeframe: str = '15Min', lookback_days: int = 60) -> pd.DataFrame:
+        self._ensure_symbol_in_store(symbol)
         df = self.data_store[symbol].get(timeframe, pd.DataFrame())
         logger.debug(f"get_latest_data {symbol} {timeframe}: cache len={len(df)}, last_bar={df.index[-1] if not df.empty else 'empty'}")
         if df.empty or len(df) < 100:

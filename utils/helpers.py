@@ -11,6 +11,7 @@ import pandas as pd
 from datetime import datetime, time, timedelta
 import holidays
 import logging
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -85,33 +86,47 @@ def is_market_open(now: datetime = None) -> bool:
     Returns True if the NYSE is currently open for regular trading.
     Handles weekends, holidays, and early closes correctly.
     """
+    eastern = ZoneInfo('America/New_York')
     if now is None:
-        now = datetime.now(tz=pd.Timestamp.now(tz='America/New_York').tzinfo)
-   
+        now = datetime.now(tz=eastern)
+    elif now.tzinfo is not None:
+        # Convert to Eastern time regardless of input timezone
+        now = now.astimezone(eastern)
+    else:
+        # Naive datetime — assume it's already Eastern
+        now = now.replace(tzinfo=eastern)
+
     # Weekend
     if now.weekday() >= 5:
         return False
-   
+
     # NYSE holiday (accurate version)
     if _is_nyse_holiday(now.date()):
         return False
-   
+
     # Regular trading hours: 9:30 AM – 4:00 PM ET
     market_open = time(9, 30)
     market_close = time(16, 0)
     current_time = now.time()
-   
+
     # Early close days (now dynamic and future-proof)
     if _is_early_close_day(now.date()):
         market_close = time(13, 0) # 1:00 PM ET early close
-   
+
     return market_open <= current_time < market_close
 
 def time_until_next_open(now: datetime = None) -> timedelta:
     """Returns timedelta until the next market open (9:30 AM ET)."""
+    eastern = ZoneInfo('America/New_York')
     if now is None:
-        now = datetime.now(tz=pd.Timestamp.now(tz='America/New_York').tzinfo)
-   
+        now = datetime.now(tz=eastern)
+    elif now.tzinfo is not None:
+        # Convert to Eastern time regardless of input timezone
+        now = now.astimezone(eastern)
+    else:
+        # Naive datetime — assume it's already Eastern
+        now = now.replace(tzinfo=eastern)
+
     # Start at the next possible 9:30 AM slot
     next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
    

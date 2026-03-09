@@ -69,7 +69,7 @@ class PortfolioRebalancer:
         for sym in symbols:
             if sym in dollar_risk_alloc and dollar_risk_alloc[sym] != 0:
                 price = prices.get(sym)
-                if price and price > 0:
+                if price and price > 0 and current_equity > 0:
                     cvar_weight = dollar_risk_alloc[sym] / current_equity
                     target_weights_dict[sym] = cvar_weight
                     logger.debug(f"[CVaR LIVE] {sym} adjusted to {cvar_weight:.4f} (dollar risk ${dollar_risk_alloc[sym]:,.0f})")
@@ -82,24 +82,18 @@ class PortfolioRebalancer:
                 old_weight = target_weights_dict[sym]
                 target_weights_dict[sym] *= scale
                 logger.warning(f"[NOTIONAL CAP] {sym} capped from {old_weight:.4f} ({proposed_notional:,.0f}$ notional) → {target_weights_dict[sym]:.4f}")
-        # ==================== CRIT-11 FIX: REGIME PERSISTENCE SCALING ====================
+        # ==================== MULTIPLICATIVE ADJUSTMENTS (all applied before single renorm) ====================
+        # 1. Regime persistence scaling
         for sym in symbols:
             regime_tuple = regimes.get(sym, ('mean_reverting', 0.5))
             persistence = regime_tuple[1] if isinstance(regime_tuple, (list, tuple)) else 0.5
-            if persistence > 0.7: # trending → higher conviction weight
+            if persistence > 0.7:
                 target_weights_dict[sym] *= (1.0 + (persistence - 0.7) * 0.6)
                 logger.debug(f"[REGIME PERSISTENCE] {sym} boosted by persistence {persistence:.3f}")
-        # renormalize target_weights_dict after notional cap so total portfolio weight sums to 1.0
-        total_abs_weight = sum(abs(v) for v in target_weights_dict.values())
-        if total_abs_weight > 0:
-            scale = 1.0 / total_abs_weight
-            for sym in target_weights_dict:
-                target_weights_dict[sym] *= scale
-        # ==================== CRIT-11 FIX: CAUSAL PENALTY (now BEFORE final renorm) ====================
+
+        # 2. Causal penalty (multiplicative)
         if hasattr(self.signal_gen, 'portfolio_causal_manager') and self.signal_gen.portfolio_causal_manager is not None:
             try:
-                # FIX: Use causal as a MULTIPLICATIVE adjustment, not a full replacement
-                # This preserves the CVaR-optimized weights while applying causal penalty/boost
                 for i, sym in enumerate(symbols):
                     penalty_factor = self.signal_gen.portfolio_causal_manager.compute_penalty_factor(
                         obs.reshape(1, -1) if hasattr(obs, 'reshape') else obs,
@@ -110,16 +104,10 @@ class PortfolioRebalancer:
                     if penalty_factor != 1.0:
                         logger.debug(f"[CAUSAL ADJUST] {sym}: {old_weight:.4f} * {penalty_factor:.4f} = {target_weights_dict[sym]:.4f}")
                 logger.info(f"[CAUSAL FINAL SCALING] Applied as multiplicative adjustment to CVaR weights")
-                # Renormalize after causal adjustment
-                total_abs_weight_causal = sum(abs(v) for v in target_weights_dict.values())
-                if total_abs_weight_causal > 0:
-                    scale_causal = 1.0 / total_abs_weight_causal
-                    for sym in target_weights_dict:
-                        target_weights_dict[sym] *= scale_causal
-                logger.debug("[CAUSAL RENORM] Final weights renormalized after causal scaling")
             except Exception as e:
                 logger.debug(f"Final causal scaling skipped: {e}")
-        # ==================== CRIT-11 FIX: MIN-HOLD ENFORCEMENT (Gemini-tuned, regime-aware) ====================
+
+        # 3. Min-hold enforcement (override to current position weight)
         if hasattr(self.signal_gen, 'broker') and hasattr(self.signal_gen.broker, 'last_entry_times'):
             for sym in symbols:
                 last_entry = self.signal_gen.broker.last_entry_times.get(sym)
@@ -127,22 +115,27 @@ class PortfolioRebalancer:
                     bars_since = (datetime.now(tz=tz.gettz('UTC')) - last_entry) / timedelta(minutes=15)
                     regime = regimes.get(sym, 'mean_reverting')
                     regime_name = regime[0] if isinstance(regime, (list, tuple)) else regime
-                    if regime_name == 'trending':
-                        min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 44)
-                    else:
-                        min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
+                    min_hold = self.config.get(
+                        'MIN_HOLD_BARS_TRENDING' if regime_name == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING',
+                        6 if regime_name == 'trending' else 3
+                    )
                     if bars_since < min_hold:
                         current_weight = target_weights_dict.get(sym, 0.0)
-                        if current_weight != 0:  # only log if we tried to change
-                            logger.debug(f"MIN-HOLD ACTIVE {sym} (portfolio) → skipping rebalance (Gemini-tuned {min_hold} bars)")
+                        if current_weight != 0:
+                            logger.debug(f"MIN-HOLD ACTIVE {sym} (portfolio) → skipping rebalance ({min_hold} bars)")
                         sym_price = prices.get(sym)
-                        if sym_price and sym_price > 0:
+                        if sym_price and sym_price > 0 and current_equity > 0:
                             target_weights_dict[sym] = positions.get(sym, 0) * sym_price / current_equity
-                        # else: keep current target weight (no price to compute position weight)
-        # Final renormalization after min-hold adjustments
+
+        # ==================== SINGLE FINAL RENORMALIZATION ====================
+        # Re-apply notional cap after all adjustments
+        for sym in target_weights_dict:
+            proposed_notional = abs(target_weights_dict[sym]) * current_equity
+            if proposed_notional > max_notional_per_symbol and proposed_notional > 0:
+                target_weights_dict[sym] *= max_notional_per_symbol / proposed_notional
+
         total_abs = sum(abs(v) for v in target_weights_dict.values())
-        if total_abs > 0:
+        if total_abs > 1.0:
             for sym in target_weights_dict:
                 target_weights_dict[sym] /= total_abs
-        # Return final normalized weights (ready for min-hold / order placement in bot.py)
         return target_weights_dict

@@ -2,6 +2,7 @@
 # Event-driven broker: trailing stops, ReplaceOrderRequest PATCH, fractional shares, extended hours
 import logging
 import asyncio
+import threading
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -59,6 +60,7 @@ class AlpacaBroker:
         self.regime_cache = self._load_regime_cache()
         self.existing_positions = {}
         self.last_ratchet_time = {}
+        self._positions_lock = threading.Lock()  # Thread safety for sync_existing_positions
         # Positions cache with TTL
         self._positions_cache = {}
         self._positions_cache_time = None
@@ -103,47 +105,249 @@ class AlpacaBroker:
     # ====================== FULL DYNAMIC SYNC ======================
     def sync_existing_positions(self, force_refresh=False):
         now = datetime.now(tz=_UTC)
-        if not force_refresh and self._positions_cache_time is not None:
-            age = (now - self._positions_cache_time).total_seconds()
-            if age < self._positions_cache_ttl:
-                self.existing_positions = self._positions_cache.copy()
-                return
+        with self._positions_lock:
+            if not force_refresh and self._positions_cache_time is not None:
+                age = (now - self._positions_cache_time).total_seconds()
+                if age < self._positions_cache_ttl:
+                    self.existing_positions = self._positions_cache.copy()
+                    return
         try:
             positions = self.client.get_all_positions()
-            self.existing_positions = {
+            new_positions = {
                 p.symbol: float(p.qty) if p.side == PositionSide.LONG else -float(p.qty)
                 for p in positions if float(p.qty) != 0
             }
-            self._positions_cache = self.existing_positions.copy()
-            self._positions_cache_time = now
-            for sym in list(self.existing_positions.keys()):
+            with self._positions_lock:
+                self.existing_positions = new_positions
+                self._positions_cache = new_positions.copy()
+                self._positions_cache_time = now
+            for sym in list(new_positions.keys()):
                 if sym not in self.last_entry_times:
                     self.last_entry_times[sym] = now - timedelta(minutes=30)
             for sym in list(self.last_entry_times.keys()):
-                if sym not in self.existing_positions:
+                if sym not in new_positions:
                     self.last_entry_times.pop(sym, None)
             self._save_last_entry_times()
         except Exception as e:
             logger.error(f"Failed to sync existing positions: {e}")
-            if self._positions_cache:
-                self.existing_positions = self._positions_cache.copy()
-            else:
-                self.existing_positions = {}
+            with self._positions_lock:
+                if self._positions_cache:
+                    self.existing_positions = self._positions_cache.copy()
+                else:
+                    self.existing_positions = {}
 
     def _reconcile_tracker_on_startup(self):
-        """Reconcile OrderTracker with actual Alpaca positions after restart.
-        - If tracker has a group but no Alpaca position: remove stale group
-        - If Alpaca has a position but no tracker group: create recovery group with protective orders
+        """Full reconciliation of OrderTracker vs Alpaca positions + open orders on restart.
+
+        Handles:
+        1. Stale tracker groups (no Alpaca position) → remove
+        2. Orphaned positions (no tracker group) → create group + attach trailing stop
+        3. Tracked positions with missing trailing stop → resubmit
+        4. Tracker direction mismatch with actual position → fix
+        5. Pending entries that never filled → clean up
         """
+        # --- Fetch all open orders from Alpaca ---
+        open_orders = {}  # symbol → list of orders
+        try:
+            all_orders = self.client.get_orders(GetOrdersRequest(status='open'))
+            for order in all_orders:
+                sym = order.symbol
+                if sym not in open_orders:
+                    open_orders[sym] = []
+                open_orders[sym].append(order)
+            logger.info(f"[RECONCILE] Fetched {len(all_orders)} open orders across {len(open_orders)} symbols")
+        except Exception as e:
+            logger.error(f"[RECONCILE] Failed to fetch open orders: {e}")
+
+        # --- 1. Remove stale tracker groups (no position on Alpaca) ---
         for sym in list(self.tracker.groups.keys()):
             group = self.tracker.groups[sym]
-            if sym not in self.existing_positions and group.state != GroupState.CLOSED:
-                logger.info(f"[RECONCILE] Removing stale tracker group for {sym} (no Alpaca position)")
+            if sym not in self.existing_positions:
+                if group.state == GroupState.PENDING_ENTRY:
+                    # Entry never filled — cancel any lingering entry order
+                    if group.entry_order_id:
+                        try:
+                            self.client.cancel_order_by_id(group.entry_order_id)
+                            logger.info(f"[RECONCILE] Canceled stale entry order for {sym}")
+                        except Exception:
+                            pass
+                elif group.state == GroupState.OPEN:
+                    # Position closed while bot was down (stop filled)
+                    logger.info(f"[RECONCILE] {sym} was OPEN in tracker but no position — stop likely filled while offline")
+                logger.info(f"[RECONCILE] Removing stale tracker group for {sym}")
                 self.tracker.remove_group(sym)
 
+        # --- 2. Process each actual Alpaca position ---
         for sym, qty in self.existing_positions.items():
-            if sym not in self.tracker.groups:
-                logger.info(f"[RECONCILE] Position {sym} has no tracker group — will re-attach protective orders in monitor")
+            direction = 1 if qty > 0 else -1
+            abs_qty = abs(qty)
+            group = self.tracker.groups.get(sym)
+            sym_orders = open_orders.get(sym, [])
+
+            # Identify existing order types for this symbol
+            has_trailing_stop = False
+            trailing_stop_order_id = None
+            has_limit_close = False
+            for order in sym_orders:
+                order_type = str(getattr(order, 'order_type', '')).lower().split('.')[-1]
+                order_side = str(getattr(order, 'side', '')).lower().split('.')[-1]
+                is_close_side = (direction > 0 and order_side == 'sell') or (direction < 0 and order_side == 'buy')
+                if order_type == 'trailing_stop' and is_close_side:
+                    has_trailing_stop = True
+                    trailing_stop_order_id = str(order.id)
+                elif order_type == 'limit' and is_close_side:
+                    has_limit_close = True
+
+            if group and group.state == GroupState.OPEN:
+                # --- 3. Tracked position: verify direction + trailing stop ---
+                if group.direction != direction:
+                    logger.warning(
+                        f"[RECONCILE] {sym} direction mismatch: tracker={group.direction}, "
+                        f"actual={direction} — updating tracker"
+                    )
+                    group.direction = direction
+                    self.tracker._save()
+
+                if has_trailing_stop:
+                    # Update tracker with the actual order ID from Alpaca
+                    if trailing_stop_order_id and group.trailing_stop_id != trailing_stop_order_id:
+                        old_id = group.trailing_stop_id
+                        group.trailing_stop_id = trailing_stop_order_id
+                        self.tracker._order_id_index.pop(old_id, None)
+                        self.tracker._order_id_index[trailing_stop_order_id] = sym
+                        self.tracker._save()
+                        logger.info(f"[RECONCILE] {sym} updated trailing stop ID: {old_id} → {trailing_stop_order_id}")
+                    logger.info(f"[RECONCILE] {sym} OK — tracked + trailing stop active")
+                else:
+                    # Trailing stop is missing — need to resubmit
+                    logger.warning(f"[RECONCILE] {sym} tracked but trailing stop MISSING — will resubmit")
+                    group.trailing_stop_id = None
+                    self.tracker._save()
+                    self._reconcile_submit_trailing_stop(sym, abs_qty, direction, group)
+
+            elif group and group.state == GroupState.PENDING_ENTRY:
+                # Entry was pending — check if it actually filled
+                logger.info(f"[RECONCILE] {sym} has position but tracker is PENDING_ENTRY — marking as filled")
+                current_price = self._get_current_price(sym)
+                if not has_trailing_stop:
+                    self._reconcile_submit_trailing_stop(sym, abs_qty, direction, group)
+                else:
+                    group.trailing_stop_id = trailing_stop_order_id
+                    if trailing_stop_order_id:
+                        self.tracker._order_id_index[trailing_stop_order_id] = sym
+                group.state = GroupState.OPEN
+                group.entry_price = current_price
+                group.filled_qty = abs_qty
+                group.filled_at = datetime.now(tz=_UTC).isoformat()
+                self.tracker._save()
+
+            else:
+                # --- 4. Orphaned position: no tracker group at all ---
+                logger.info(f"[RECONCILE] {sym} orphaned position ({abs_qty:.2f} {'LONG' if direction > 0 else 'SHORT'}) — creating tracker + protective orders")
+                current_price = self._get_current_price(sym)
+                regime = self.regime_cache.get(sym, {})
+                if isinstance(regime, tuple):
+                    regime_str, persistence = regime
+                elif isinstance(regime, dict):
+                    regime_str = regime.get('regime', 'mean_reverting')
+                    persistence = regime.get('persistence', 0.5)
+                else:
+                    regime_str = str(regime) if regime else 'mean_reverting'
+                    persistence = 0.5
+
+                entry_id = f"reconcile_{sym}_{datetime.now(tz=_UTC).strftime('%Y%m%d%H%M%S')}"
+                self.tracker.create_group(sym, direction, entry_id, regime=regime_str, persistence=persistence)
+
+                if has_trailing_stop and trailing_stop_order_id:
+                    # Already has a trailing stop on Alpaca — just record it
+                    atr = self._reconcile_get_atr(sym)
+                    tp_price = self._get_tp_price(current_price, atr, regime_str, direction)
+                    trail_pct = 2.0  # estimate; will be corrected by ratchet
+                    stop_est = round(current_price * (1 - direction * trail_pct / 100), 2)
+                    self.tracker.mark_entry_filled(
+                        symbol=sym, fill_price=current_price, filled_qty=abs_qty,
+                        trailing_stop_id=trailing_stop_order_id, take_profit_id='',
+                        trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
+                    )
+                    logger.info(f"[RECONCILE] {sym} linked existing trailing stop {trailing_stop_order_id}")
+                else:
+                    # No trailing stop — submit one now
+                    group = self.tracker.groups[sym]
+                    self._reconcile_submit_trailing_stop(sym, abs_qty, direction, group)
+
+        logger.info(
+            f"[RECONCILE] Complete — {len(self.existing_positions)} positions, "
+            f"{len(self.tracker.get_open_groups())} tracked groups"
+        )
+
+    def _reconcile_submit_trailing_stop(self, symbol: str, qty: float, direction: int, group):
+        """Submit a trailing stop during startup reconciliation (synchronous).
+        NOTE: Alpaca does NOT support trailing stops for fractional shares — round to whole shares."""
+        current_price = self._get_current_price(symbol)
+        atr = self._reconcile_get_atr(symbol)
+        regime = group.regime or 'mean_reverting'
+        trail_pct = self._get_trail_percent(current_price, atr, regime)
+        tp_price = self._get_tp_price(current_price, atr, regime, direction)
+        close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
+        stop_est = round(current_price * (1 - direction * trail_pct / 100), 2)
+
+        # Alpaca rejects trailing stop orders for fractional shares — round down to whole shares
+        # Remaining fractional qty will be protected by the software TP in monitor loop
+        if qty != int(qty):
+            whole_qty = int(qty)
+            if whole_qty < 1:
+                logger.warning(f"[RECONCILE] {symbol} qty={qty} is fractional with <1 whole share — "
+                               f"trailing stop not possible, relying on software TP in monitor loop")
+                # Still mark entry filled with no trailing stop so monitor loop can manage
+                self.tracker.mark_entry_filled(
+                    symbol=symbol, fill_price=current_price, filled_qty=qty,
+                    trailing_stop_id='', take_profit_id='',
+                    trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
+                )
+                return
+            logger.info(f"[RECONCILE] {symbol} rounding qty {qty} → {whole_qty} whole shares for trailing stop")
+            qty = whole_qty
+
+        try:
+            trail_req = TrailingStopOrderRequest(
+                symbol=symbol, qty=qty, side=close_side,
+                time_in_force=self._tif_for_qty(qty), trail_percent=trail_pct,
+            )
+            resp = self.client.submit_order(trail_req)
+            trailing_stop_id = str(resp.id)
+            logger.info(f"[RECONCILE] {symbol} trailing stop submitted @ {trail_pct}% | id={trailing_stop_id}")
+
+            self.tracker.mark_entry_filled(
+                symbol=symbol, fill_price=current_price, filled_qty=qty,
+                trailing_stop_id=trailing_stop_id, take_profit_id='',
+                trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
+            )
+        except Exception as e:
+            logger.error(f"[RECONCILE] Failed to submit trailing stop for {symbol}: {e}")
+
+    def _reconcile_get_atr(self, symbol: str) -> float:
+        """Get ATR for reconciliation — best effort."""
+        if self.data_ingestion:
+            data = self.data_ingestion.get_latest_data(symbol)
+            if data is not None and len(data) >= 14:
+                return self._compute_current_atr(data)
+        return 0.01
+
+    def _get_current_price(self, symbol: str) -> float:
+        """Get latest price for a symbol — best effort."""
+        if self.data_ingestion:
+            data = self.data_ingestion.get_latest_data(symbol)
+            if data is not None and len(data) > 0:
+                return float(data['close'].iloc[-1])
+        # Fallback: use Alpaca position cost basis
+        try:
+            positions = self.client.get_all_positions()
+            for p in positions:
+                if p.symbol == symbol:
+                    return float(p.current_price)
+        except Exception:
+            pass
+        return 0.0
 
     def _load_regime_cache(self):
         if os.path.exists(REGIME_CACHE_FILE):
@@ -220,6 +424,12 @@ class AlpacaBroker:
         # Clamp: at least 0.5%, at most 35%
         return round(max(0.5, min(35.0, trail_pct)), 2)
 
+    def _tif_for_qty(self, qty: float) -> TimeInForce:
+        """Fractional orders MUST use DAY; whole-share orders use GTC."""
+        if qty != int(qty):
+            return TimeInForce.DAY
+        return TimeInForce.GTC
+
     def _get_tp_price(self, current_price: float, atr: float, regime: str, direction: int) -> float:
         """Compute take-profit limit price."""
         tp_mult = (
@@ -233,9 +443,9 @@ class AlpacaBroker:
     # ====================== DUPLICATE CHECK ======================
     def has_active_orders(self, symbol: str) -> bool:
         """Check if symbol already has open orders (entry or exit)."""
-        if symbol in self.tracker.groups:
-            group = self.tracker.groups[symbol]
-            if group.state in (GroupState.PENDING_ENTRY, GroupState.OPEN):
+        with self.tracker._lock:
+            group = self.tracker.groups.get(symbol)
+            if group and group.state in (GroupState.PENDING_ENTRY, GroupState.OPEN):
                 return True
         try:
             orders = self.client.get_orders(GetOrdersRequest(status='open', symbols=[symbol]))
@@ -255,7 +465,8 @@ class AlpacaBroker:
         regime, persistence = self._get_regime(symbol, data)
 
         # Fractional shares: allow float qty, but enforce minimum notional
-        if self.use_fractional:
+        # NOTE: Alpaca does NOT allow fractional shares for short sells
+        if self.use_fractional and direction > 0:
             if size * current_price < 1.0:
                 logger.info(f"Skipping {symbol} — notional ${size * current_price:.2f} below $1 minimum")
                 return None
@@ -263,6 +474,7 @@ class AlpacaBroker:
         else:
             size = int(size)
             if size < 1:
+                logger.debug(f"Skipping {symbol} — qty rounds to 0 (size={size:.4f})")
                 return None
             qty = size
 
@@ -288,11 +500,12 @@ class AlpacaBroker:
         limit_price = round(float(current_price) * (1 + direction * self.limit_price_offset), 2)
         position_intent = PositionIntent.BUY_TO_OPEN if direction > 0 else PositionIntent.SELL_TO_OPEN
 
+        tif = self._tif_for_qty(qty)
         entry_request = LimitOrderRequest(
             symbol=symbol,
             qty=qty,
             side=side,
-            time_in_force=TimeInForce.GTC,
+            time_in_force=tif,
             limit_price=limit_price,
             extended_hours=self.use_extended_hours,
             position_intent=position_intent,
@@ -312,9 +525,11 @@ class AlpacaBroker:
                 extended_hours=self.use_extended_hours,
             )
             # Temporarily store limit_price as entry_price for slippage measurement
-            group = self.tracker.groups[symbol]
-            group.entry_price = limit_price
-            self.tracker._save()
+            with self.tracker._lock:
+                group = self.tracker.groups.get(symbol)
+                if group:
+                    group.entry_price = limit_price
+                    self.tracker._save()
 
             self.last_entry_times[symbol] = datetime.now(tz=_UTC)
             self._save_last_entry_times()
@@ -356,46 +571,46 @@ class AlpacaBroker:
         position_intent = PositionIntent.SELL_TO_CLOSE if direction > 0 else PositionIntent.BUY_TO_CLOSE
 
         # === 1. Trailing Stop (native Alpaca trailing) ===
+        # NOTE: Alpaca does NOT support extended_hours or fractional shares on trailing stop orders
         trailing_stop_id = None
-        try:
-            trail_req = TrailingStopOrderRequest(
-                symbol=symbol,
-                qty=filled_qty,
-                side=close_side,
-                time_in_force=TimeInForce.GTC,
-                trail_percent=trail_pct,
-                extended_hours=self.use_extended_hours,
-                position_intent=position_intent,
-            )
-            trail_resp = await asyncio.to_thread(self.client.submit_order, trail_req)
-            trailing_stop_id = str(trail_resp.id)
-            logger.info(f"[EXIT] {symbol} trailing stop: {trail_pct}% trail | id={trailing_stop_id}")
-        except Exception as e:
-            logger.error(f"[EXIT] Failed to submit trailing stop for {symbol}: {e}")
+        trail_qty = filled_qty
+        if trail_qty != int(trail_qty):
+            trail_qty = int(trail_qty)
+            if trail_qty < 1:
+                logger.warning(f"[EXIT] {symbol} fractional qty {filled_qty} — no trailing stop possible, "
+                               f"relying on software TP in monitor loop")
+                trail_qty = 0
+            else:
+                logger.info(f"[EXIT] {symbol} rounding qty {filled_qty} → {trail_qty} for trailing stop")
+        if trail_qty >= 1:
+            try:
+                trail_req = TrailingStopOrderRequest(
+                    symbol=symbol,
+                    qty=trail_qty,
+                    side=close_side,
+                    time_in_force=self._tif_for_qty(trail_qty),
+                    trail_percent=trail_pct,
+                    position_intent=position_intent,
+                )
+                trail_resp = await asyncio.to_thread(self.client.submit_order, trail_req)
+                trailing_stop_id = str(trail_resp.id)
+                logger.info(f"[EXIT] {symbol} trailing stop: {trail_pct}% trail | id={trailing_stop_id}")
+            except Exception as e:
+                logger.error(f"[EXIT] Failed to submit trailing stop for {symbol}: {e}")
 
-        # === 2. Take-Profit (limit order) ===
-        tp_order_id = None
-        try:
-            tp_req = LimitOrderRequest(
-                symbol=symbol,
-                qty=filled_qty,
-                side=close_side,
-                time_in_force=TimeInForce.GTC,
-                limit_price=tp_price,
-                extended_hours=self.use_extended_hours,
-                position_intent=position_intent,
-            )
-            tp_resp = await asyncio.to_thread(self.client.submit_order, tp_req)
-            tp_order_id = str(tp_resp.id)
-            logger.info(f"[EXIT] {symbol} take-profit: ${tp_price:.2f} | id={tp_order_id}")
-        except Exception as e:
-            logger.error(f"[EXIT] Failed to submit take-profit for {symbol}: {e}")
+        # === 2. Take-Profit ===
+        # NOTE: Alpaca reserves all qty for the trailing stop, so a separate TP limit
+        # order would fail with "insufficient qty". Instead, store the TP price in the
+        # tracker and enforce it in the monitor loop by canceling the trailing stop
+        # and closing the position when TP is hit.
+        tp_order_id = ''
+        logger.info(f"[EXIT] {symbol} take-profit target: ${tp_price:.2f} (enforced via monitor loop)")
 
         # Compute initial stop_price estimate for logging
         stop_price_est = round(fill_price * (1 - direction * trail_pct / 100), 2)
 
         # Update tracker
-        if trailing_stop_id and tp_order_id:
+        if trailing_stop_id:
             self.tracker.mark_entry_filled(
                 symbol=symbol,
                 fill_price=fill_price,
@@ -405,19 +620,6 @@ class AlpacaBroker:
                 trail_percent=trail_pct,
                 tp_price=tp_price,
                 stop_price=stop_price_est,
-            )
-        elif trailing_stop_id:
-            # At least we have a stop
-            self.tracker.mark_entry_filled(
-                symbol=symbol, fill_price=fill_price, filled_qty=filled_qty,
-                trailing_stop_id=trailing_stop_id, take_profit_id=tp_order_id or '',
-                trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_price_est,
-            )
-        elif tp_order_id:
-            self.tracker.mark_entry_filled(
-                symbol=symbol, fill_price=fill_price, filled_qty=filled_qty,
-                trailing_stop_id='', take_profit_id=tp_order_id,
-                trail_percent=0.0, tp_price=tp_price, stop_price=0.0,
             )
 
     # ====================== RATCHET VIA PATCH (ReplaceOrderRequest) ======================
@@ -454,8 +656,8 @@ class AlpacaBroker:
 
         # Compute tighter trail percentage
         profit_protection = max(
-            self.config.get('RATCHET_PROFIT_PROTECTION_MIN', 0.5),
-            min(1.0, 1.0 - unrealized_pct * self.config.get('RATCHET_PROFIT_PROTECTION_SLOPE', 3.0))
+            self.config.get('RATCHET_PROFIT_PROTECTION_MIN', 0.30),
+            min(1.0, 1.0 - unrealized_pct * self.config.get('RATCHET_PROFIT_PROTECTION_SLOPE', 1.5))
         )
         trailing_mult = (
             self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
@@ -517,9 +719,9 @@ class AlpacaBroker:
                     bars_held = ((datetime.now(tz=_UTC) - last_entry) / timedelta(minutes=15)) if last_entry else 9999
                     regime, persistence = self._get_regime(sym, data)
                     min_hold = (
-                        self.config.get('MIN_HOLD_BARS_TRENDING', 48)
+                        self.config.get('MIN_HOLD_BARS_TRENDING', 6)
                         if regime == 'trending'
-                        else self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
+                        else self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
                     )
                     logger.info(
                         f"  {sym} | {'LONG' if direction > 0 else 'SHORT'} {abs(qty):.2f} | "
@@ -529,6 +731,39 @@ class AlpacaBroker:
                     # === Ratchet trailing stop via PATCH ===
                     if is_market_open():
                         await asyncio.to_thread(self.ratchet_trailing_stop, sym, current_price, atr)
+
+                    # === Software TP check (trailing stop holds all qty, TP enforced here) ===
+                    group = self.tracker.groups.get(sym)
+                    if group and group.state == GroupState.OPEN and group.tp_price:
+                        tp_hit = (direction > 0 and current_price >= group.tp_price) or \
+                                 (direction < 0 and current_price <= group.tp_price)
+                        if tp_hit:
+                            logger.info(f"[TP HIT] {sym} @ {current_price:.2f} >= TP {group.tp_price:.2f} — closing position")
+                            # Cancel trailing stop first
+                            if group.trailing_stop_id:
+                                try:
+                                    await asyncio.to_thread(self.client.cancel_order_by_id, group.trailing_stop_id)
+                                except Exception as e:
+                                    logger.warning(f"[TP HIT] Failed to cancel trailing stop for {sym}: {e}")
+                            # Close position
+                            try:
+                                await asyncio.to_thread(self.client.close_position, sym)
+                                logger.info(f"[TP HIT] {sym} position closed")
+                                self.tracker.mark_closed(sym)
+                                self.tracker.remove_group(sym)
+                                self.last_entry_times.pop(sym, None)
+                                self._save_last_entry_times()
+                            except Exception as e:
+                                logger.error(f"[TP HIT] Failed to close {sym}: {e}")
+                                # Race condition: position may have been closed by trailing stop fill
+                                err_str = str(e).lower()
+                                if 'position does not exist' in err_str or '40410000' in str(e):
+                                    logger.info(f"[TP HIT] {sym} position already closed — cleaning up tracker")
+                                    self.tracker.mark_closed(sym)
+                                    self.tracker.remove_group(sym)
+                                    self.last_entry_times.pop(sym, None)
+                                    self._save_last_entry_times()
+                            continue
 
                     # === Re-attach missing exits for untracked positions ===
                     group = self.tracker.groups.get(sym)
@@ -559,38 +794,39 @@ class AlpacaBroker:
         trailing_stop_id = None
         tp_order_id = None
 
-        try:
-            trail_req = TrailingStopOrderRequest(
-                symbol=symbol, qty=abs_qty, side=close_side,
-                time_in_force=TimeInForce.GTC, trail_percent=trail_pct,
-                extended_hours=self.use_extended_hours, position_intent=position_intent,
-            )
-            resp = await asyncio.to_thread(self.client.submit_order, trail_req)
-            trailing_stop_id = str(resp.id)
-            logger.info(f"[REATTACH] {symbol} trailing stop @ {trail_pct}%")
-        except Exception as e:
-            logger.error(f"[REATTACH] Failed trailing stop for {symbol}: {e}")
+        # NOTE: Alpaca does NOT support extended_hours or fractional shares on trailing stop orders
+        # Omit position_intent on reattach — let Alpaca infer from existing position
+        trail_qty = abs_qty
+        if trail_qty != int(trail_qty):
+            trail_qty = int(trail_qty)
+            if trail_qty < 1:
+                logger.warning(f"[REATTACH] {symbol} fractional qty {abs_qty} — no trailing stop, "
+                               f"relying on software TP in monitor loop")
+            else:
+                logger.info(f"[REATTACH] {symbol} rounding qty {abs_qty} → {trail_qty} for trailing stop")
+        if trail_qty >= 1:
+            try:
+                trail_req = TrailingStopOrderRequest(
+                    symbol=symbol, qty=trail_qty, side=close_side,
+                    time_in_force=self._tif_for_qty(trail_qty), trail_percent=trail_pct,
+                )
+                resp = await asyncio.to_thread(self.client.submit_order, trail_req)
+                trailing_stop_id = str(resp.id)
+                logger.info(f"[REATTACH] {symbol} trailing stop @ {trail_pct}%")
+            except Exception as e:
+                logger.error(f"[REATTACH] Failed trailing stop for {symbol}: {e}")
 
-        try:
-            tp_req = LimitOrderRequest(
-                symbol=symbol, qty=abs_qty, side=close_side,
-                time_in_force=TimeInForce.GTC, limit_price=tp_price,
-                extended_hours=self.use_extended_hours, position_intent=position_intent,
-            )
-            resp = await asyncio.to_thread(self.client.submit_order, tp_req)
-            tp_order_id = str(resp.id)
-            logger.info(f"[REATTACH] {symbol} take-profit @ ${tp_price:.2f}")
-        except Exception as e:
-            logger.error(f"[REATTACH] Failed take-profit for {symbol}: {e}")
+        # TP enforced via monitor loop (Alpaca can't hold two closing orders)
+        logger.info(f"[REATTACH] {symbol} take-profit target: ${tp_price:.2f} (enforced via monitor)")
 
         # Create a recovery tracker group
-        if trailing_stop_id or tp_order_id:
+        if trailing_stop_id:
             entry_id = f"reattach_{symbol}_{datetime.now(tz=_UTC).strftime('%Y%m%d%H%M%S')}"
             self.tracker.create_group(symbol, direction, entry_id, regime=regime)
             stop_est = round(current_price * (1 - direction * trail_pct / 100), 2)
             self.tracker.mark_entry_filled(
                 symbol=symbol, fill_price=current_price, filled_qty=abs_qty,
-                trailing_stop_id=trailing_stop_id or '', take_profit_id=tp_order_id or '',
+                trailing_stop_id=trailing_stop_id, take_profit_id='',
                 trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
             )
 

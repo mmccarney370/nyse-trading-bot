@@ -42,7 +42,7 @@ class Backtester:
         self.risk_manager = risk_manager
         self.assumed_spread = config.get('ASSUMED_SPREAD', 0.0001)
         self.slippage = config.get('SLIPPAGE', 0.0003)
-        self.commission_per_share = config.get('COMMISSION_PER_SHARE', 0.005)
+        self.commission_per_share = config.get('COMMISSION_PER_SHARE', 0.0005)
         self.debug_mode = config.get('BACKTEST_DEBUG', False)
     def _compute_current_atr(self, data_window: pd.DataFrame, lookback: int = 50) -> float:
         """Proper classic True Range + EMA(14) ATR — pandas only, no annualization."""
@@ -196,15 +196,32 @@ class Backtester:
                     equity_curve.append((timestamp, pre_trade_equity))
                     continue
                 # Generate portfolio actions
-                target_weights = asyncio.get_event_loop().run_until_complete(
-                    self.signal_gen.generate_portfolio_actions(
-                        symbols=symbols_config,
-                        data_dict=data_dict,
-                        current_equity=pre_trade_equity,
-                        precomputed_env=precomputed_env,
-                        timestamp=timestamp
+                try:
+                    loop = asyncio.get_running_loop()
+                    # Already in async context — use nest_asyncio or thread
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        target_weights = pool.submit(
+                            asyncio.run,
+                            self.signal_gen.generate_portfolio_actions(
+                                symbols=symbols_config,
+                                data_dict=data_dict,
+                                current_equity=pre_trade_equity,
+                                precomputed_env=precomputed_env,
+                                timestamp=timestamp
+                            )
+                        ).result()
+                except RuntimeError:
+                    # No running loop — safe to use run_until_complete
+                    target_weights = asyncio.get_event_loop().run_until_complete(
+                        self.signal_gen.generate_portfolio_actions(
+                            symbols=symbols_config,
+                            data_dict=data_dict,
+                            current_equity=pre_trade_equity,
+                            precomputed_env=precomputed_env,
+                            timestamp=timestamp
+                        )
                     )
-                )
                 # Regime detection
                 regimes = {}
                 for sym in symbols_config:
@@ -305,7 +322,7 @@ class Backtester:
                         atr = self._compute_current_atr(data_dict.get(sym))
                         trailing_mult = self.config.get(
                             f'TRAILING_STOP_ATR_{regime.upper()}',
-                            self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config['TRAILING_STOP_ATR']
+                            self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
                         )
                         tp_mult = self.config.get(
                             f'TAKE_PROFIT_ATR_{regime.upper()}',
@@ -356,7 +373,7 @@ class Backtester:
                     atr = self._compute_current_atr(data_window)
                     trailing_mult = self.config.get(
                         f'TRAILING_STOP_ATR_{regime.upper()}',
-                        self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config['TRAILING_STOP_ATR']
+                        self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
                     )
                     new_stop = quoted_price - direction * trailing_mult * atr
                     if direction > 0:
@@ -385,7 +402,7 @@ class Backtester:
                     flat = False
                     last_entry = pos['entry_time']
                     bars_held = ((timestamp - last_entry) / pd.Timedelta(minutes=15)) if last_entry else 9999
-                    min_hold_bars = self.config.get('MIN_HOLD_BARS', 32)
+                    min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if regime == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
                     if self.debug_mode:
                         delta_min = (timestamp - last_entry).total_seconds() / 60 if last_entry else None
                         logger.info(f"MIN-HOLD CHECK {sym} | last_entry={last_entry} | current={timestamp} | "
@@ -490,6 +507,9 @@ class Backtester:
                     for sym, pos in positions.items()
                 )
                 equity_history[timestamp.date()] = pre_trade_equity
+                # Clear stale signals from prior bar — prevents re-trading old signals
+                signals = {}
+                confidences = {}
                 if i > 0:
                     prev_timestamp = common_index[i - 1]
                     for sym in full_dfs_15m:
@@ -577,9 +597,9 @@ class Backtester:
                         if self.debug_mode:
                             risk_distance = self._compute_current_atr(data_window) * self.config.get(
                                 f'TRAILING_STOP_ATR_{regime.upper()}',
-                                self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config['TRAILING_STOP_ATR']
+                                self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
                             )
-                            logger.info(f"[DEBUG ENTRY] {sym} | dollar_risk={dollar_risk:.2f} | atr={self._compute_current_atr(data_window):.4f} | mult={self.config.get(f'TRAILING_STOP_ATR_{regime.upper()}', self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config['TRAILING_STOP_ATR'])} | risk_distance={risk_distance:.4f} | size_raw={size} | signed_size={signed_size}")
+                            logger.info(f"[DEBUG ENTRY] {sym} | dollar_risk={dollar_risk:.2f} | atr={self._compute_current_atr(data_window):.4f} | mult={self.config.get(f'TRAILING_STOP_ATR_{regime.upper()}', self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0)))} | risk_distance={risk_distance:.4f} | size_raw={size} | signed_size={signed_size}")
                         if signed_size == 0:
                             if self.debug_mode:
                                 logger.info(f"[SKIP ENTRY] {sym} — size=0 (likely ATR too large or risk_amount too small)")
@@ -591,13 +611,13 @@ class Backtester:
                             if self.debug_mode:
                                 logger.info(f"Re-entry blocked for {sym} — exited this bar")
                             continue
-                        min_hold_bars = self.config.get('MIN_HOLD_BARS', 32)
+                        min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if regime == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
                         if last_exit and (timestamp - last_exit) < timedelta(minutes=15 * min_hold_bars):
                             continue
                         atr = self._compute_current_atr(data_window)
                         trailing_mult = self.config.get(
                             f'TRAILING_STOP_ATR_{regime.upper()}',
-                            self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config['TRAILING_STOP_ATR']
+                            self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
                         )
                         tp_mult = self.config.get(
                             f'TAKE_PROFIT_ATR_{regime.upper()}',
@@ -654,7 +674,7 @@ class Backtester:
                     atr = self._compute_current_atr(full_dfs_15m[sym].loc[:timestamp])
                     trailing_mult = self.config.get(
                         f'TRAILING_STOP_ATR_{regime.upper()}',
-                        self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config['TRAILING_STOP_ATR']
+                        self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
                     )
                     new_stop = quoted_price - direction * trailing_mult * atr
                     if direction > 0:
@@ -683,7 +703,7 @@ class Backtester:
                     flat = sym in signals and signals[sym]['direction'] == 0 and signals[sym]['confidence'] > 0.75
                     last_entry = self.signal_gen.last_entry_time.get(sym)
                     bars_held = ((timestamp - last_entry) / pd.Timedelta(minutes=15)) if last_entry else 9999
-                    min_hold_bars = self.config.get('MIN_HOLD_BARS', 32)
+                    min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if regime == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
                     if self.debug_mode:
                         delta_min = (timestamp - last_entry).total_seconds() / 60 if last_entry else None
                         logger.info(f"MIN-HOLD CHECK {sym} | last_entry={last_entry} | current={timestamp} | "

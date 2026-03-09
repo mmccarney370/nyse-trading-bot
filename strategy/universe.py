@@ -58,8 +58,8 @@ class UniverseManager:
                     perf_score = win_rate
                 else:
                     perf_score = 0.5 # Neutral if little data
-                # Collect returns for correlation
-                daily_ret = data['close'].pct_change().dropna()
+                # Collect returns for correlation (use last 60 days, aligned by index)
+                daily_ret = data['close'].pct_change().dropna().tail(60)
                 returns_df[symbol] = daily_ret
                 total_score = (
                     CONFIG['LIQUIDITY_WEIGHT'] * liquidity_score +
@@ -77,6 +77,10 @@ class UniverseManager:
             ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:self.max_size]
             return [s[0] for s in ranked]
         # 4. Diversification: Penalize high correlation clusters
+        # Only keep symbols that were successfully scored (avoid phantom correlations)
+        returns_df = returns_df[[c for c in returns_df.columns if c in scores]]
+        # Drop NaN columns and align to common index
+        returns_df = returns_df.dropna(axis=1, how='all').dropna()
         corr_matrix = returns_df.corr()
         final_scores = scores.copy()
         for symbol in scores:

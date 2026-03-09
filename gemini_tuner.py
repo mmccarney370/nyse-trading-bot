@@ -334,8 +334,10 @@ GROUP 7: Regime Detection
         current_symbols = set(CONFIG.get('SYMBOLS', []))
         proposed_universe = tweaks.get("proposed_universe", [])
         if isinstance(proposed_universe, list):
-            proposed_set = set([s.upper() for s in proposed_universe if s.upper() in CONFIG.get('UNIVERSE_CANDIDATES', [])])
-            if len(proposed_set) == current_config.get('MAX_UNIVERSE_SIZE', 8):
+            candidates = set(CONFIG.get('UNIVERSE_CANDIDATES', []))
+            proposed_set = set([s.upper() for s in proposed_universe if s.upper() in candidates])
+            max_size = current_config.get('MAX_UNIVERSE_SIZE', 8)
+            if len(proposed_set) >= max(max_size - 1, 4):
                 # Performance check: rotate only if poor (win rate < 55% or drawdown > 5%)
                 try:
                     recent_win_rate = float(context_data.get('win_rate', '50')) / 100
@@ -358,6 +360,7 @@ GROUP 7: Regime Detection
                         new_value=list(proposed_set),
                         pnl_context=pnl_context
                     )
+                    current_config['SYMBOLS'] = list(proposed_set)
                     logger.info(f"[GEMINI TUNER] Intra-week rotation triggered — win rate {recent_win_rate:.1%}, drawdown {drawdown:.1%}")
                 elif proposed_set != current_symbols:
                     logger.debug(f"[GEMINI TUNER] Proposed universe different but performance ok — no rotation")

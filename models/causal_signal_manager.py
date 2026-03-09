@@ -234,6 +234,10 @@ class CausalSignalManager:
             ges = GES(data)
             logger.info(f"[CAUSAL DEBUG] Starting GES estimation (bare call for maximum compatibility)")
             self.causal_graph = ges.estimate()
+            # Ensure action/reward nodes exist in graph (GES may not include isolated nodes)
+            for required_node in ['action', 'reward']:
+                if required_node not in self.causal_graph.nodes:
+                    self.causal_graph.add_node(required_node)
             # === BUILD DoWhy CausalModel FIRST (now with correct action/reward columns) ===
             logger.info(f"[CAUSAL DOWHY] Building DoWhy CausalModel with {len(self.causal_graph.edges)} edges")
             # DoWhy expects a GML string for the graph parameter, not a networkx DiGraph
@@ -245,7 +249,7 @@ class CausalSignalManager:
                 graph=graph_gml
             )
             # P-20 FIX: Explicitly identify the estimand (missing step causing AttributeError)
-            identified_estimand = self.causal_model.identify_effect()
+            identified_estimand = self.causal_model.identify_effect(proceed_when_unidentifiable=True)
             self.identified_estimand = identified_estimand # BUG #6 PATCH: Store on self so predict() and compute_penalty_factor() can access it
             logger.info(f"[CAUSAL IDENTIFY] Estimand identified successfully")
             logger.info(f"✅ [CAUSAL DOWHY SUCCESS] DoWhy CausalModel ready with {len(self.causal_graph.edges)} validated edges")

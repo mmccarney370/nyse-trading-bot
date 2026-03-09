@@ -121,11 +121,12 @@ def detect_regime(
                 raise ValueError("All HMM fits failed — no valid transition probabilities")
 
             avg_self_prob = np.mean(self_probs)
-            regime = 'trending' if trending_votes > ensemble_size // 2 else 'mean_reverting'
+            actual_fits = len(self_probs)
+            regime = 'trending' if trending_votes >= (actual_fits + 1) // 2 else 'mean_reverting'
 
             if verbose:
                 logger.debug(
-                    f"HMM Ensemble | {symbol} | TF={used_tf} | votes={trending_votes}/{ensemble_size} | "
+                    f"HMM Ensemble | {symbol} | TF={used_tf} | votes={trending_votes}/{actual_fits} | "
                     f"persistence={avg_self_prob:.3f} | regime={regime} | last_bar={full_data.index[-1]}"
                 )
             else:

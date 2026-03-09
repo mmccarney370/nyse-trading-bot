@@ -33,7 +33,7 @@ class CausalRLManager:
         # BUG #20 PATCH: Force ReplayBuffer reset on rotation
         if hasattr(self.signal_gen, 'portfolio_causal_wrapper') and self.signal_gen.portfolio_causal_wrapper is not None:
             if hasattr(self.signal_gen.portfolio_causal_wrapper, 'replay_buffer'):
-                self.signal_gen.portfolio_causal_wrapper.replay_buffer = []
+                self.signal_gen.portfolio_causal_wrapper.replay_buffer.buffer.clear()
             logger.info("✅ Portfolio causal ReplayBuffer reset for new universe (stale transitions cleared)")
         # BUG #23 PATCH: Prune per-symbol causal wrappers for removed symbols and init new ones for added symbols
         old_symbols = set(getattr(self.signal_gen, 'causal_wrappers', {}).keys())
@@ -46,7 +46,8 @@ class CausalRLManager:
         for sym in added:
             if sym not in getattr(self.signal_gen, 'causal_wrappers', {}):
                 # ISSUE #4 FIX: Updated class name from old CausalSignalWrapper → current CausalSignalManager
-                self.signal_gen.causal_wrappers[sym] = CausalSignalManager(base_model=None, symbol=sym)
+                data_ing = getattr(self.signal_gen, 'data_ingestion', None)
+                self.signal_gen.causal_wrappers[sym] = CausalSignalManager(base_model=None, symbol=sym, data_ingestion=data_ing)
                 logger.info(f"[B-23] Initialized new per-symbol causal wrapper for added symbol {sym}")
     def sync_daily_rewards(self):
         """Bug #21: After daily graph refresh, force-push any pending realized rewards from live_signal_history."""
@@ -63,7 +64,10 @@ class CausalRLManager:
                 for entry in entries:
                     if entry.get('realized_return') is not None and not entry.get('reward_pushed', False):
                         reward = entry['realized_return']
-                        obs = entry.get('obs', [])
+                        obs_raw = entry.get('obs', [])
+                        if not obs_raw or (isinstance(obs_raw, (list, np.ndarray)) and len(obs_raw) == 0):
+                            continue  # skip empty obs — would crash np.vstack in sample()
+                        obs = np.array(obs_raw, dtype=np.float32) if isinstance(obs_raw, list) else obs_raw
                         # Push to per-symbol causal manager if exists
                         if symbol in getattr(self.signal_gen, 'causal_wrappers', {}):
                             wrapper = self.signal_gen.causal_wrappers[symbol]

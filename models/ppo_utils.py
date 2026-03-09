@@ -69,6 +69,9 @@ def save_ppo_model(trainer, key: str):
             return
         model = trainer.ppo_models[key]
         vec_norm = trainer.vec_norms[key]
+        if model is None or vec_norm is None:
+            logger.warning(f"PPO model or VecNorm is None for {key} — skipping save")
+            return
         ppo_path = os.path.join(MODEL_DIR, f"ppo_{key}.zip")
         vec_path = os.path.join(MODEL_DIR, f"vecnorm_{key}.pkl")
 

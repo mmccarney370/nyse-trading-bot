@@ -565,7 +565,7 @@ class DataHandler:
     def _fetch_yfinance_data(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame:
         time.sleep(self.config['REQUEST_INTERVAL'])
         try:
-            interval = '1d' if timeframe == '1d' else '15m'
+            interval = '1d' if timeframe == '1d' else ('1h' if timeframe.lower() in ('1h', '60min') else '15m')
             if interval != '1d' and (end - start).days > 60:
                 logger.debug(f"Skipping yFinance for {symbol} {timeframe}: range >60 days")
                 return pd.DataFrame()

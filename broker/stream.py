@@ -94,7 +94,7 @@ class TradeStreamHandler:
 
             await self.broker.submit_exit_orders(symbol, group, fill_price, filled_qty)
 
-        elif order_id in (group.trailing_stop_id, group.take_profit_id):
+        elif order_id and order_id in (group.trailing_stop_id, group.take_profit_id):
             # === EXIT FILL: Cancel the other leg (manual OCO) ===
             cancel_id = tracker.mark_exit_fill(symbol, order_id, fill_price)
             if cancel_id:
@@ -141,21 +141,23 @@ class TradeStreamHandler:
         new_order_id = str(order.id) if hasattr(order, 'id') else order_id
         logger.info(f"[STREAM] Order replaced: {symbol} old={order_id} new={new_order_id}")
         tracker = self.broker.tracker
-        group = tracker.lookup_by_order_id(order_id)
-        if group and order_id == group.trailing_stop_id:
-            # Update tracker with the new order ID so future fills are recognized
-            old_id = group.trailing_stop_id
-            group.trailing_stop_id = new_order_id
-            # Update the order ID index
-            if hasattr(tracker, '_order_id_index'):
+        # Use a single lock acquisition for lookup + update to prevent stale reference
+        with tracker._lock:
+            sym = tracker._order_id_index.get(order_id)
+            group = tracker.groups.get(sym) if sym else None
+            if group and order_id == group.trailing_stop_id:
+                old_id = group.trailing_stop_id
+                group.trailing_stop_id = new_order_id
                 tracker._order_id_index.pop(old_id, None)
-                tracker._order_id_index[new_order_id] = symbol
-            new_trail = float(order.trail_percent) if hasattr(order, 'trail_percent') and order.trail_percent else None
-            new_stop = float(order.stop_price) if hasattr(order, 'stop_price') and order.stop_price else None
-            if new_trail:
-                tracker.update_trail(symbol, new_trail, new_stop)
-            tracker._save()
-            logger.info(f"[STREAM] Trailing stop ID updated: {old_id} → {new_order_id}")
+                tracker._order_id_index[new_order_id] = sym
+                new_trail = float(order.trail_percent) if hasattr(order, 'trail_percent') and order.trail_percent else None
+                new_stop = float(order.stop_price) if hasattr(order, 'stop_price') and order.stop_price else None
+                if new_trail:
+                    group.trail_percent = new_trail
+                    if new_stop is not None:
+                        group.stop_price = new_stop
+                tracker._save()
+                logger.info(f"[STREAM] Trailing stop ID updated: {old_id} → {new_order_id}")
 
     def _push_reward(self, symbol: str, group, fill_price: float):
         """Push realized return to causal buffer if bot context is available."""

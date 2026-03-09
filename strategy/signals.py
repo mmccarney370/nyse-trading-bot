@@ -401,9 +401,9 @@ class SignalGenerator:
             bars_since = (timestamp - self.last_entry_time[symbol]) / pd.Timedelta(minutes=15)
             # P-13 / Critical #5 FIX: Safe default if config key missing (prevents TypeError crash)
             if regime == 'trending':
-                min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 48)
+                min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 6)
             else:
-                min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 24)
+                min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
             if bars_since < min_hold:
                 if direction == 0 or direction == -prev_direction:
                     direction = prev_direction
@@ -531,8 +531,8 @@ class SignalGenerator:
   
             # Cache result (now per hour)
             if len(self.sentiment_cache) > 5000:
-                # Evict oldest entries (keep most recent 2500)
-                keys = sorted(self.sentiment_cache.keys())
+                # Evict oldest entries by date/hour, not alphabetically by symbol
+                keys = sorted(self.sentiment_cache.keys(), key=lambda k: '_'.join(k.split('_')[1:]))
                 for k in keys[:len(keys) - 2500]:
                     del self.sentiment_cache[k]
             self.sentiment_cache[cache_key] = score
@@ -809,15 +809,22 @@ class SignalGenerator:
                 if len(closed) >= 5:
                     recent_rets = [e['realized_return'] for e in closed[-10:]]
                     win_rate = sum(r > 0 for r in recent_rets) / len(recent_rets)
-                    if win_rate < 0.4:
-                        logger.warning(f"{symbol} OOS degradation detected: recent win rate {win_rate:.1%} — capping conviction")
-                        # Actually apply the cap by boosting the confidence threshold (fewer entries)
-                        if symbol in self.trainer.confidence_thresholds:
-                            thresholds = self.trainer.confidence_thresholds[symbol]
-                            if thresholds:
-                                latest = thresholds[-1]
-                                latest['long'] = min(latest.get('long', 0.6) + 0.05, 0.85)
-                                latest['short'] = max(latest.get('short', 0.4) - 0.05, 0.15)
+                    if symbol in self.trainer.confidence_thresholds:
+                        thresholds = self.trainer.confidence_thresholds[symbol]
+                        if thresholds:
+                            latest = thresholds[-1]
+                            if win_rate < 0.4:
+                                # Tighten thresholds — but use absolute target, not cumulative increment
+                                target_long = min(0.65 + (0.4 - win_rate) * 0.5, 0.85)
+                                target_short = max(0.35 - (0.4 - win_rate) * 0.5, 0.15)
+                                latest['long'] = max(latest.get('long', 0.6), target_long)
+                                latest['short'] = min(latest.get('short', 0.4), target_short)
+                                logger.warning(f"{symbol} OOS degradation: win rate {win_rate:.1%} — thresholds tightened to L={latest['long']:.2f}/S={latest['short']:.2f}")
+                            elif win_rate > 0.55:
+                                # Recovery: relax thresholds back toward default
+                                latest['long'] = max(latest.get('long', 0.6) - 0.02, 0.55)
+                                latest['short'] = min(latest.get('short', 0.4) + 0.02, 0.45)
+                                logger.info(f"{symbol} OOS recovery: win rate {win_rate:.1%} — thresholds relaxed to L={latest['long']:.2f}/S={latest['short']:.2f}")
                 # B-25 FIX: Runtime prune old realized entries to prevent memory bloat (keep last 2000 per symbol)
                 if len(history) > 2000:
                     history[:] = history[-2000:]

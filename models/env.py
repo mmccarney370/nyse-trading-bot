@@ -66,10 +66,21 @@ class TradingEnv(gym.Env):
         self.equity_prev = self.equity
         # P-9 FIX: Reset vol_target
         self.vol_target = 0.0
+        # PERF FIX: Cache regime at reset() to avoid expensive HMM call every step()
+        self._cached_regime = None
+        self._cached_persistence = None
         data = self.data_ingestion.get_latest_data(self.symbol)
         if len(data) < 200:
             data = pd.DataFrame()
         self.data = data
+        # Compute regime once per episode (uses full available data)
+        if not self.data.empty and len(self.data) >= 200:
+            self._cached_regime, self._cached_persistence = detect_regime(
+                data=self.data,
+                symbol=self.symbol,
+                data_ingestion=self.data_ingestion,
+                lookback=CONFIG.get('LOOKBACK', 900)
+            )
         # TFT CACHING
         if CONFIG.get('USE_TFT_ENCODER', False):
             import time as _time
@@ -93,20 +104,22 @@ class TradingEnv(gym.Env):
     def step(self, action):
         if self.current_step >= len(self.data) - 1 or self.data.empty:
             return self._get_observation(), 0, True, False, {'volatility_target': 0.0}
-        # P-4 FIX: Single detect_regime() call at top of step() — reused for causal penalty AND persistence bonus
-        # (eliminates duplicate 20-HMM computation per training step)
+        # PERF FIX: Use cached regime from reset() instead of calling detect_regime() every step
         window = self.data.iloc[:self.current_step + 1]
-        regime, persistence = detect_regime(
-            data=window,
-            symbol=self.symbol,
-            data_ingestion=self.data_ingestion,
-            lookback=CONFIG.get('LOOKBACK', 900)
-        )
+        if self._cached_regime is not None:
+            regime, persistence = self._cached_regime, self._cached_persistence
+        else:
+            regime, persistence = detect_regime(
+                data=window,
+                symbol=self.symbol,
+                data_ingestion=self.data_ingestion,
+                lookback=CONFIG.get('LOOKBACK', 900)
+            )
         target_pos = np.clip(float(action[0]), -1.0, 1.0)
         current_price = self.data['close'].iloc[self.current_step]
         trade_pos = target_pos - self.position
         trade_shares = trade_pos * self.max_shares
-        turnover_cost = abs(trade_shares) * current_price * (CONFIG.get('SLIPPAGE', 0.0005) + CONFIG.get('COMMISSION_PER_SHARE', 0.005) / current_price)
+        turnover_cost = abs(trade_shares) * current_price * (CONFIG.get('SLIPPAGE', 0.0005) + CONFIG.get('COMMISSION_PER_SHARE', 0.0005) / current_price)
         self.position = target_pos
         self.cash -= trade_shares * current_price  # pay for (or receive from) the shares
         self.cash -= turnover_cost
