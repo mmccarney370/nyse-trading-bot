@@ -66,13 +66,31 @@ class PortfolioRebalancer:
         )
         # ==================== END NEW SYMMETRY ====================
         # Apply CVaR dollar risk to final weights
+        # FIX: Convert risk dollars → notional position via ATR stop distance
+        # risk_dollars is how much we're willing to LOSE, not the position size itself
         for sym in symbols:
             if sym in dollar_risk_alloc and dollar_risk_alloc[sym] != 0:
                 price = prices.get(sym)
                 if price and price > 0 and current_equity > 0:
-                    cvar_weight = dollar_risk_alloc[sym] / current_equity
+                    risk_dollars = dollar_risk_alloc[sym]
+                    # Compute stop distance to convert risk → notional
+                    data = data_dict.get(sym)
+                    if data is not None and len(data) >= 14:
+                        atr = self.risk_manager._compute_current_atr(data, lookback=50)
+                        atr_pct = max(atr / price, 0.0005)
+                        regime_tuple = regimes.get(sym, ('mean_reverting', 0.5))
+                        regime_str = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                        trail_key = 'TRAILING_STOP_ATR_TRENDING' if regime_str == 'trending' else 'TRAILING_STOP_ATR_MEAN_REVERTING'
+                        trailing_mult = self.config.get(trail_key, self.config.get('TRAILING_STOP_ATR', 3.0))
+                        stop_distance_pct = atr_pct * trailing_mult
+                    else:
+                        stop_distance_pct = 0.02  # 2% fallback
+                    # notional = risk / stop_distance (e.g. $35 risk / 1.5% stop = $2,333 position)
+                    notional = abs(risk_dollars) / stop_distance_pct if stop_distance_pct > 0 else 0
+                    cvar_weight = np.sign(risk_dollars) * notional / current_equity
                     target_weights_dict[sym] = cvar_weight
-                    logger.debug(f"[CVaR LIVE] {sym} adjusted to {cvar_weight:.4f} (dollar risk ${dollar_risk_alloc[sym]:,.0f})")
+                    logger.debug(f"[CVaR LIVE] {sym} risk=${risk_dollars:,.0f} → notional=${notional:,.0f} "
+                                 f"(stop_dist={stop_distance_pct:.4f}) → weight={cvar_weight:.4f}")
         # HARD NOTIONAL CAP (prevents cheap-stock explosion)
         max_notional_per_symbol = current_equity * self.config.get('MAX_POSITION_VALUE_FRACTION', 0.20)
         for sym in target_weights_dict:

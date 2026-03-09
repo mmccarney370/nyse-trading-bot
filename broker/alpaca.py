@@ -60,6 +60,7 @@ class AlpacaBroker:
         self.regime_cache = self._load_regime_cache()
         self.existing_positions = {}
         self.last_ratchet_time = {}
+        self._ratchet_pending = set()  # Symbols with in-flight replace — skip until websocket confirms
         self._positions_lock = threading.Lock()  # Thread safety for sync_existing_positions
         # Positions cache with TTL
         self._positions_cache = {}
@@ -176,6 +177,22 @@ class AlpacaBroker:
                     logger.info(f"[RECONCILE] {sym} was OPEN in tracker but no position — stop likely filled while offline")
                 logger.info(f"[RECONCILE] Removing stale tracker group for {sym}")
                 self.tracker.remove_group(sym)
+
+        # --- 1b. Cancel orphaned closing orders for symbols with no position ---
+        for sym, orders in open_orders.items():
+            if sym not in self.existing_positions:
+                for order in orders:
+                    order_side = str(getattr(order, 'side', '')).lower().split('.')[-1]
+                    order_type = str(getattr(order, 'order_type', '')).lower().split('.')[-1]
+                    # Only cancel closing orders (sells for longs, buys for shorts) — not pending entries
+                    if order_type in ('trailing_stop', 'stop', 'stop_limit') or \
+                       (order_type == 'limit' and order_side == 'sell'):
+                        try:
+                            self.client.cancel_order_by_id(str(order.id))
+                            logger.info(f"[RECONCILE] Cancelled orphaned {order_type} order for {sym} "
+                                        f"(no position exists) — id={order.id}")
+                        except Exception as e:
+                            logger.warning(f"[RECONCILE] Failed to cancel orphaned order for {sym}: {e}")
 
         # --- 2. Process each actual Alpaca position ---
         for sym, qty in self.existing_positions.items():
@@ -628,6 +645,9 @@ class AlpacaBroker:
         group = self.tracker.groups.get(symbol)
         if not group or group.state != GroupState.OPEN or not group.trailing_stop_id:
             return
+        # Skip if a replace is already in-flight (waiting for websocket _handle_replaced)
+        if symbol in self._ratchet_pending:
+            return
 
         now = datetime.now(tz=_UTC)
         last_ratchet = self.last_ratchet_time.get(symbol, _EPOCH)
@@ -674,6 +694,7 @@ class AlpacaBroker:
 
         try:
             replace_req = ReplaceOrderRequest(trail=new_trail_pct)
+            self._ratchet_pending.add(symbol)
             self.client.replace_order_by_id(group.trailing_stop_id, replace_req)
             self.last_ratchet_time[symbol] = now
             self.tracker.update_trail(symbol, new_trail_pct)
@@ -682,6 +703,7 @@ class AlpacaBroker:
                 f"(profit={unrealized_pct*100:+.1f}%, regime={regime})"
             )
         except Exception as e:
+            self._ratchet_pending.discard(symbol)
             logger.warning(f"[RATCHET] Failed PATCH for {symbol}: {e} — will retry next cycle")
 
     # ====================== MONITOR LOOP ======================
@@ -710,7 +732,10 @@ class AlpacaBroker:
                     if data is None or len(data) < 50:
                         continue
 
-                    direction = 1 if qty > 0 else -1
+                    # Prefer tracker direction (authoritative) over position qty sign
+                    # Alpaca may report short positions with positive qty in some cases
+                    tracked_group = self.tracker.groups.get(sym)
+                    direction = tracked_group.direction if tracked_group else (1 if qty > 0 else -1)
                     current_price = float(data['close'].iloc[-1])
                     atr = self._compute_current_atr(data)
 
@@ -735,10 +760,14 @@ class AlpacaBroker:
                     # === Software TP check (trailing stop holds all qty, TP enforced here) ===
                     group = self.tracker.groups.get(sym)
                     if group and group.state == GroupState.OPEN and group.tp_price:
-                        tp_hit = (direction > 0 and current_price >= group.tp_price) or \
-                                 (direction < 0 and current_price <= group.tp_price)
+                        # BUG FIX: Use group.direction (from entry) not position-derived direction.
+                        # Alpaca paper may report short sells as LONG positions, causing
+                        # direction=1 with a below-entry TP → immediate false TP hit.
+                        tp_dir = group.direction
+                        tp_hit = (tp_dir > 0 and current_price >= group.tp_price) or \
+                                 (tp_dir < 0 and current_price <= group.tp_price)
                         if tp_hit:
-                            logger.info(f"[TP HIT] {sym} @ {current_price:.2f} >= TP {group.tp_price:.2f} — closing position")
+                            logger.info(f"[TP HIT] {sym} @ {current_price:.2f} {'≥' if tp_dir > 0 else '≤'} TP {group.tp_price:.2f} — closing position")
                             # Cancel trailing stop first
                             if group.trailing_stop_id:
                                 try:
@@ -831,7 +860,10 @@ class AlpacaBroker:
             )
 
     def _adapt_slippage(self):
-        """Adapt limit_price_offset based on recent fill slippage."""
+        """Adapt limit_price_offset based on recent ENTRY fill slippage only.
+        BUG FIX: Was including exit orders (trailing stops, TP sells) which have completely
+        different price levels, causing a positive feedback loop that spiraled the offset
+        from 0.4% to 1000%+."""
         try:
             recent_closed = self.client.get_orders(GetOrdersRequest(
                 status='closed',
@@ -843,15 +875,31 @@ class AlpacaBroker:
         slippage_total = 0.0
         fill_count = 0
         for o in recent_closed:
-            if o.filled_at and o.filled_avg_price and o.limit_price:
-                filled_at_utc = o.filled_at.astimezone(_UTC) if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=_UTC)
-                if (datetime.now(tz=_UTC) - filled_at_utc).total_seconds() < 3600:
-                    slippage = abs(float(o.filled_avg_price) - float(o.limit_price)) / float(o.limit_price)
-                    slippage_total += slippage
-                    fill_count += 1
+            if not (o.filled_at and o.filled_avg_price and o.limit_price):
+                continue
+            # ONLY measure slippage on ENTRY limit orders (not trailing stops, not exit sells)
+            order_type = str(getattr(o, 'order_type', '')).lower().split('.')[-1]
+            if order_type != 'limit':
+                continue
+            # Skip exit orders — only entry orders have position_intent BUY_TO_OPEN/SELL_TO_OPEN
+            # Heuristic: entry buys have limit ABOVE market, entry sells have limit BELOW market
+            fill_price = float(o.filled_avg_price)
+            limit_price = float(o.limit_price)
+            side = str(getattr(o, 'side', '')).lower().split('.')[-1]
+            # Entry buy: limit >= fill (willing to pay up to limit)
+            # Entry sell (short): limit <= fill (willing to sell down to limit)
+            # Exit sell: limit could be anything (TP target) — skip
+            # Only count if slippage is small (< 5%) — large gaps indicate exit orders
+            slippage = abs(fill_price - limit_price) / limit_price
+            if slippage > 0.05:
+                continue  # clearly not an entry order — skip
+            filled_at_utc = o.filled_at.astimezone(_UTC) if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=_UTC)
+            if (datetime.now(tz=_UTC) - filled_at_utc).total_seconds() < 3600:
+                slippage_total += slippage
+                fill_count += 1
         if fill_count > 0:
             avg_slippage = slippage_total / fill_count
-            new_offset = max(0.001, avg_slippage * 2 + 0.001)
+            new_offset = max(0.001, min(0.02, avg_slippage * 2 + 0.001))  # Hard cap at 2%
             if abs(new_offset - self.limit_price_offset) > 0.0005:
                 old = self.limit_price_offset
                 self.limit_price_offset = new_offset

@@ -158,6 +158,8 @@ class TradeStreamHandler:
                         group.stop_price = new_stop
                 tracker._save()
                 logger.info(f"[STREAM] Trailing stop ID updated: {old_id} → {new_order_id}")
+        # Clear ratchet in-flight flag so next ratchet can proceed
+        self.broker._ratchet_pending.discard(sym or symbol)
 
     def _push_reward(self, symbol: str, group, fill_price: float):
         """Push realized return to causal buffer if bot context is available."""
