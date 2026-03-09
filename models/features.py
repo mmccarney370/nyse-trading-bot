@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 if CONFIG.get('USE_TFT_ENCODER', False):
     try:
         from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-        from pytorch_forecasting.data import GroupNormalizer
+        from pytorch_forecasting.data import GroupNormalizer, EncoderNormalizer
         from pytorch_forecasting.metrics import QuantileLoss
         import lightning.pytorch as pl
         TFT_AVAILABLE = True
@@ -192,7 +192,7 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
             static_reals=[],
             time_varying_known_reals=["time_idx", "open", "high", "low", "volume"] if 'volume' in df else ["time_idx", "open", "high", "low"],
             time_varying_unknown_reals=["close"],
-            target_normalizer=GroupNormalizer(groups=["symbol"], transformation="softplus"),
+            target_normalizer=EncoderNormalizer(transformation="softplus"),
             add_relative_time_idx=True,
             add_target_scales=True,
             add_encoder_length=True,

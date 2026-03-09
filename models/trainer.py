@@ -12,7 +12,8 @@ from .ppo_utils import (
     train_ppo,
     save_ppo_model,
     load_ppo_model,
-    update_model_weights as ppo_update_model_weights
+    update_model_weights as ppo_update_model_weights,
+    cosine_annealing_schedule,
 )
 from .stacking_ensemble import train_stacking
 from config import CONFIG
