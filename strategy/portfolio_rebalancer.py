@@ -91,7 +91,16 @@ class PortfolioRebalancer:
                     target_weights_dict[sym] = cvar_weight
                     logger.debug(f"[CVaR LIVE] {sym} risk=${risk_dollars:,.0f} → notional=${notional:,.0f} "
                                  f"(stop_dist={stop_distance_pct:.4f}) → weight={cvar_weight:.4f}")
-        # HARD NOTIONAL CAP (prevents cheap-stock explosion)
+        # FIX: Normalize CVaR weights to sum(abs) = 1.0 BEFORE notional cap
+        # Without this, CVaR risk→notional conversion produces weights >> 1.0 per symbol,
+        # and the notional cap clamps ALL of them to the same flat value, erasing CVaR differentiation
+        pre_cap_abs = sum(abs(v) for v in target_weights_dict.values())
+        if pre_cap_abs > 1.0:
+            for sym in target_weights_dict:
+                target_weights_dict[sym] /= pre_cap_abs
+            logger.debug(f"[CVaR RENORM] Pre-cap normalization: divided all weights by {pre_cap_abs:.4f}")
+
+        # HARD NOTIONAL CAP (prevents cheap-stock explosion) — now only clips true outliers
         max_notional_per_symbol = current_equity * self.config.get('MAX_POSITION_VALUE_FRACTION', 0.20)
         for sym in target_weights_dict:
             proposed_notional = abs(target_weights_dict[sym]) * current_equity
@@ -101,6 +110,19 @@ class PortfolioRebalancer:
                 target_weights_dict[sym] *= scale
                 logger.warning(f"[NOTIONAL CAP] {sym} capped from {old_weight:.4f} ({proposed_notional:,.0f}$ notional) → {target_weights_dict[sym]:.4f}")
         # ==================== MULTIPLICATIVE ADJUSTMENTS (all applied before single renorm) ====================
+        # 0. Regime-direction override: block shorts in strong trending, block longs in strong mean-reverting
+        regime_override_threshold = self.config.get('REGIME_OVERRIDE_PERSISTENCE', 0.80)
+        for sym in symbols:
+            regime_tuple = regimes.get(sym, ('mean_reverting', 0.5))
+            regime_str = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+            persistence = regime_tuple[1] if isinstance(regime_tuple, (list, tuple)) else 0.5
+            weight = target_weights_dict.get(sym, 0.0)
+            if persistence >= regime_override_threshold and weight != 0:
+                if regime_str == 'trending' and weight < 0:
+                    logger.warning(f"[REGIME OVERRIDE] {sym} SHORT weight {weight:.4f} zeroed — "
+                                   f"strong trending regime (persistence={persistence:.3f})")
+                    target_weights_dict[sym] = 0.0
+
         # 1. Regime persistence scaling
         for sym in symbols:
             regime_tuple = regimes.get(sym, ('mean_reverting', 0.5))

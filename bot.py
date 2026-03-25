@@ -505,6 +505,7 @@ class TradingBot:
                                 if len(hist) > self._signal_history_max:
                                     self.live_signal_history[sym] = hist[-self._signal_history_max:]
                                 self._save_last_entry_times() # B-23: immediate save after new entry
+                                self._save_live_signal_history() # FIX: persist signal history immediately (was only saved on emergency shutdown)
                 except Exception as e:
                     logger.error(f"Portfolio PPO inference/rebalance failed: {e}", exc_info=True)
             else:
@@ -535,6 +536,12 @@ class TradingBot:
                     prev_direction = self.signal_gen.prev_signals.get(symbol, 0)
                     conviction = 0.3 * confidence + 0.7 * ppo_strength
                     conviction = np.clip(conviction, 0.0, 1.0)
+                    # FIX: Block shorts in strong trending regimes
+                    regime_override_threshold = self.config.get('REGIME_OVERRIDE_PERSISTENCE', 0.80)
+                    if direction == -1 and regime == 'trending' and persistence >= regime_override_threshold:
+                        logger.warning(f"[REGIME OVERRIDE] {symbol} SHORT blocked — strong trending regime "
+                                       f"(persistence={persistence:.3f})")
+                        direction = 0
                     if direction != 0 and prev_direction == 0:
                         # MAX_POSITIONS enforcement: skip new entries when at capacity
                         if len(self.broker.existing_positions) >= self.config.get('MAX_POSITIONS', 6):
@@ -593,6 +600,7 @@ class TradingBot:
                                 if len(hist) > self._signal_history_max:
                                     self.live_signal_history[symbol] = hist[-self._signal_history_max:]
                                 self._save_last_entry_times() # B-23: immediate save after new entry
+                                self._save_live_signal_history() # FIX: persist signal history immediately (was only saved on emergency shutdown)
                     if direction == 0 and symbol in positions and positions[symbol] != 0:
                         try:
                             # B-02 / B-10 FIX: Use safe async method (awaited) instead of raw client.close_position

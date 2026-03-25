@@ -201,3 +201,9 @@ class TradeStreamHandler:
                 causal_manager.add_transition(obs, action, ret)
                 causal_manager.save_buffer()
                 logger.info(f"[STREAM] Causal push: {symbol} realized={ret:+.4f}")
+        # FIX: Persist live_signal_history after recording realized return
+        if hasattr(bot, '_save_live_signal_history'):
+            try:
+                bot._save_live_signal_history()
+            except Exception as e:
+                logger.warning(f"[STREAM] Failed to save live_signal_history after reward push: {e}")

@@ -865,6 +865,31 @@ class AlpacaBroker:
                     if is_market_open():
                         await asyncio.to_thread(self.ratchet_trailing_stop, sym, current_price, atr)
 
+                    # === Auto-close tracked fractional orphans (< 1 share, no trailing stop) ===
+                    group = self.tracker.groups.get(sym)
+                    if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) < 1.0:
+                        notional = abs(qty) * current_price
+                        logger.info(f"[FRAC CLEANUP] {sym} tracked OPEN but only {abs(qty):.4f} shares "
+                                    f"(${notional:.2f}) with no trailing stop — closing orphan")
+                        try:
+                            await asyncio.to_thread(self.client.close_position, sym)
+                            logger.info(f"[FRAC CLEANUP] {sym} fractional orphan closed")
+                            self.tracker.mark_closed(sym)
+                            self.tracker.remove_group(sym)
+                            self.last_entry_times.pop(sym, None)
+                            self._save_last_entry_times()
+                        except Exception as e:
+                            err_str = str(e).lower()
+                            if 'position does not exist' in err_str or '40410000' in str(e):
+                                logger.info(f"[FRAC CLEANUP] {sym} already gone — cleaning up tracker")
+                                self.tracker.mark_closed(sym)
+                                self.tracker.remove_group(sym)
+                                self.last_entry_times.pop(sym, None)
+                                self._save_last_entry_times()
+                            else:
+                                logger.error(f"[FRAC CLEANUP] Failed to close {sym}: {e}")
+                        continue
+
                     # === Re-attach trailing stop for tracked groups that lost it ===
                     group = self.tracker.groups.get(sym)
                     if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) >= 1:
