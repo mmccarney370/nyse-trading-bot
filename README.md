@@ -1,36 +1,93 @@
-# nyse-trading-bot
+# NYSE Trading Bot
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
-![Status](https://img.shields.io/badge/Status-Paper_Trading-green)
-![RL](https://img.shields.io/badge/RL-Recurrent_PPO-purple)
-![Causal](https://img.shields.io/badge/Causal-GES_%2B_DoWhy-orange)
+![Status](https://img.shields.io/badge/Status-Live_Paper_Trading-green)
+![RL](https://img.shields.io/badge/RL-GTrXL_Recurrent_PPO-purple)
+![Causal](https://img.shields.io/badge/Causal_AI-GES_%2B_DoWhy-orange)
+![Self-Tuning](https://img.shields.io/badge/Self--Tuning-Gemini_2.5_Flash-red)
 ![License](https://img.shields.io/badge/License-MIT-brightgreen)
 
-An autonomous algorithmic trading system for US equities that combines reinforcement learning, causal inference, and adaptive self-tuning to make regime-aware portfolio decisions. It runs continuously during market hours, learns from its own trades, and adjusts its own hyperparameters overnight — no manual intervention required.
-
-This isn't a backtest-only research project. It connects to a live broker (Alpaca), streams real-time bars, places real orders with trailing stops and take-profits, and tracks every position through a full lifecycle state machine. That said, it's currently running in paper trading mode, and you should too until you're confident in what it's doing.
+**A fully autonomous, self-improving algorithmic trading system** that combines deep reinforcement learning, causal inference, and LLM-powered self-tuning to trade US equities around the clock — with zero manual intervention.
 
 ---
 
-## What It Actually Does
+## Why This Bot Is Different
 
-The bot wakes up every ~45 seconds during market hours and runs a full decision loop:
+### It Learns From Its Own Trades
+A **GTrXL Transformer-based PPO agent** (not a rules engine, not a simple moving average crossover) makes portfolio allocation decisions across 8 symbols simultaneously. It trains on a realistic multi-asset environment with transaction costs, drawdown penalties, and Sortino-weighted rewards — then continues learning nightly from real market outcomes.
 
-1. **Pulls fresh market data** from Alpaca's real-time stream (15-min and 1H bars), with ArcticDB as a local cache so cold starts don't lose history.
+### It Understands *Why*, Not Just *What*
+A **causal inference layer** (GES graph discovery + DoWhy) separates genuine market signals from spurious correlations. Before every trade, the bot asks: *"Is the action-reward relationship real, or just a statistical coincidence?"* Trades backed by weak causal evidence get their size reduced automatically.
 
-2. **Detects the current market regime** using an ensemble of Hidden Markov Models fitted on returns, rolling volatility, and volume changes. Each symbol gets classified as either *trending* or *mean-reverting*, along with a persistence score (how confident the HMM is that the regime will continue). A Hurst exponent fallback kicks in if the HMM can't converge.
+### It Tunes Itself Every Night
+At 3:30 AM, the bot sends its complete performance profile — Sharpe, Sortino, drawdown, win rate, per-symbol P&L, regime breakdown — to **Gemini 2.5 Flash**, which proposes parameter adjustments within safety-clamped bounds. Every change is logged as structured JSON. You can audit every decision the tuner has ever made.
 
-3. **Generates trading signals** through a multi-layer stack:
-   - A **Recurrent PPO agent** (GTrXL transformer policy via sb3-contrib) trained on a custom multi-asset Gym environment that simulates portfolio allocation with realistic transaction costs, drawdown penalties, and Sortino-weighted rewards.
-   - A **LightGBM stacking ensemble** (15 bootstrapped models) for next-bar direction probability.
-   - **Causal penalty factors** from a GES-discovered causal graph (via pgmpy) refined with DoWhy statistical refutation — this penalizes actions that the causal model thinks are spurious.
-   - Optional **sentiment analysis** from FinBERT + local LLM debate (Ollama).
+### It Adapts to Market Regimes in Real Time
+An **ensemble of Hidden Markov Models** classifies each symbol as *trending* or *mean-reverting* with a persistence confidence score. This score flows everywhere: it scales risk budgets, adjusts trailing stop widths, tilts position sizes, and shapes the PPO reward function. When markets shift, the bot shifts with them.
 
-4. **Sizes positions** using CVaR (Conditional Value-at-Risk) portfolio optimization with Ledoit-Wolf covariance shrinkage, regime-scaled risk budgets, hard notional caps, and real-time buying power checks against the broker.
+### It Runs Like a Production System
+This isn't a Jupyter notebook experiment. It connects to a **live broker (Alpaca)**, streams real-time bars, places real orders with trailing stops and take-profits, handles websocket fill events, manages a full order lifecycle state machine, persists state across restarts, and self-heals from disconnects. Currently running 24/7 in paper trading mode.
 
-5. **Executes trades** through Alpaca with bracket-style exit management: every entry gets a trailing stop (native Alpaca auto-trail with periodic PATCH ratcheting to tighten) and a take-profit limit. The websocket stream handles fill events and implements manual OCO (one-cancels-other) logic since Alpaca doesn't support true OCO on equities.
+---
 
-6. **Self-tunes overnight** — at 3:30 AM ET, the bot sends its recent performance metrics (Sharpe, Sortino, drawdown, win rate, profit factor) to Gemini 2.5 Flash, which proposes parameter adjustments within safety-clamped bounds. Changes are logged as structured JSON so you can audit every decision the tuner ever made.
+## Key Capabilities
+
+| Capability | Implementation |
+|---|---|
+| **Portfolio Optimization** | CVaR (Conditional Value-at-Risk) with Ledoit-Wolf covariance shrinkage, regime-scaled risk budgets, and real-time buying power enforcement |
+| **Signal Generation** | 5-layer blend: Recurrent PPO + LightGBM stacking ensemble (20 models) + causal penalty + FinBERT/Ollama sentiment + regime persistence weighting |
+| **52 Input Features** | Bollinger Bands, RSI, MACD, ATR, CCI, Stochastic, OBV z-score, Chaikin, VWAP deviation, volume imbalance, divergence detection, VIX/yield curve macro, TFT encoder, and more |
+| **Adaptive Exits** | Alpaca native trailing stops with periodic PATCH ratcheting that tightens based on unrealized profit tiers + software take-profit enforcement |
+| **Causal Overfitting Brake** | GES-discovered DAG over 54 variables identifies genuine action-reward pathways; spurious signals get suppressed |
+| **Sentiment Analysis** | Multi-agent LLM debate (3 agents: bull, bear, analyst) via Ollama + FinBERT fallback, parallelized across all symbols |
+| **Walk-Forward Validation** | Optuna-optimized thresholds with 6-window walk-forward, IS/OOS gap monitoring, and automatic overfitting detection |
+| **Dynamic Universe Rotation** | Weekly evaluation of 34 candidate symbols by liquidity, regime quality, and recent performance — automatic retraining on rotation |
+| **State Persistence** | Atomic file writes for order tracker, regime cache, signal history, replay buffers, and entry timestamps — survives crashes and restarts |
+| **Structured Observability** | Every subsystem logs with searchable prefixes (`[CVaR]`, `[CAUSAL]`, `[REGIME]`, `[TRACKER]`, `[RATCHET]`), plus TensorBoard for PPO training curves |
+
+---
+
+## How It Works
+
+The bot runs a **45-second decision loop** during market hours:
+
+```
+Market Data (Alpaca Stream + ArcticDB cache)
+     |
+     v
+Regime Detection (HMM ensemble + Hurst fallback)
+     |
+     v
+Feature Generation (52 technical + macro + TFT features)
+     |
+     v
+Portfolio PPO Inference (GTrXL policy -> target weights per symbol)
+     |
+     v
+Causal Penalty (GES graph correlation -> boost or suppress)
+     |
+     v
+Sentiment Blend (Ollama LLM debate, parallel across symbols)
+     |
+     v
+CVaR Position Sizing (risk budget + buying power + notional caps)
+     |
+     v
+Order Execution (limit entry -> websocket fill -> trailing stop + TP)
+     |
+     v
+Position Monitor (ratchet tightening, software TP/SL, reattach)
+```
+
+### Overnight Self-Improvement Cycle
+
+| Time (ET) | Task | What Happens |
+|---|---|---|
+| **3:30 AM** | Gemini Tuning | Sends full performance report to Gemini 2.5 Flash; receives parameter adjustments within safety bounds; applies and logs changes |
+| **3:30 AM** | Causal Refresh | Rebuilds GES causal graph with latest feature data + replay buffer transitions |
+| **4:00 AM** | Regime Precompute | Parallel HMM fitting across all symbols using ThreadPoolExecutor; updates shared regime cache |
+| **6:00 PM** | PPO Retrain | Online incremental update of portfolio PPO (75K timesteps) using latest market data |
+| **Friday 8 PM** | Universe Rotation | Evaluates 34 candidates, swaps underperformers, retrains all models on new universe |
 
 ---
 
@@ -40,46 +97,43 @@ The bot wakes up every ~45 seconds during market hours and runs a full decision 
 trading_bot/
 |
 |-- bot.py                          # Main async event loop + orchestration
-|-- config.py                       # All settings, Pydantic-validated
-|-- __main__.py                     # Entry point (python -m trading_bot)
-|-- backtest.py                     # Full backtesting engine (portfolio + per-symbol modes)
-|-- run_backtest.py                 # Standalone backtest runner with CLI args
-|-- gemini_tuner.py                 # Gemini API self-tuning + structured logging
+|-- config.py                       # All settings, Pydantic-validated (single source of truth)
+|-- __main__.py                     # Entry point
+|-- backtest.py                     # Full backtesting engine (portfolio + per-symbol)
+|-- gemini_tuner.py                 # Gemini 2.5 Flash self-tuning + structured JSON logging
 |
 |-- broker/
 |   |-- alpaca.py                   # Order execution, trailing stop ratcheting, position sync
-|   |-- stream.py                   # WebSocket trade-update handler (fill -> OCO -> close)
-|   |-- order_tracker.py            # Persistent state machine: pending -> open -> exit -> closed
+|   |-- stream.py                   # WebSocket handler (fill -> OCO -> close lifecycle)
+|   |-- order_tracker.py            # Persistent state machine with atomic saves
 |
 |-- strategy/
-|   |-- signals.py                  # Signal blending (PPO + ensemble + causal + sentiment)
-|   |-- regime.py                   # HMM ensemble + Hurst fallback + divergence detection
-|   |-- risk.py                     # CVaR optimization, position sizing, buying power clamps
-|   |-- portfolio_rebalancer.py     # Portfolio-level rebalance pipeline
-|   |-- universe.py                 # Weekly universe rotation with liquidity filters
+|   |-- signals.py                  # Signal blending (PPO + stacking + causal + sentiment)
+|   |-- regime.py                   # HMM ensemble + Hurst fallback + persistence scoring
+|   |-- risk.py                     # CVaR optimization, Kelly sizing, buying power clamps
+|   |-- portfolio_rebalancer.py     # Portfolio-level rebalance with notional caps
+|   |-- universe.py                 # Weekly universe rotation with liquidity/momentum filters
 |
 |-- models/
-|   |-- trainer.py                  # PPO/RecurrentPPO training loops (nightly retrain)
-|   |-- env.py                      # Per-symbol Gym environment (Sortino + causal rewards)
-|   |-- portfolio_env.py            # Multi-asset Gym environment for portfolio PPO
-|   |-- features.py                 # 50+ technical features (BB, RSI, MACD, ATR, OBV, etc.)
-|   |-- policies.py                 # Custom AuxGTrXL policy (auxiliary volatility head)
-|   |-- stacking_ensemble.py        # LightGBM bootstrap ensemble for meta-probabilities
-|   |-- causal_signal_manager.py    # GES causal discovery + DoWhy refutation + replay buffer
+|   |-- trainer.py                  # PPO/RecurrentPPO training (startup + nightly online)
+|   |-- env.py                      # Per-symbol Gym env (Sortino + causal rewards)
+|   |-- portfolio_env.py            # Multi-asset Gym env for portfolio PPO
+|   |-- features.py                 # 52-feature generator (technical + macro + TFT)
+|   |-- policies.py                 # Custom AuxGTrXL policy (gated transformer + aux vol head)
+|   |-- stacking_ensemble.py        # LightGBM bootstrap ensemble (20 models)
+|   |-- causal_signal_manager.py    # GES discovery + replay buffer + fast penalty computation
 |   |-- causal_rl_manager.py        # Causal buffer persistence + rotation reset
-|   |-- bot_initializer.py          # Startup initialization (model loading, cache warming)
-|   |-- ppo_utils.py                # PPO helper utilities
+|   |-- bot_initializer.py          # Startup: model loading, cache warming, state restoration
+|   |-- ppo_utils.py                # PPO save/load, cosine LR schedule
 |
 |-- data/
-|   |-- handler.py                  # ArcticDB local storage + Polygon/Alpaca/Finnhub fetching
+|   |-- handler.py                  # ArcticDB + Redis caching + Polygon/Alpaca/Finnhub fetch
 |   |-- ingestion.py                # Real-time bar stream + historical backfill
 |
 |-- utils/
-|   |-- helpers.py                  # Market hours, time utilities
-|   |-- local_llm.py                # Ollama LLM debate for sentiment
+|   |-- helpers.py                  # Market hours, holiday calendar
+|   |-- local_llm.py                # Ollama multi-agent debate for sentiment
 |   |-- log_setup.py                # Logging configuration
-|
-|-- tests/                          # Unit + integration tests
 ```
 
 ---
@@ -89,10 +143,12 @@ trading_bot/
 ### Prerequisites
 
 - Python 3.11+
-- An [Alpaca](https://alpaca.markets/) account (paper trading keys work fine)
+- CUDA-capable GPU (recommended for PPO training and TFT encoder)
+- [Alpaca](https://alpaca.markets/) account (paper trading keys work fine)
+- [Redis](https://redis.io/) (for data caching)
 - [Ollama](https://ollama.ai/) installed locally (optional, for sentiment analysis)
-- A [Gemini API key](https://ai.google.dev/) (optional, for self-tuning)
-- A [News API key](https://newsapi.org/) (optional, for causal news features)
+- [Gemini API key](https://ai.google.dev/) (optional, for self-tuning)
+- [News API key](https://newsapi.org/) (optional, for news sentiment)
 
 ### Setup
 
@@ -101,22 +157,21 @@ git clone https://github.com/mmccarney370/nyse-trading-bot.git
 cd nyse-trading-bot
 
 python -m venv venv
-source venv/bin/activate        # Linux/macOS
-# venv\Scripts\activate         # Windows
+source venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root:
+Create a `.env` file:
 
 ```env
-API_KEY=your_alpaca_api_key
-API_SECRET=your_alpaca_secret_key
+ALPACA_API_KEY=your_alpaca_api_key
+ALPACA_API_SECRET=your_alpaca_secret_key
 GEMINI_API_KEY=your_gemini_key          # optional
 NEWS_API_KEY=your_newsapi_key           # optional
 ```
 
-If you want sentiment analysis, pull the Ollama models:
+For sentiment analysis:
 
 ```bash
 ollama pull llama3.1:8b
@@ -126,110 +181,55 @@ ollama pull llama3.1:8b
 
 ```bash
 # Live paper trading
-python -m trading_bot
+python __main__.py
 
 # Backtest mode
 python run_backtest.py --start 2025-01-01 --end 2025-12-31
 ```
 
-The bot will:
-1. Initialize data (fetch historical bars if cache is empty)
-2. Load or train PPO models
-3. Build causal graphs (once replay buffer has enough data)
-4. Start the trading loop + websocket stream
+The bot will initialize data, load or train models, build causal graphs, and start the trading loop. First startup takes ~5 minutes (TFT precompute on GPU + stacking training); subsequent starts are faster with cached models.
 
-Logs go to `nyse_bot.log`. TensorBoard logs go to `ppo_tensorboard/`.
-
----
-
-## How the Pieces Fit Together
-
-### Regime Detection
-
-The regime detector runs an ensemble of 4 Gaussian HMMs with different random seeds, each fitted on a 3D observation space (returns, rolling volatility, log volume change). Each model votes on whether the current state is trending or mean-reverting based on its transition matrix self-probability. The majority vote wins, and the average self-transition probability becomes the "persistence score" — a continuous 0-1 measure of how sticky the current regime is.
-
-This persistence score flows everywhere: it scales the total risk budget, tilts per-symbol weights toward high-conviction names, adjusts min-hold periods, and shapes the PPO reward function. When the HMM can't fit (too little data, degenerate variance), it falls back to a Hurst exponent calculation.
-
-### The PPO Agent
-
-The portfolio-level PPO uses a GTrXL (Gated Transformer-XL) recurrent policy, which gives it memory across timesteps without the vanishing gradient problems of vanilla LSTMs. The observation space is ~50 features per symbol (technical indicators, macro inputs, regime flags, TFT encoder outputs) concatenated with portfolio state (current weights, cash ratio).
-
-The reward function is deliberately complex — it blends raw returns with a Sortino component, volatility penalty, drawdown penalty, turnover cost, causal penalty factor, and regime persistence bonus. The idea is to teach the agent that not all returns are equal: a 1% gain during a trending regime with low drawdown is worth more than a 1% gain during whipsaw conditions.
-
-### Causal Layer
-
-The causal pipeline uses the GES (Greedy Equivalence Search) algorithm from pgmpy to discover a directed acyclic graph over the feature space + action + reward. Each edge is then tested with DoWhy's statistical refutation (random common cause, placebo treatment). Edges that fail refutation are pruned.
-
-The surviving causal graph is used to compute a "penalty factor" for each trade — if the causal model thinks the action-reward relationship is mostly explained by confounders rather than genuine signal, the penalty scales down the position. This acts as a built-in overfitting brake.
-
-### Order Lifecycle
-
-Every trade follows a strict state machine tracked by `OrderTracker`:
-
-```
-pending_entry  ->  open  ->  pending_exit  ->  closed
-    |                |             |
-  (limit order    (trailing     (one exit
-   submitted)     stop + TP      fills,
-                  attached)      other
-                                canceled)
-```
-
-The trailing stop uses Alpaca's native auto-trail (set by `trail_percent`), but the bot also runs a periodic ratchet loop that PATCHes the trail tighter as price moves favorably. This means stops get tighter over time even during min-hold periods when no new trades are allowed.
+Logs: `nyse_bot.log` | Training curves: `tensorboard --logdir ppo_tensorboard`
 
 ---
 
 ## Configuration
 
-Everything lives in `config.py` and is validated by Pydantic on startup. Key groups:
+Everything lives in `config.py` with Pydantic validation. Key groups:
 
-| Group | Examples | What They Control |
-|-------|----------|-------------------|
-| **Risk** | `RISK_PER_TRADE`, `MAX_LEVERAGE`, `KELLY_FRACTION` | How much capital goes into each position |
-| **Regime** | `HMM_ENSEMBLE_SIZE`, `HURST_TREND_THRESHOLD`, `REGIME_SHORT_WEIGHT` | How the bot reads market conditions |
-| **Execution** | `TRAILING_STOP_ATR_TRENDING`, `TAKE_PROFIT_ATR_*`, `MIN_HOLD_BARS_*` | Stop placement and holding periods |
-| **PPO** | `PPO_LEARNING_RATE`, `PPO_ENT_COEF`, `SORTINO_WEIGHT` | RL training behavior |
-| **Tuning** | `GEMINI_TUNING_HOUR`, `TUNING_PCT_BOUND_*` | Self-tuning schedule and safety bounds |
+| Group | Key Parameters | What They Control |
+|---|---|---|
+| **Risk** | `RISK_PER_TRADE`, `MAX_LEVERAGE`, `KELLY_FRACTION`, `MAX_POSITIONS` | Capital allocation and risk limits |
+| **Regime** | `HMM_ENSEMBLE_SIZE`, `REGIME_SHORT_WEIGHT`, `HURST_TREND_THRESHOLD` | How the bot reads market conditions |
+| **Execution** | `TRAILING_STOP_ATR_*`, `TAKE_PROFIT_ATR_*`, `MIN_HOLD_BARS_*`, `RATCHET_*` | Stop placement, profit targets, and trail tightening |
+| **PPO** | `PPO_LEARNING_RATE`, `PPO_ENTROPY_COEFF`, `GTRXL_*`, `SORTINO_WEIGHT` | RL training behavior and architecture |
+| **Causal** | `USE_CAUSAL_RL`, `CAUSAL_PENALTY_WEIGHT`, `CAUSAL_EDGE_THRESHOLD` | Causal inference strength and sensitivity |
+| **Tuning** | Gemini schedule, safety bounds | Self-tuning schedule and parameter clamps |
 
-The Gemini tuner can adjust most of these within clamped bounds (typically +/-15-25% of current value). Every change is logged with full context so you can trace why any parameter changed.
+The Gemini tuner adjusts most parameters within clamped bounds (typically +/-15-25%). Every change is logged with full performance context as structured JSON.
 
 ---
 
 ## Monitoring
 
-- **`nyse_bot.log`** — Main log file. Search for `[CVaR]`, `[REGIME]`, `[CAUSAL]`, `[TRACKER]` prefixes to filter by subsystem.
-- **TensorBoard** — `tensorboard --logdir ppo_tensorboard` for training curves, reward progression, and policy entropy.
-- **Structured Gemini logs** — Search for `"event": "gemini_change"` in the log to see every parameter adjustment with before/after values and performance context.
-- **Order tracker** — `order_tracker.json` has the current state of all active positions.
-- **Heartbeat** — The bot logs a heartbeat with portfolio status every 60 seconds during market hours.
+- **`nyse_bot.log`** — Searchable by subsystem: `[CVaR]`, `[REGIME]`, `[CAUSAL]`, `[TRACKER]`, `[RATCHET]`, `[STREAM]`
+- **TensorBoard** — `tensorboard --logdir ppo_tensorboard` for reward curves, policy entropy, episode length
+- **Gemini audit trail** — Search `"event": "gemini_change"` for every parameter adjustment with before/after values
+- **`order_tracker.json`** — Real-time state of all active positions and their exit orders
+- **Monitor heartbeat** — Position status logged every 20 seconds during market hours
 
 ---
 
 ## Troubleshooting
 
-| Symptom | What's Happening | Fix |
-|---------|-----------------|-----|
-| "Insufficient features for stacking" | Not enough historical bars loaded | Wait for cache to fill (~300 bars) or increase `lookback_days` |
-| "CVaR fell back to parity" | Not enough overlapping returns for optimization | Need 50+ bars per symbol; check data fetch |
-| "HMM ensemble failed — falling back to Hurst" | Data too flat or too few bars for HMM | Normal for low-vol periods; Hurst fallback works fine |
-| "Causal buffer insufficient" | Replay buffer needs ~1500 transitions | Normal at startup; causal penalties disabled until buffer fills |
-| Stream keeps reconnecting | Alpaca websocket dropped | Check API keys, network; bot auto-reconnects with exponential backoff |
-| "Failed to check active orders" | Alpaca API rate limit or network blip | Logged as warning; retries next cycle automatically |
-
----
-
-## Testing
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run specific test suites
-pytest tests/test_regime.py -v
-pytest tests/test_risk.py -v
-pytest tests/test_features.py -v
-pytest tests/test_backtest_integration.py -v
-```
+| Symptom | Cause | Resolution |
+|---|---|---|
+| "Insufficient features for stacking" | Not enough historical bars | Wait for cache to fill (~300 bars) or increase lookback |
+| "CVaR fell back to parity" | Not enough overlapping returns | Need 50+ bars per symbol |
+| "HMM ensemble failed" | Data too flat for HMM convergence | Normal; Hurst fallback handles it |
+| "Causal buffer insufficient" | Replay buffer needs ~100+ transitions | Fills automatically from live trading |
+| Stream reconnecting | Alpaca websocket dropped | Auto-reconnects; check API keys if persistent |
+| TFT features all zero | Cache needs rebuild | Cleared automatically after 7 days; delete `ppo_checkpoints/tft_cache/` to force |
 
 ---
 
