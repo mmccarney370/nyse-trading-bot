@@ -130,10 +130,21 @@ class TradeStreamHandler:
             logger.warning(f"[STREAM] Entry order {event} for {symbol} — removing group")
             tracker.remove_group(symbol)
         elif order_id in (group.trailing_stop_id, group.take_profit_id) and group.state.value == 'open':
-            logger.warning(
-                f"[STREAM] Exit order {event} for {symbol} (order={order_id}) — "
-                f"position may be UNPROTECTED. Monitor loop will re-attach exits."
-            )
+            # Clear the cancelled order ID so monitor loop can reattach
+            with tracker._lock:
+                if order_id == group.trailing_stop_id:
+                    tracker._order_id_index.pop(order_id, None)
+                    group.trailing_stop_id = ''
+                    tracker._save()
+                    logger.warning(
+                        f"[STREAM] Trailing stop {event} for {symbol} (order={order_id}) — "
+                        f"cleared from tracker. Monitor will re-attach."
+                    )
+                else:
+                    logger.warning(
+                        f"[STREAM] Exit order {event} for {symbol} (order={order_id}) — "
+                        f"position may be UNPROTECTED. Monitor loop will re-attach exits."
+                    )
 
     async def _handle_replaced(self, order, order_id: str, symbol: str):
         """Handle order replacement (e.g. ratchet tightening trailing stop via PATCH).

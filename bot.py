@@ -431,6 +431,10 @@ class TradingBot:
                                 success = await self.broker.close_position_safely(sym)
                                 if success:
                                     logger.info(f"PORTFOLIO PPO SAFE CLOSE {sym} completed")
+                                    # Clean up tracker group so symbol can be re-entered
+                                    self.broker.tracker.mark_closed(sym)
+                                    self.broker.tracker.remove_group(sym)
+                                    logger.debug(f"[TRACKER CLEANUP] Removed tracker group for {sym} after safe close")
                                 else:
                                     logger.error(f"PORTFOLIO PPO SAFE CLOSE {sym} failed")
                                 # B-22 FIX: Clear timestamp when position is closed so min-hold resets for next signal
@@ -599,6 +603,10 @@ class TradingBot:
                             success = await self.broker.close_position_safely(symbol)
                             if success:
                                 logger.info(f"Closed position in {symbol} (flat signal) — safe close completed")
+                                # Clean up tracker group so symbol can be re-entered
+                                self.broker.tracker.mark_closed(symbol)
+                                self.broker.tracker.remove_group(symbol)
+                                logger.debug(f"[TRACKER CLEANUP] Removed tracker group for {symbol} after safe close")
                             else:
                                 logger.error(f"Safe close failed for {symbol} — position may still be open")
                             # B-22 FIX: Clear timestamp when position is closed so min-hold resets for next signal

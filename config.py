@@ -59,43 +59,43 @@ class TradingBotConfig(BaseModel):
     DIVERSIFICATION_WEIGHT: float = 0.10
     TIMEFRAMES: List[str] = Field(default_factory=lambda: ['15Min', '1H'])
     # ==================== Risk & Position Sizing ====================
-    RISK_PER_TRADE: float = 0.012
-    TRAILING_STOP_ATR: float = 4.0
-    TAKE_PROFIT_ATR: float = 18.0
-    RISK_PER_TRADE_MEAN_REVERTING: float = 0.006      # Was 0.002 — 3x more capital on mean-reversion
-    RISK_PER_TRADE_TRENDING: float = 0.025             # Slightly tighter from 0.02975
-    TRAILING_STOP_ATR_MEAN_REVERTING: float = 3.0      # Tighter from 3.5 — capture more MR profit
-    TRAILING_STOP_ATR_TRENDING: float = 2.0            # Tighter from 2.5 — lock in trend gains
-    TAKE_PROFIT_ATR_MEAN_REVERTING: float = 8.0        # Tighter from 12 — MR trades don't run far
-    TAKE_PROFIT_ATR_TRENDING: float = 25.0             # Tighter from 32.5 — realize more trend profits
-    MAX_POSITIONS: int = 6                             # Was 4 — more diversification with fractional shares
+    RISK_PER_TRADE: float = 0.015                      # Was 0.012 — deploy more per trade with improved signals
+    TRAILING_STOP_ATR: float = 4.5                     # Was 4.0 — wider stops to avoid premature exits
+    TAKE_PROFIT_ATR: float = 20.0                      # Was 18.0 — larger targets
+    RISK_PER_TRADE_MEAN_REVERTING: float = 0.008       # Was 0.006 — MR is lower risk, can allocate more
+    RISK_PER_TRADE_TRENDING: float = 0.03              # Was 0.025 — trends are the main profit driver
+    TRAILING_STOP_ATR_MEAN_REVERTING: float = 4.5      # Was 4.0 — wider to reduce stop-hunt exits
+    TRAILING_STOP_ATR_TRENDING: float = 3.5            # Was 3.0 — more room for trend pullbacks
+    TAKE_PROFIT_ATR_MEAN_REVERTING: float = 8.0        # Was 10.0 — MR trades should book profit faster
+    TAKE_PROFIT_ATR_TRENDING: float = 35.0             # Was 30.0 — let trend winners run further
+    MAX_POSITIONS: int = 5                             # Was 6 — concentrate capital in higher-conviction trades
     MAX_ATR_VOLATILITY: float = 0.06
-    KELLY_FRACTION: float = 0.50                       # Was 0.38 — more aggressive sizing
+    KELLY_FRACTION: float = 0.55                       # Was 0.50 — slightly more aggressive
     COMMISSION_PER_SHARE: float = 0.0005
     SLIPPAGE: float = 0.0001
     ASSUMED_SPREAD: float = 0.0
-    LIMIT_PRICE_OFFSET: float = 0.004                  # Tighter from 0.005 — dynamic adaptation handles rest
-    DAILY_LOSS_THRESHOLD: float = -0.25                # Tighter from -0.3 — cut losses sooner
+    LIMIT_PRICE_OFFSET: float = 0.003                  # Was 0.004 — tighter limit orders for better fills
+    DAILY_LOSS_THRESHOLD: float = -0.20                # Was -0.25 — cut losses sooner to preserve capital
     API_FAILURE_THRESHOLD: int = 5000
     MIN_LIQUIDITY: int = 100000
-    MAX_SECTOR_CONCENTRATION: float = 0.30             # Was 0.4 — more diversified
-    MAX_TOTAL_RISK_PCT: float = 0.15                   # Was 0.12 — allow more total risk with better signals
-    MAX_POSITION_VALUE_FRACTION: float = 0.25          # Was 0.20 — bigger conviction bets
-    RISK_BUDGET_MULTIPLIER: float = 2.0                # Was 1.8 — more capital deployed
+    MAX_SECTOR_CONCENTRATION: float = 0.30
+    MAX_TOTAL_RISK_PCT: float = 0.18                   # Was 0.15 — allow more total risk with better signals
+    MAX_POSITION_VALUE_FRACTION: float = 0.30          # Was 0.25 — bigger conviction bets
+    RISK_BUDGET_MULTIPLIER: float = 2.2                # Was 2.0 — more capital deployed
     # ==================== Signal Generation ====================
-    MIN_CONFIDENCE: float = 0.78                       # Signals are much better with fixed stacking — take more trades
-    PORTFOLIO_SENTIMENT_WEIGHT: float = 0.35           # Was 0.40 — slightly less sentiment dependency
-    SENTIMENT_WEIGHT: float = 0.25                     # Was 0.20 — sentiment more integrated
+    MIN_CONFIDENCE: float = 0.72                       # Was 0.78 — take more trades with improved signal pipeline
+    PORTFOLIO_SENTIMENT_WEIGHT: float = 0.25           # Was 0.35 — sentiment is noisy, reduce influence
+    SENTIMENT_WEIGHT: float = 0.18                     # Was 0.25 — let PPO/stacking dominate more
     USE_LLM_DEBATE: bool = True
     LLM_DEBATE_WEIGHT: float = 0.6
-    MIN_VOLATILITY: float = 0.006                      # Was 0.008 — trade in calmer conditions too
-    MIN_HOLD_BARS: int = 6                             # Was 8
-    MIN_HOLD_BARS_TRENDING: int = 6                    # Was 8 — exit faster if signal flips
-    MIN_HOLD_BARS_MEAN_REVERTING: int = 3              # Was 4 — MR trades should be quick
-    EMA_ALPHA: float = 0.008                           # Was 0.005 — faster signal adaptation
-    CONVICTION_THRESHOLD: float = 0.28                 # NEW — was hardcoded 0.35 in risk.py
-    DEAD_ZONE_LOW: float = 0.48                        # NEW — was hardcoded 0.50 in signals.py
-    DEAD_ZONE_HIGH: float = 0.64                       # NEW — was hardcoded 0.68 in signals.py
+    MIN_VOLATILITY: float = 0.005                      # Was 0.006 — trade in calmer conditions
+    MIN_HOLD_BARS: int = 6                             # Was 8 — allow faster exits when signal flips
+    MIN_HOLD_BARS_TRENDING: int = 8                    # Was 10 — still give trends time but not too long
+    MIN_HOLD_BARS_MEAN_REVERTING: int = 3              # Was 4 — MR trades are quick by nature
+    EMA_ALPHA: float = 0.01                            # Was 0.008 — faster signal adaptation
+    CONVICTION_THRESHOLD: float = 0.25                 # Was 0.28 — lower bar to enter with better signals
+    DEAD_ZONE_LOW: float = 0.46                        # Was 0.48 — wider signal acceptance zone
+    DEAD_ZONE_HIGH: float = 0.62                       # Was 0.64 — wider signal acceptance zone
     # ==================== Regime Detection ====================
     REGIME_METHOD: str = 'ensemble_hmm'
     HMM_N_COMPONENTS: int = 3
@@ -124,14 +124,14 @@ class TradingBotConfig(BaseModel):
     GTRXL_EVAL_CHUNK_SIZE: int = 64                     # Chunk size for batched evaluate_actions (~64x speedup)
     PPO_LSTM_HIDDEN_SIZE: int = 512
     PPO_N_LSTM_LAYERS: int = 4
-    PPO_LEARNING_RATE: float = 8e-5                    # Slightly lower for GTrXL stability
-    PPO_LEARNING_RATE_MIN: float = 5e-6                # Higher floor — don't decay to near-zero
-    PPO_ONLINE_LEARNING_RATE: float = 3e-5             # Conservative online updates to preserve learned policy
-    PPO_ENTROPY_COEFF: float = 0.03                    # Higher for fresh start exploration, Gemini can lower later
-    PPO_GAMMA: float = 0.97                            # Longer horizon — GTrXL can handle temporal credit assignment
-    PPO_GAE_LAMBDA: float = 0.93                       # Good balance of bias/variance
-    PPO_CLIP_RANGE: float = 0.18                       # Wider for fresh training — allows larger policy updates
-    PPO_OVERRIDE_CONF: float = 0.90                    # Let PPO override more with better signals
+    PPO_LEARNING_RATE: float = 8e-5
+    PPO_LEARNING_RATE_MIN: float = 5e-6
+    PPO_ONLINE_LEARNING_RATE: float = 3e-5
+    PPO_ENTROPY_COEFF: float = 0.02                    # Was 0.03 — less exploration, more exploitation of learned policy
+    PPO_GAMMA: float = 0.97
+    PPO_GAE_LAMBDA: float = 0.93
+    PPO_CLIP_RANGE: float = 0.15                       # Was 0.18 — tighter updates for stable policy
+    PPO_OVERRIDE_CONF: float = 0.85                    # Was 0.90 — slightly more conservative PPO override
     vf_coef: float = 1.0                               # Critic needs equal weight with GTrXL architecture
     RISK_PENALTY_COEF: float = 0.10
     VOL_PENALTY_COEF: float = 0.02                     # Moderate vol penalty — discourages erratic sizing
@@ -148,7 +148,7 @@ class TradingBotConfig(BaseModel):
     # ==================== PORTFOLIO-LEVEL PPO ====================
     PORTFOLIO_PPO: bool = True
     MAX_LEVERAGE: float = 2.0                          # Was 2.15 — slightly more conservative
-    PORTFOLIO_TIMESTEPS: int = 1_500_000               # More portfolio training — GTrXL converges slower but better
+    PORTFOLIO_TIMESTEPS: int = 500_000                  # Reduced for faster startup — nightly online updates continue learning
     PORTFOLIO_ONLINE_TIMESTEPS: int = 75_000           # Was 100k — faster online updates
     ONLINE_PPO_UPDATE_HOURS: int = 4                   # Was 6 — more frequent adaptation
     LIGHTGBM_PARAMS: Dict[str, Any] = Field(
@@ -179,14 +179,14 @@ class TradingBotConfig(BaseModel):
     PERSISTENCE_BONUS_SCALE: float = 0.15              # Low — avoid reward noise from persistence signal
     CURRENT_REGIME: str = 'mean_reverting'
     # ==================== Operational & Misc ====================
-    TRADING_INTERVAL: int = 45                         # Was 60 — faster trading cycles
-    MONITOR_INTERVAL: int = 45                         # Was 60 — faster monitor heartbeat
+    TRADING_INTERVAL: int = 45                         # Was 60 — faster reaction to market opportunities
+    MONITOR_INTERVAL: int = 20                         # Was 30 — faster TP/SL checks for tighter execution
     LOOKBACK: int = 1200
     CACHE_TTL_DAYS: int = 30
     VIX_THRESHOLD: int = 28                            # Was 30 — slightly more cautious in high-VIX
     REQUEST_INTERVAL: float = 1.5                      # Was 2.0 — faster API polling
     DYNAMIC_THRESHOLD_UPDATE_DAYS: int = 5             # Was 7 — more responsive threshold adaptation
-    MAX_ORDER_NOTIONAL_PCT: float = 0.80               # Was 0.75 — slightly more capital per order
+    MAX_ORDER_NOTIONAL_PCT: float = 0.85               # Was 0.80 — deploy more capital per order
     LGB_NUM_ITERATIONS: int = 250                      # NEW — was hardcoded 200 in stacking_ensemble.py
     # ==================== Debugging & Features ====================
     USE_LOCAL_TICKDB: bool = True
@@ -195,6 +195,7 @@ class TradingBotConfig(BaseModel):
     BACKTEST_DEBUG: bool = True
     LOG_LEVEL: str = 'INFO'
     RUN_BACKTEST_ON_STARTUP: bool = False
+    FORCE_PPO_RETRAIN: bool = False                    # Set True to force full retrain (PPO already trained with new params)
     DEBUG_SIGNAL_BLEND: bool = True
     # ==================== Local LLM Settings ====================
     USE_LOCAL_LLM: bool = True
@@ -219,14 +220,18 @@ class TradingBotConfig(BaseModel):
     AGENT_REWARD_SHARE: float = 0.7
     # ==================== Trailing Stop Ratcheting ====================
     # Regime-adaptive frequency and sensitivity (used in alpaca.py monitor_positions)
-    RATCHET_TRENDING_INTERVAL_SEC: int = 120           # Was 180 — faster ratchet in trends
-    RATCHET_MEAN_REVERTING_INTERVAL_SEC: int = 360     # Was 540 — faster in MR too
-    RATCHET_TRENDING_MIN_ATR_MOVE: float = 0.3         # Was 0.4 — more aggressive
-    RATCHET_MEAN_REVERTING_MIN_ATR_MOVE: float = 0.6   # Was 0.8 — tighter
-    RATCHET_REGIME_FACTOR_TRENDING: float = 0.45        # Was 0.525 — tighter trail in trends
-    RATCHET_REGIME_FACTOR_MEAN_REVERTING: float = 1.15 # Was 1.35 — tighter in MR
-    RATCHET_PROFIT_PROTECTION_SLOPE: float = 1.5       # Was 1.25 — more aggressive tightening on gains
-    RATCHET_PROFIT_PROTECTION_MIN: float = 0.30         # Was 0.35 — lower floor = tighter on big gains
+    RATCHET_TRENDING_INTERVAL_SEC: int = 240           # Was 300 — slightly faster ratcheting for profit protection
+    RATCHET_MEAN_REVERTING_INTERVAL_SEC: int = 480     # Was 600 — 8 min between MR ratchets
+    RATCHET_TRENDING_MIN_ATR_MOVE: float = 0.4         # Was 0.5 — ratchet on smaller moves to lock in more profit
+    RATCHET_MEAN_REVERTING_MIN_ATR_MOVE: float = 0.6   # Was 0.8 — tighter for MR too
+    RATCHET_REGIME_FACTOR_TRENDING: float = 0.65       # Was 0.70 — slightly tighter trail in trends
+    RATCHET_REGIME_FACTOR_MEAN_REVERTING: float = 1.20 # Was 1.35 — tighter MR trail for quicker profit capture
+    RATCHET_PROFIT_PROTECTION_SLOPE: float = 0.8       # Was 1.0 — slower tightening lets trends breathe
+    RATCHET_PROFIT_PROTECTION_MIN: float = 0.35        # Was 0.40 — tighter floor locks in more profit
+    RATCHET_TIER1_PCT: float = 0.008                   # Was 0.01 — start ratcheting earlier (0.8% profit)
+    RATCHET_TIER2_PCT: float = 0.025                   # Was 0.03 — transition to aggressive ratchet sooner
+    RATCHET_TIER2_FLOOR_PCT: float = 0.8               # Was 1.0 — tighter floor locks in more
+    RATCHET_TIER3_FLOOR_PCT: float = 0.4               # Was 0.5 — tighter aggressive floor
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty

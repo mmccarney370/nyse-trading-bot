@@ -198,7 +198,26 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
             add_encoder_length=True,
             allow_missing_timesteps=True,
         )
+        # FIX: Strip feature_names_in_ from internal scalers to prevent sklearn
+        # "X does not have valid feature names" warnings. Root cause: pytorch-forecasting
+        # fits StandardScalers on DataFrames (with column names) but transforms numpy arrays.
+        def _strip_scaler_names(dataset):
+            scalers = getattr(dataset, 'scalers', None)
+            if scalers and isinstance(scalers, dict):
+                for scaler in scalers.values():
+                    if hasattr(scaler, 'feature_names_in_'):
+                        delattr(scaler, 'feature_names_in_')
+            tn = getattr(dataset, 'target_normalizer', None)
+            if tn is not None:
+                if hasattr(tn, 'feature_names_in_'):
+                    delattr(tn, 'feature_names_in_')
+                for attr in ['scaler_', 'center_', 'fitted_']:
+                    inner = getattr(tn, attr, None)
+                    if inner is not None and hasattr(inner, 'feature_names_in_'):
+                        delattr(inner, 'feature_names_in_')
+        _strip_scaler_names(training)
         full_dataset = TimeSeriesDataSet.from_dataset(training, df, predict=True, stop_randomization=True)
+        _strip_scaler_names(full_dataset)
         full_dataloader = full_dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
         tft = TemporalFusionTransformer.from_dataset(
             training,
@@ -214,9 +233,10 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
         )
         trainer = pl.Trainer(
             max_epochs=12,
-            accelerator="cpu",
+            accelerator="auto",
             devices=1,
             enable_progress_bar=False,
+            enable_model_summary=False,
             logger=False,
             precision="32-true",
             num_sanity_val_steps=0,

@@ -611,11 +611,12 @@ class SignalGenerator:
             target_weights = {sym: float(weight) for sym, weight in zip(symbols, action)}
             sentiment_blend_weight = self.config.get('PORTFOLIO_SENTIMENT_WEIGHT', 0.3)
             if sentiment_blend_weight > 0:
-                for sym in symbols:
+                # Parallelize sentiment calls — cuts cycle time from ~4 min to ~25s
+                async def _get_sentiment(sym):
                     ts = timestamp if timestamp is not None else data_dict[sym].index[-1]
-                    sentiment = await self.get_sentiment_score(sym, ts, live_mode=True)
-                    # ISSUE P9 / BUG-17 FIX: symmetric scaling for sentiment in [-1, 1] range
-                    # +1 → boost (1 + weight), -1 → suppress (1 - weight), 0 → neutral (1.0)
+                    return sym, await self.get_sentiment_score(sym, ts, live_mode=True)
+                sentiment_results = await asyncio.gather(*[_get_sentiment(sym) for sym in symbols])
+                for sym, sentiment in sentiment_results:
                     sentiment_factor = 1.0 + sentiment_blend_weight * sentiment
                     old_weight = target_weights[sym]
                     target_weights[sym] *= sentiment_factor
@@ -704,15 +705,10 @@ class SignalGenerator:
                 logger.info(f"Portfolio causal matrix refreshed with {full_matrix.shape[0]} total rows and {full_matrix.shape[1]} features + symbol_id")
             else:
                 self.portfolio_causal_manager = None
-        # ==================== NEW: RESTORE BUFFER AFTER REBUILD ====================
+        # NOTE: load_buffer() already called in CausalSignalManager.__init__ — no duplicate load needed
         if hasattr(self, 'portfolio_causal_manager') and self.portfolio_causal_manager is not None:
-            try:
-                self.portfolio_causal_manager.load_buffer() # ← FIXED: use correct method name
-                loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
-                logger.info(f"[BUFFER RESTORE] Loaded {loaded_count} samples after nightly refresh")
-            except Exception as e:
-                logger.error(f"[BUFFER RESTORE FAILED] {e}")
-        # ==================== END RESTORE ====================
+            loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
+            logger.info(f"[BUFFER RESTORE] Buffer has {loaded_count} samples after nightly refresh (loaded in __init__)")
         logger.info("✅ All causal managers refreshed successfully")
 
     # ==================== NEW: STARTUP-SAFE REBUILD (no cache deletion) ====================
@@ -767,20 +763,15 @@ class SignalGenerator:
                 logger.debug("[PORTFOLIO CAUSAL] No data or features — manager set to None")
         else:
             logger.debug("[PORTFOLIO CAUSAL] No portfolio_ppo_model loaded yet — manager remains None")
-        # ==================== LOAD BUFFER ON STARTUP ====================
+        # NOTE: load_buffer() already called in CausalSignalManager.__init__ — no duplicate load needed
         if hasattr(self, 'portfolio_causal_manager') and self.portfolio_causal_manager is not None:
-            try:
-                self.portfolio_causal_manager.load_buffer() # ← FIXED: use correct method name
-                loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
-                if loaded_count > 0:
-                    logger.info(f"[BUFFER RESTORE ON STARTUP] Successfully loaded {loaded_count} samples")
-                else:
-                    logger.info("[BUFFER RESTORE ON STARTUP] Portfolio buffer file exists but was empty — starting fresh")
-            except Exception as e:
-                logger.warning(f"[BUFFER RESTORE ON STARTUP] Failed to load: {e} — starting with empty buffer this run")
+            loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
+            if loaded_count > 0:
+                logger.info(f"[BUFFER RESTORE ON STARTUP] Buffer has {loaded_count} samples (loaded in __init__)")
+            else:
+                logger.info("[BUFFER RESTORE ON STARTUP] Portfolio buffer empty — starting fresh")
         else:
-            logger.debug("[BUFFER RESTORE ON STARTUP] No portfolio_causal_manager — skipping load (normal during early startup)")
-        # ==================== END LOAD ====================
+            logger.debug("[BUFFER RESTORE ON STARTUP] No portfolio_causal_manager — skipping (normal during early startup)")
         logger.info("✅ Causal managers rebuilt safely on startup (cache preserved — ReplayBuffer will continue growing)")
 
     # ==================== NEW: AUTO-SAVE AFTER EVERY REWARD PUSH ====================

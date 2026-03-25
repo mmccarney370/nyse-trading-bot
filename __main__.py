@@ -5,6 +5,7 @@ import sys
 import os
 os.environ["TQDM_DISABLE"] = "1"
 os.environ["DISABLE_TQDM"] = "1"
+os.environ["LIGHTNING_TIPS"] = "0"
 import asyncio
 import warnings
 import logging
@@ -32,9 +33,12 @@ warnings.filterwarnings("ignore", message="Checkpoint directory.*exists and is n
 warnings.filterwarnings("ignore",
                         message="Found `num_iterations` in params. Will use it instead of argument",
                         module="lightgbm")
-# 4. Set Lightning root logger to ERROR
+# 4. Set Lightning root logger to ERROR (suppresses GPU/TPU status, model summary noise)
 logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
 logging.getLogger("lightning.fabric").setLevel(logging.ERROR)
+logging.getLogger("lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.rank_zero").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.accelerators.cuda").setLevel(logging.ERROR)
 # 5. Quiet other noisy libs
 logging.getLogger("torch").setLevel(logging.WARNING)
 logging.getLogger("matplotlib").setLevel(logging.WARNING)

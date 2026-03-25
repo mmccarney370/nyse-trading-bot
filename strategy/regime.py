@@ -104,7 +104,6 @@ def detect_regime(
                         random_state=seed,
                         min_covar=dynamic_min_covar,
                         tol=1e-4,
-                        n_init=20  # ← increased: more restarts per seed
                     )
                     model.fit(observations)
                     hidden_states = model.predict(observations)
@@ -114,7 +113,7 @@ def detect_regime(
                     if self_prob > 0.80:
                         trending_votes += 1
                 except Exception as fit_e:
-                    logger.debug(f"HMM fit failed for seed {seed} on {symbol}: {fit_e} — skipping this fit")
+                    logger.warning(f"HMM fit failed for seed {seed} on {symbol}: {type(fit_e).__name__}: {fit_e}")
                     continue  # skip bad fit — ensemble continues
 
             if not self_probs:

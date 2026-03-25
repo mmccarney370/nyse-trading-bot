@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Tuple
 import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 from optuna.samplers import TPESampler
 from concurrent.futures import ThreadPoolExecutor
 from strategy.regime import detect_regime # Consolidated single source of truth
@@ -385,7 +386,7 @@ class Trainer:
             return
         # NEW: Check for existing saved portfolio model — load and skip full training if found
         existing_model, existing_norm = load_ppo_model(self, "portfolio")
-        if existing_model is not None:
+        if existing_model is not None and not self.config.get('FORCE_PPO_RETRAIN', False):
             logger.info("Existing portfolio PPO model found — skipping full training, ready for inference/online updates")
             self.portfolio_ppo_model = existing_model
             self.portfolio_vec_norm = existing_norm

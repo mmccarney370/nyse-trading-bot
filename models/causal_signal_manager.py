@@ -27,6 +27,8 @@ from collections import deque
 from models.features import generate_features
 
 logger = logging.getLogger(__name__)
+# Reduce pgmpy verbosity — it dumps full datatype inference for all features on every GES call
+logging.getLogger('pgmpy').setLevel(logging.WARNING)
 
 class ReplayBuffer:
     """Single source of truth: Replay buffer for causal counterfactual estimation using real historical rewards.
@@ -123,6 +125,10 @@ class CausalSignalManager:
         Builds only if buffer has ≥100 real transitions and graph is None."""
         if self.causal_graph is not None:
             return  # already built
+        # Cooldown after failed build attempts (5 minutes)
+        last_fail = getattr(self, '_last_build_fail', 0)
+        if time.time() - last_fail < 300:
+            return  # too soon after last failure
         if len(self.replay_buffer.buffer) < 100:
             logger.debug(f"[CAUSAL LAZY] {self.symbol} — buffer only {len(self.replay_buffer.buffer)} samples — "
                          f"deferring graph build until ≥100 real transitions")
@@ -192,8 +198,11 @@ class CausalSignalManager:
                 # P-18 / Critical #11 FIX: Force rebuild if model version changed (post-nightly retrain)
                 if file_age_hours < 24 and cached_hash == self.model_version_hash:
                     self.causal_graph = cached['graph']
-                    self.causal_model = cached['model']
-                    self.identified_estimand = cached.get('identified_estimand') # BUG #7 PATCH: Restore from cache on hit
+                    self.causal_model = cached.get('model')
+                    self.identified_estimand = cached.get('identified_estimand')
+                    self._action_reward_corr = cached.get('action_reward_corr', 0.0)
+                    self._has_action_reward_path = cached.get('has_action_reward_path', False)
+                    self._reward_parent_count = cached.get('reward_parent_count', 0)
                     logger.info(f"✅ [CAUSAL CACHE HIT] Loaded cached graph for {self.symbol} ({len(self.causal_graph.edges)} edges, age={file_age_hours:.1f}h, hash match)")
                     return
                 else:
@@ -238,96 +247,103 @@ class CausalSignalManager:
             for required_node in ['action', 'reward']:
                 if required_node not in self.causal_graph.nodes:
                     self.causal_graph.add_node(required_node)
-            # === BUILD DoWhy CausalModel FIRST (now with correct action/reward columns) ===
-            logger.info(f"[CAUSAL DOWHY] Building DoWhy CausalModel with {len(self.causal_graph.edges)} edges")
-            # DoWhy expects a GML string for the graph parameter, not a networkx DiGraph
-            graph_gml = ''.join(nx.generate_gml(self.causal_graph))
-            self.causal_model = CausalModel(
-                data=data,
-                treatment='action',
-                outcome='reward',
-                graph=graph_gml
-            )
-            # P-20 FIX: Explicitly identify the estimand (missing step causing AttributeError)
-            identified_estimand = self.causal_model.identify_effect(proceed_when_unidentifiable=True)
-            self.identified_estimand = identified_estimand # BUG #6 PATCH: Store on self so predict() and compute_penalty_factor() can access it
-            logger.info(f"[CAUSAL IDENTIFY] Estimand identified successfully")
-            logger.info(f"✅ [CAUSAL DOWHY SUCCESS] DoWhy CausalModel ready with {len(self.causal_graph.edges)} validated edges")
-            # P-15 / Critical #7 FIX: Compute global ATE once before loop (identical for every edge — no need to recompute)
-            logger.info("[CAUSAL REFUTATION] Computing global ATE once (shared across all edges)")
-            estimate = self.causal_model.estimate_effect(
-                identified_estimand, # P-20 FIX: Use the identified estimand
-                method_name="backdoor.linear_regression",
-                target_units="ate"
-            )
-            # === PROPER STATISTICAL REFINEMENT (DoWhy refutation) — now safely after model creation ===
-            logger.info(f"[CAUSAL REFUTATION] Running DoWhy refutation tests on {len(self.causal_graph.edges)} edges...")
-            refined_edges = []
-            for u, v in list(self.causal_graph.edges):
-                try:
-                    # P-15 / Critical #7 FIX: Reuse the single pre-computed estimate (huge speedup)
-                    refuter = self.causal_model.refute_estimate(
-                        identified_estimand, # P-20 FIX: Use the identified estimand
-                        estimate,
-                        method_name="random_common_cause",
-                        num_simulations=10
-                    )
-                    # FIX: DoWhy CausalRefutation uses 'refutation_result' not 'refutation_passed'
-                    # Check if the new effect estimate is close to the original (p-value > 0.05)
-                    passed = True
-                    if hasattr(refuter, 'refutation_result'):
-                        result = refuter.refutation_result
-                        if isinstance(result, dict) and result.get('is_statistically_significant', False):
-                            passed = False  # significant change means edge is spurious
-                        elif hasattr(result, 'p_value') and result.p_value < 0.05:
-                            passed = False
-                    elif hasattr(refuter, 'new_effect') and estimate is not None:
-                        # Fallback: compare effect magnitudes — if perturbation changes effect by >50%, reject
-                        orig_val = abs(estimate.value) if hasattr(estimate, 'value') else 0
-                        new_val = abs(refuter.new_effect) if hasattr(refuter, 'new_effect') else orig_val
-                        if orig_val > 0 and abs(new_val - orig_val) / orig_val > 0.5:
-                            passed = False
-                    if passed:
-                        refined_edges.append((u, v))
-                        logger.debug(f"Edge {u}→{v} PASSED statistical refutation")
-                    else:
-                        logger.debug(f"Edge {u}→{v} FAILED refutation")
-                except Exception:
-                    refined_edges.append((u, v)) # keep edge if test fails gracefully
-            if refined_edges:
-                self.causal_graph = nx.DiGraph(refined_edges)
-                # Rebuild CausalModel with refined graph so they stay in sync
-                refined_gml = ''.join(nx.generate_gml(self.causal_graph))
-                self.causal_model = CausalModel(
-                    data=data,
-                    treatment='action',
-                    outcome='reward',
-                    graph=refined_gml
-                )
-                # Re-identify estimand after rebuilding (old one is stale)
-                self.identified_estimand = self.causal_model.identify_effect(proceed_when_unidentifiable=True)
-                logger.info(f"✅ [CAUSAL REFINED] {len(refined_edges)} edges passed statistical refutation")
+            # === FAST PATH: Compute action→reward correlation from GES graph + replay buffer ===
+            # Skip DoWhy entirely (CausalModel + identify_effect + estimate_effect are too slow
+            # on 54-node graphs — 30-60 min each). Use GES graph structure + direct correlation instead.
+            logger.info(f"[CAUSAL GES] Computing action→reward edge strength from graph ({len(self.causal_graph.edges)} edges)")
+            # Check if action→reward path exists in GES graph
+            has_direct_edge = self.causal_graph.has_edge('action', 'reward')
+            try:
+                has_path = nx.has_path(self.causal_graph, 'action', 'reward')
+                path_length = nx.shortest_path_length(self.causal_graph, 'action', 'reward') if has_path else 0
+            except (nx.NetworkXError, nx.NodeNotFound):
+                has_path = False
+                path_length = 0
+            # Compute direct action→reward correlation from replay buffer (fast: plain numpy)
+            if 'action' in data.columns and 'reward' in data.columns:
+                corr = data['action'].corr(data['reward'])
+                self._action_reward_corr = corr if not np.isnan(corr) else 0.0
             else:
-                logger.warning("[CAUSAL REFINED] No edges passed refutation — keeping original GES graph")
+                self._action_reward_corr = 0.0
+            # Count causal parents of 'reward' in the GES graph (features that influence reward)
+            reward_parents = list(self.causal_graph.predecessors('reward')) if 'reward' in self.causal_graph.nodes else []
+            self._reward_parent_count = len(reward_parents)
+            self._has_action_reward_path = has_path
+            logger.info(f"[CAUSAL GES] action→reward: direct_edge={has_direct_edge}, path={has_path} (len={path_length}), "
+                        f"corr={self._action_reward_corr:.4f}, reward_parents={len(reward_parents)}")
+            # No DoWhy model needed for fast path — set to None so predict/compute use graph-based penalty
+            self.causal_model = None
+            self.identified_estimand = None
             build_time = time.time() - start_time
             initial_edges = len(self.causal_graph.edges)
-            logger.info(f"✅ [CAUSAL BUILD SUCCESS] GES discovered {initial_edges} edges in {build_time:.1f}s")
-            # Save to disk cache with model version hash
+            logger.info(f"✅ [CAUSAL BUILD SUCCESS] GES discovered {initial_edges} edges in {build_time:.1f}s (fast path, no DoWhy)")
+            # Save to disk cache
             try:
+                cache_data = {
+                    'graph': self.causal_graph,
+                    'model': None,
+                    'model_version_hash': self.model_version_hash,
+                    'identified_estimand': None,
+                    'action_reward_corr': self._action_reward_corr,
+                    'has_action_reward_path': self._has_action_reward_path,
+                    'reward_parent_count': self._reward_parent_count,
+                }
                 with open(self.cache_path, 'wb') as f:
-                    pickle.dump({
-                        'graph': self.causal_graph,
-                        'model': self.causal_model,
-                        'model_version_hash': self.model_version_hash, # P-18 / Critical #11 FIX: Store hash for invalidation
-                        'identified_estimand': self.identified_estimand # BUG #7 PATCH: Save so cache hit restores it
-                    }, f)
+                    pickle.dump(cache_data, f)
                 logger.debug(f"[CAUSAL CACHE SAVED] Saved graph for {self.symbol} with hash {self.model_version_hash}")
             except Exception as e:
                 logger.debug(f"Failed to save causal cache: {e}")
+            # === BACKGROUND: Spawn DoWhy deep analysis in a thread (non-blocking) ===
+            import threading
+            def _background_dowhy_build(data_copy, graph_copy, symbol, cache_path, model_hash):
+                try:
+                    logger.info(f"[DOWHY BACKGROUND] Starting deep causal analysis for {symbol}...")
+                    # Clean all non-serializable attributes for GML serialization
+                    for node in list(graph_copy.nodes):
+                        for key in list(graph_copy.nodes[node].keys()):
+                            val = graph_copy.nodes[node][key]
+                            if val is None or not isinstance(val, (int, float, str)):
+                                del graph_copy.nodes[node][key]
+                    for u, v in list(graph_copy.edges):
+                        for key in list(graph_copy.edges[u, v].keys()):
+                            val = graph_copy.edges[u, v][key]
+                            if val is None or not isinstance(val, (int, float, str)):
+                                del graph_copy.edges[u, v][key]
+                    graph_gml = ''.join(nx.generate_gml(graph_copy))
+                    cm = CausalModel(data=data_copy, treatment='action', outcome='reward', graph=graph_gml)
+                    estimand = cm.identify_effect(proceed_when_unidentifiable=True)
+                    estimate = cm.estimate_effect(estimand, method_name="backdoor.linear_regression", target_units="ate")
+                    # Swap in results (thread-safe assignment)
+                    self.causal_model = cm
+                    self.identified_estimand = estimand
+                    self._dowhy_ate = estimate.value if hasattr(estimate, 'value') else 0.0
+                    # Update cache with full DoWhy results
+                    try:
+                        with open(cache_path, 'wb') as f:
+                            pickle.dump({
+                                'graph': graph_copy, 'model': cm, 'model_version_hash': model_hash,
+                                'identified_estimand': estimand,
+                                'action_reward_corr': self._action_reward_corr,
+                                'has_action_reward_path': self._has_action_reward_path,
+                                'reward_parent_count': self._reward_parent_count,
+                            }, f)
+                    except Exception:
+                        pass
+                    logger.info(f"✅ [DOWHY BACKGROUND] Deep analysis complete for {symbol} — ATE={self._dowhy_ate:.6f}")
+                except Exception as e:
+                    logger.warning(f"[DOWHY BACKGROUND] Failed for {symbol}: {e} — graph-based penalty still active")
+            bg_thread = threading.Thread(
+                target=_background_dowhy_build,
+                args=(data.copy(), self.causal_graph.copy(), self.symbol, self.cache_path, self.model_version_hash),
+                daemon=True
+            )
+            bg_thread.start()
+            logger.info(f"[DOWHY BACKGROUND] Spawned background thread for deep causal analysis")
         except Exception as e:
             logger.error(f"[CAUSAL BUILD FAILED] Causal graph build failed for {self.symbol}: {e}", exc_info=True)
             self.causal_model = None
             self.causal_graph = None
+            self._last_build_fail = time.time()
 
     def refresh_causal_wrappers(self):
         """BUG #19 PATCH: Rebuild all causal wrappers after universe rotation or nightly retrain.
@@ -364,33 +380,7 @@ class CausalSignalManager:
             action, new_state = self.base_model.predict(obs, deterministic=deterministic)
         # B-10 PATCH: Causal penalty now guaranteed to be applied and logged in live trading
         original_action = action.copy() if hasattr(action, 'copy') else float(action)
-        # P-7 FIX: Graceful degradation — use whatever samples are available (minimum 50 for meaningful penalty)
-        try:
-            available = len(self.replay_buffer.buffer)
-            if available < 50:
-                logger.warning(f"[CAUSAL WARMUP] {self.symbol} buffer only {available} samples — penalty attenuated (needs ~1500 for full strength)")
-                penalty_factor = 1.0
-            else:
-                replay_sample_size = min(1500, available)
-                data_df = self.replay_buffer.sample(batch_size=replay_sample_size)
-                if data_df is not None:
-                    logger.debug(f"[CAUSAL] Using {len(data_df)} real transitions for ATE estimation (robust sample)")
-                    effect = self.causal_model.estimate_effect(
-                        self.identified_estimand, # BUG #6 PATCH: now stored on self (was NameError)
-                        method_name="backdoor.linear_regression",
-                        target_units="ate",
-                        data=data_df
-                    )
-                    violation = abs(effect.value)
-                    # ISSUE #3 FIX: Inverted penalty — now AMPLIFIES strong causal signals instead of suppressing
-                    penalty_factor = min(2.0, 1.0 + (violation * CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.34)))
-                    if penalty_factor > 1.0:
-                        logger.debug(f"[CAUSAL BOOST] {self.symbol} strong causal signal → amplified by {penalty_factor:.4f}")
-                else:
-                    penalty_factor = 1.0
-        except Exception:
-            logger.debug(f"[CAUSAL] Penalty computation failed — using neutral factor=1.0")
-            penalty_factor = 1.0
+        penalty_factor = self._compute_fast_penalty()
         action = action * penalty_factor
         action = np.clip(action, -1.0, 1.0)
         # B-10: Always log the penalty so we can confirm it's being applied live
@@ -402,41 +392,47 @@ class CausalSignalManager:
             return action, new_state
         return action, None
 
-    # P-3 FIX: Real public method for causal penalty (used by explain_signal_breakdown and generate_signal)
-    def compute_penalty_factor(self, obs, action) -> float:
-        """Public method for logging/debug breakdowns. Returns the penalty factor (1.0 = no penalty).
-        P-3 FIX: Replaces the missing _compute_penalty_factor calls."""
-        # C-3 FIX: Ensure graph exists before computing penalty
-        self._ensure_graph_exists()
-        if not CONFIG.get('USE_CAUSAL_RL', False) or self.causal_model is None:
+    def _compute_fast_penalty(self) -> float:
+        """Fast graph-based causal penalty using GES structure + replay buffer correlation.
+        Falls back to full DoWhy estimate if background thread has completed."""
+        if not CONFIG.get('USE_CAUSAL_RL', False) or self.causal_graph is None:
             return 1.0
         try:
-            # P-7 FIX: Graceful degradation — use whatever samples are available (minimum 50)
-            available = len(self.replay_buffer.buffer)
-            if available < 50:
-                logger.warning(f"[CAUSAL WARMUP] {self.symbol} buffer only {available} samples — penalty attenuated (needs ~1500 for full strength)")
-                return 1.0
-            replay_sample_size = min(1500, available)
-            data_df = self.replay_buffer.sample(batch_size=replay_sample_size)
-            if data_df is not None:
-                logger.debug(f"[CAUSAL PENALTY LOG] Using {len(data_df)} real transitions for debug")
-                effect = self.causal_model.estimate_effect(
-                    self.identified_estimand, # BUG #6 PATCH: now stored on self (was NameError)
-                    method_name="backdoor.linear_regression",
-                    target_units="ate",
-                    data=data_df
-                )
-                violation = abs(effect.value)
-                # ISSUE #3 FIX: Inverted penalty — now AMPLIFIES strong causal signals instead of suppressing
-                penalty_factor = min(2.0, 1.0 + (violation * CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.34)))
-                if penalty_factor > 1.0:
-                    logger.debug(f"[CAUSAL BOOST DEBUG] Strong causal signal → amplified by {penalty_factor:.4f}")
-            else:
-                penalty_factor = 1.0
+            # If DoWhy background thread completed, use the full ATE estimate
+            if self.causal_model is not None and self.identified_estimand is not None:
+                available = len(self.replay_buffer.buffer)
+                if available >= 50:
+                    data_df = self.replay_buffer.sample(batch_size=min(1500, available))
+                    if data_df is not None:
+                        effect = self.causal_model.estimate_effect(
+                            self.identified_estimand,
+                            method_name="backdoor.linear_regression",
+                            target_units="ate",
+                            data=data_df
+                        )
+                        violation = abs(effect.value)
+                        penalty = min(2.0, 1.0 + (violation * CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.40)))
+                        logger.debug(f"[CAUSAL DOWHY] {self.symbol} full ATE penalty={penalty:.4f}")
+                        return penalty
+            # Fast path: use pre-computed GES graph correlation
+            corr = getattr(self, '_action_reward_corr', 0.0)
+            has_path = getattr(self, '_has_action_reward_path', False)
+            if not has_path:
+                return 1.0  # No causal path from action to reward — neutral
+            # Scale: abs(corr) from 0→1 maps to penalty_factor 1.0→2.0
+            # Stronger correlation = stronger causal signal = more confidence boost
+            penalty = min(2.0, 1.0 + (abs(corr) * CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.40)))
+            logger.debug(f"[CAUSAL GES FAST] {self.symbol} corr={corr:.4f}, path={has_path} → factor={penalty:.4f}")
+            return penalty
         except Exception as e:
-            logger.debug(f"[CAUSAL PENALTY LOG] Failed to compute factor: {e}")
-            penalty_factor = 1.0
-        return penalty_factor
+            logger.debug(f"[CAUSAL] Penalty failed: {e} — neutral")
+            return 1.0
+
+    # P-3 FIX: Real public method for causal penalty (used by explain_signal_breakdown and generate_signal)
+    def compute_penalty_factor(self, obs, action) -> float:
+        """Public method for logging/debug breakdowns. Returns the penalty factor (1.0 = no penalty)."""
+        self._ensure_graph_exists()
+        return self._compute_fast_penalty()
 
     def warmup_from_history(self, history_entries: list):
         """Replay closed trades from live_signal_history into ReplayBuffer on startup.
