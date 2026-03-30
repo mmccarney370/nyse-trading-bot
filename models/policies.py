@@ -34,13 +34,25 @@ logger.info("Using local namedtuple fallback for LSTMStates — fully compatible
 # === Dummy Features Extractor for GTrXL (satisfies base policy without doing anything) ===
 class DummyFeaturesExtractor(BaseFeaturesExtractor):
     """
-    Minimal pass-through extractor — reports correct features_dim but returns raw observations.
-    Used only to satisfy base ActorCriticPolicy init requirements.
+    Minimal pass-through extractor for GTrXL policy.
+
+    NOTE (FIX #17): Reports features_dim=hidden_size but forward() returns raw obs
+    (which has obs_dim, potentially != hidden_size). This mismatch is masked because
+    GTrXLPolicy overrides extract_features() and never calls this forward() directly.
+    For safety, we project obs to features_dim if dimensions don't match.
     """
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int):
         super().__init__(observation_space, features_dim)
+        obs_dim = observation_space.shape[-1]
+        # FIX #17: Add projection if obs_dim != features_dim to avoid silent shape mismatch
+        if obs_dim != features_dim:
+            self._proj = nn.Linear(obs_dim, features_dim)
+        else:
+            self._proj = None
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return observations # Identity — no processing
+        if self._proj is not None:
+            return self._proj(observations)
+        return observations
 
 class AuxMlpPolicy(ActorCriticPolicy):
     """
@@ -56,13 +68,28 @@ class AuxMlpPolicy(ActorCriticPolicy):
             nn.Sigmoid()
         )
     def forward(self, obs, deterministic=False):
+        """HIGH-2 FIX: Return standard SB3 3-tuple (actions, values, log_prob).
+        Aux prediction is only needed during training — store it on self._last_aux_pred
+        for CustomPPO.train() to access, or compute separately in train()."""
         features = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
-        aux_pred = self.aux_head(latent_pi)  # volatility target prediction (teacher-forcing)
+        # Store aux prediction for training access without breaking SB3 interface
+        self._last_aux_pred = self.aux_head(latent_pi)
+        return actions, values, log_prob
+
+    def forward_with_aux(self, obs, deterministic=False):
+        """Explicit aux-returning variant for CustomPPO.train() aux loss computation."""
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        aux_pred = self.aux_head(latent_pi)
         return actions, values, log_prob, aux_pred
 
 class AuxRecurrentPolicy(RecurrentActorCriticPolicy):
@@ -240,6 +267,25 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         # Sinusoidal positional encoding (not learned — consistent across segments)
         self._build_sinusoidal_pe(hidden_size, max_len=2048)
 
+        # Parent creates lstm_actor/lstm_critic we never use.
+        # We can't delete them (RecurrentPPO._setup_model accesses them after policy init).
+        # Instead, freeze them and rebuild the optimizer to exclude their params.
+        _lstm_param_ids = set()
+        for attr_name in ('lstm_actor', 'lstm_critic'):
+            mod = getattr(self, attr_name, None)
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = False
+                    _lstm_param_ids.add(id(p))
+
+        # Rebuild optimizer with only the params we actually use (excludes frozen LSTMs)
+        active_params = [p for p in self.parameters() if p.requires_grad and id(p) not in _lstm_param_ids]
+        self.optimizer = self.optimizer_class(
+            active_params,
+            lr=lr_schedule(1),
+            **(optimizer_kwargs or {})
+        )
+
         # Aux head for volatility prediction
         self.aux_head = nn.Sequential(
             nn.Linear(hidden_size, 64),
@@ -247,6 +293,12 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
             nn.Linear(64, 1),
             nn.Sigmoid()
         )
+
+        # Inference step counter for correct positional encoding during rollouts.
+        # During training (evaluate_actions), proper pos_offset is computed per chunk.
+        # During single-step inference, this counter tracks the absolute position
+        # so PE is consistent with training (not always 0,1).
+        self._inference_step: int = 0
 
     def _build_sinusoidal_pe(self, d_model: int, max_len: int = 2048):
         """Build sinusoidal positional encoding buffer."""
@@ -290,8 +342,11 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         B, S, H = x.shape
         mem_len = layer_memories[0].shape[1] if layer_memories is not None else 0
 
-        # Add sinusoidal positional encoding at correct absolute positions
-        x = x + self.sinusoidal_pe[:, pos_offset:pos_offset + S, :H]
+        # L29 FIX: Clamp pos_offset to prevent PE buffer overflow
+        max_pe_len = self.sinusoidal_pe.shape[1]
+        clamped_start = min(pos_offset, max_pe_len - S) if S > 0 else 0
+        clamped_start = max(clamped_start, 0)
+        x = x + self.sinusoidal_pe[:, clamped_start:clamped_start + S, :H]
 
         # Causal mask (only needed when sequence length > 1)
         attn_mask = self._make_causal_mask(S, mem_len, x.device) if S > 1 else None
@@ -307,17 +362,29 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         return self.output_norm(h), new_memories
 
     def _extract_memory(self, lstm_states, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Extract summary memory vector from LSTMStates (various formats)."""
+        """Extract summary memory vector [B, H] from LSTMStates (various formats).
+        Must always return exactly 2D: [batch_size, hidden_size]."""
         if lstm_states is None:
             return torch.zeros(batch_size, self.hidden_size, device=device)
+        h = None
         if hasattr(lstm_states, 'pi'):
             h = lstm_states.pi[0]
-            if h is None:
-                return torch.zeros(batch_size, self.hidden_size, device=device)
-            return h.squeeze(0)
-        if lstm_states[0] is None or lstm_states[0].nelement() == 0:
+        elif isinstance(lstm_states, (tuple, list)) and len(lstm_states) > 0:
+            h = lstm_states[0]
+        if h is None or (hasattr(h, 'nelement') and h.nelement() == 0):
             return torch.zeros(batch_size, self.hidden_size, device=device)
-        return lstm_states[0].squeeze(0)
+        # Flatten to exactly 2D [B, H] regardless of input shape
+        while h.dim() > 2:
+            h = h.squeeze(0)
+        if h.dim() == 1:
+            h = h.unsqueeze(0)
+        # Ensure hidden dim matches expected size (take last hidden_size elements)
+        if h.shape[-1] != self.hidden_size:
+            h = h[..., :self.hidden_size]
+        # Ensure batch dim matches
+        if h.shape[0] != batch_size:
+            h = h[-batch_size:]
+        return h
 
     def _make_lstm_states(self, memory: torch.Tensor) -> LSTMStates:
         """Wrap summary memory into LSTMStates namedtuple for sb3 compatibility."""
@@ -326,13 +393,32 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         shared_tuple = (hidden_out, cell_out)
         return LSTMStates(pi=shared_tuple, vf=shared_tuple)
 
-    def _single_step_forward(self, obs: torch.Tensor, lstm_states, episode_starts: torch.Tensor) -> torch.Tensor:
+    def _single_step_forward(self, obs: torch.Tensor, lstm_states, episode_starts: torch.Tensor,
+                             increment_step: bool = True) -> torch.Tensor:
         """
         Shared single-step inference: project obs → memory-token attention → output.
         Used by forward(), get_distribution(), predict_values().
 
         The previous summary vector is prepended as a context token so the transformer
         attends to both current features and compressed history.
+
+        Uses self._inference_step for positional encoding offset so PE positions
+        increment across steps within an episode, matching training behavior.
+
+        Args:
+            increment_step: Whether to increment _inference_step after this call.
+                Only forward() should increment (once per observation). get_distribution()
+                and predict_values() are called on the SAME observation during SB3 rollout
+                collection, so they must NOT increment to avoid double-counting.
+
+        KNOWN ARCHITECTURAL MISMATCH (train vs inference):
+        Training (evaluate_actions) processes full chunks through _gtrxl_forward with
+        XL-style segment memory across chunks. Inference here uses a 2-token approach
+        (memory_token + current_obs) without true XL memory. This means the transformer
+        sees different sequence structures at train vs inference time. Fixing this would
+        require storing per-layer XL memories across inference steps, which is a
+        fundamental architecture change. The memory-token approach provides a reasonable
+        approximation by compressing history into a single summary vector.
         """
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
@@ -343,21 +429,55 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         features = self.obs_projection(obs).unsqueeze(1)  # [B, 1, H]
         memory = self._extract_memory(lstm_states, B, obs.device)
 
-        # Reset memory on episode boundaries
+        # Reset memory and step counter on episode boundaries.
+        # SB3 RecurrentPPO requires n_envs=1 for recurrent policies, so episode_starts
+        # is always shape [1]. We assert this and reset per-env for safety.
+        # CRIT-2 FIX: _inference_step is a scalar shared across envs — unsafe for n_envs>1.
+        assert B == 1, (
+            f"GTrXLPolicy._inference_step is a scalar — n_envs must be 1, got batch size {B}. "
+            "Use RecurrentPPO with n_envs=1 for correct positional encoding."
+        )
         if episode_starts is not None and episode_starts.any():
             memory = memory * (1 - episode_starts.float().unsqueeze(-1))
+            # Reset step counter for any env that starts a new episode
+            # (With n_envs=1 this is equivalent to the old .all() check, but safe for n_envs>1)
+            if episode_starts.any():
+                self._inference_step = 0
 
         # Prepend memory as context token — transformer attends to [memory, current]
-        mem_token = memory.unsqueeze(1)  # [B, 1, H]
+        # Robust dimension handling: ensure both are exactly 3D [B, 1, H]
+        if memory.dim() == 1:
+            memory = memory.unsqueeze(0)  # [H] → [1, H]
+        if memory.dim() == 2:
+            mem_token = memory.unsqueeze(1)  # [B, H] → [B, 1, H]
+        elif memory.dim() == 3:
+            mem_token = memory  # already [B, 1, H]
+        else:
+            # 4D+ from stacked states — collapse to [B, H] then unsqueeze
+            mem_token = memory.reshape(memory.shape[0], -1)[:, :self.hidden_size].unsqueeze(1)
+        if features.dim() == 2:
+            features = features.unsqueeze(1)  # [B, H] → [B, 1, H]
         combined = torch.cat([mem_token, features], dim=1)  # [B, 2, H]
 
-        # Add positional encoding (positions 0 and 1)
-        combined = combined + self.sinusoidal_pe[:, :2, :self.hidden_size]
+        # Add positional encoding ONLY to the observation token (index 1), NOT the memory token.
+        # In training (_gtrxl_forward), PE is added only to current segment tokens, not memory.
+        # Applying PE to the memory token here would create a train/inference inconsistency.
+        max_pe = self.sinusoidal_pe.shape[1] - 1
+        pos = self._inference_step % max_pe if max_pe > 0 else 0
+        pe_for_obs = self.sinusoidal_pe[:, pos:pos + 1, :self.hidden_size]  # [1, 1, H]
+        combined[:, 1:2, :] = combined[:, 1:2, :] + pe_for_obs  # Only observation token gets PE
 
-        # Forward through GTrXL layers (no XL memory needed for single-step)
+        # Apply causal mask (matches training) — token 0 attends to [0], token 1 attends to [0,1]
+        causal_mask = self._make_causal_mask(2, 0, combined.device)
         for layer in self.gtrxl_layers:
-            combined = layer(combined)
+            combined = layer(combined, attn_mask=causal_mask)
         combined = self.output_norm(combined)
+
+        # HIGH-1 FIX: Only increment step counter when caller requests it.
+        # During SB3 rollout, get_distribution() and predict_values() are both called
+        # on the same observation — only forward() should increment to avoid double-counting.
+        if increment_step:
+            self._inference_step += 1
 
         # Return last token (current step output)
         return combined[:, -1, :]  # [B, H]
@@ -379,8 +499,10 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
     def get_distribution(self, obs: torch.Tensor,
                          lstm_states: Union[LSTMStates, Tuple[torch.Tensor, torch.Tensor]],
                          episode_starts: torch.Tensor) -> Tuple[Distribution, Tuple[torch.Tensor, torch.Tensor]]:
-        """Single-step inference for backtest/live trading."""
-        output = self._single_step_forward(obs, lstm_states, episode_starts)
+        """Single-step inference for backtest/live trading.
+        HIGH-1 FIX: increment_step=False — SB3 calls get_distribution() and predict_values()
+        on the same observation during rollout collection. Only forward() increments."""
+        output = self._single_step_forward(obs, lstm_states, episode_starts, increment_step=False)
         latent_pi, _ = self.mlp_extractor(output)
         distribution = self._get_action_dist_from_latent(latent_pi)
         hidden_out = output.unsqueeze(0)
@@ -390,8 +512,9 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
     def predict_values(self, obs: torch.Tensor,
                        lstm_states: Tuple[torch.Tensor, torch.Tensor],
                        episode_starts: torch.Tensor) -> torch.Tensor:
-        """Value prediction for GAE computation."""
-        output = self._single_step_forward(obs, lstm_states, episode_starts)
+        """Value prediction for GAE computation.
+        HIGH-1 FIX: increment_step=False — same observation as get_distribution()."""
+        output = self._single_step_forward(obs, lstm_states, episode_starts, increment_step=False)
         _, latent_vf = self.mlp_extractor(output)
         return self.value_net(latent_vf)
 
@@ -466,86 +589,154 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
                 all_entropies.append(dist.entropy())
 
         if not all_values:
+            # HIGH-3 FIX: Return empty tensors for all three — SB3 expects shape [N]
+            # not a scalar 0.0 for entropy. Empty [0] tensors are consistent.
             empty = torch.tensor([], device=device)
-            return empty, empty, torch.tensor(0.0, device=device)
+            return empty, empty, empty
 
         return torch.cat(all_values), torch.cat(all_log_probs), torch.cat(all_entropies)
 
 class CustomRecurrentPPO(RecurrentPPO):
+    """Aux training uses a SEPARATE optimizer for aux_head parameters only,
+    so PPO's optimizer momentum/variance estimates are never corrupted."""
+
+    def _setup_model(self) -> None:
+        super()._setup_model()
+        # Create a separate optimizer for aux head only (prevents PPO gradient corruption)
+        if CONFIG.get('PPO_AUX_TASK', True) and hasattr(self.policy, 'aux_head'):
+            aux_lr = CONFIG.get('PPO_AUX_LEARNING_RATE', 1e-4)
+            self._aux_optimizer = torch.optim.Adam(self.policy.aux_head.parameters(), lr=aux_lr)
+            logger.info(f"Aux optimizer created for aux_head (lr={aux_lr})")
+
+    def set_parameters(self, load_path_or_dict, exact_match=True, device="auto"):
+        """Override to handle optimizer state mismatch from checkpoints saved before
+        LSTM params were excluded from the optimizer. On mismatch, skip optimizer
+        state and log a warning — policy weights are still loaded correctly."""
+        if isinstance(load_path_or_dict, dict):
+            params = load_path_or_dict
+        else:
+            from stable_baselines3.common.save_util import load_from_zip_file
+            _, params, _ = load_from_zip_file(load_path_or_dict, device=device, load_data=False)
+
+        # Always substitute fresh optimizer state — saved checkpoints may have different
+        # param counts (e.g., old code deleted LSTM before saving, new code keeps them frozen).
+        # Policy weights are architecture-compatible; only the optimizer state differs.
+        opt_key = 'policy.optimizer'
+        if opt_key in params and hasattr(self.policy, 'optimizer'):
+            params[opt_key] = self.policy.optimizer.state_dict()
+            logger.info("Substituted fresh optimizer state for checkpoint load (policy weights preserved)")
+
+        super().set_parameters(params, exact_match=exact_match, device=device)
+
     def train(self) -> None:
         super().train()
         if not CONFIG.get('PPO_AUX_TASK', True):
             return
         aux_weight = CONFIG.get('PPO_AUX_LOSS_WEIGHT', 0.3)
-        rollout_buffer = self.rollout_buffer
-        if len(getattr(rollout_buffer, 'infos', [])) == 0:
+        targets_list = getattr(self, '_aux_vol_targets', [])
+        if not targets_list:
             return
+        aux_optimizer = getattr(self, '_aux_optimizer', None)
+        if aux_optimizer is None:
+            return
+        rollout_buffer = self.rollout_buffer
         device = self.device
-        targets = []
+        n_targets = min(len(targets_list), rollout_buffer.buffer_size)
+        if n_targets == 0:
+            return
         obs_list = []
         episode_starts_list = []
-        lstm_states_list = []
-        for i in range(rollout_buffer.buffer_size):
-            info_dict = getattr(rollout_buffer, 'infos', [{}])[i] if hasattr(rollout_buffer, 'infos') else {}
-            if 'volatility_target' not in info_dict:
-                continue
-            target = info_dict['volatility_target']
-            targets.append(target)
+        targets = []
+        for i in range(n_targets):
+            targets.append(targets_list[i])
             obs_list.append(obs_as_tensor(rollout_buffer.observations[i], device))
-            episode_starts_list.append(torch.tensor([rollout_buffer.episode_starts[i]], device=device, dtype=torch.float32))
-            # Reconstruct LSTMStates from buffer (shared)
-            lstm_obj = rollout_buffer.lstm_states[i]
-            hidden = torch.from_numpy(lstm_obj.pi[0]).to(device)
-            cell = torch.from_numpy(lstm_obj.pi[1]).to(device)
-            shared_tuple = (hidden, cell)
-            lstm_states_list.append(LSTMStates(pi=shared_tuple, vf=shared_tuple))
-        if len(obs_list) == 0:
+            episode_starts_list.append(
+                torch.tensor([rollout_buffer.episode_starts[i]], device=device, dtype=torch.float32)
+            )
+        if not obs_list:
             return
-        # Forward pass WITH gradients to allow aux loss to backpropagate
+        # Aux head predicts per-bar volatility (not sequential patterns), so fresh zero
+        # hidden states are acceptable here. The aux head is a simple MLP on the transformer
+        # output — it doesn't need accumulated recurrent state to predict volatility.
         aux_preds = []
-        for obs_t, ep_start, lstm_st in zip(obs_list, episode_starts_list, lstm_states_list):
-            _, _, _, _, aux_pred = self.policy(obs_t, lstm_st, ep_start, deterministic=False, return_aux=True)
+        zero_h = torch.zeros(1, 1, self.policy.hidden_size if hasattr(self.policy, 'hidden_size') else 256, device=device)
+        zero_lstm = LSTMStates(pi=(zero_h, zero_h.clone()), vf=(zero_h.clone(), zero_h.clone()))
+        for obs_t, ep_start in zip(obs_list, episode_starts_list):
+            # M48 FIX: Run forward with no_grad to get the hidden state cheaply,
+            # then re-apply only aux_head with gradients. Avoids wasteful backward
+            # through the full transformer backbone for the aux loss.
+            with torch.no_grad():
+                _, _, _, new_states = self.policy(obs_t, zero_lstm, ep_start, deterministic=False, return_aux=False)
+            hidden = new_states.pi[0][-1].detach()  # detached last-layer hidden
+            aux_pred = self.policy.aux_head(hidden)
             aux_preds.append(aux_pred.squeeze(-1))
         aux_preds = torch.cat(aux_preds)
         targets_t = torch.tensor(targets, dtype=torch.float32, device=device)
         aux_loss = F.mse_loss(aux_preds, targets_t)
-        self.policy.optimizer.zero_grad(set_to_none=True)
+        # Use separate aux optimizer — does NOT touch PPO's optimizer state
+        aux_optimizer.zero_grad(set_to_none=True)
         (aux_weight * aux_loss).backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        self.policy.optimizer.step()
-        logger.debug(f"Auxiliary volatility MSE loss: {aux_loss.item():.6f} (weighted {aux_weight})")
+        torch.nn.utils.clip_grad_norm_(self.policy.aux_head.parameters(), self.max_grad_norm)
+        aux_optimizer.step()
+        # CRIT-1 FIX: Zero stale gradients on non-aux params accumulated by aux backward().
+        # PPO's optimizer.zero_grad() should handle this, but be safe against ordering bugs.
+        for name, param in self.policy.named_parameters():
+            if param.grad is not None and not name.startswith('aux_head'):
+                param.grad = None
+        logger.debug(f"Auxiliary volatility MSE loss: {aux_loss.item():.6f} (weighted {aux_weight}, n={n_targets})")
+        self._aux_vol_targets = []
 
 class CustomPPO(PPO):
+    """Aux training uses a SEPARATE optimizer for aux_head parameters only,
+    so PPO's optimizer momentum/variance estimates are never corrupted."""
+
+    def _setup_model(self) -> None:
+        super()._setup_model()
+        if CONFIG.get('PPO_AUX_TASK', True) and hasattr(self.policy, 'aux_head'):
+            aux_lr = CONFIG.get('PPO_AUX_LEARNING_RATE', 1e-4)
+            self._aux_optimizer = torch.optim.Adam(self.policy.aux_head.parameters(), lr=aux_lr)
+            logger.info(f"Aux optimizer created for aux_head (lr={aux_lr})")
+
     def train(self) -> None:
         super().train()
         if not CONFIG.get('PPO_AUX_TASK', True):
             return
         aux_weight = CONFIG.get('PPO_AUX_LOSS_WEIGHT', 0.3)
+        targets_list = getattr(self, '_aux_vol_targets', [])
+        if not targets_list:
+            return
+        aux_optimizer = getattr(self, '_aux_optimizer', None)
+        if aux_optimizer is None:
+            return
         rollout_buffer = self.rollout_buffer
-        if len(getattr(rollout_buffer, 'infos', [])) == 0:
-            return
         device = self.device
-        targets = []
-        obs_list = []
-        for i in range(rollout_buffer.buffer_size):
-            info_dict = rollout_buffer.infos[i]
-            if 'volatility_target' not in info_dict:
-                continue
-            target = info_dict['volatility_target']
-            targets.append(target)
-            obs_list.append(obs_as_tensor(rollout_buffer.observations[i], device))
-        if len(obs_list) == 0:
+        n_targets = min(len(targets_list), rollout_buffer.buffer_size)
+        if n_targets == 0:
             return
-        # Forward pass WITH gradients to allow aux loss to backpropagate
+        obs_list = []
+        targets = []
+        for i in range(n_targets):
+            targets.append(targets_list[i])
+            obs_list.append(obs_as_tensor(rollout_buffer.observations[i], device))
+        if not obs_list:
+            return
         aux_preds = []
         for obs_t in obs_list:
-            _, _, _, aux_pred = self.policy.forward(obs_t, deterministic=False)
+            # HIGH-2 FIX: Use forward_with_aux() which returns 4 values
+            # (forward() now returns standard SB3 3-tuple)
+            _, _, _, aux_pred = self.policy.forward_with_aux(obs_t, deterministic=False)
             aux_preds.append(aux_pred.squeeze(-1))
         aux_preds = torch.cat(aux_preds)
         targets_t = torch.tensor(targets, dtype=torch.float32, device=device)
         aux_loss = F.mse_loss(aux_preds, targets_t)
-        self.policy.optimizer.zero_grad(set_to_none=True)
+        # Use separate aux optimizer — does NOT touch PPO's optimizer state
+        aux_optimizer.zero_grad(set_to_none=True)
         (aux_weight * aux_loss).backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-        self.policy.optimizer.step()
-        logger.debug(f"Auxiliary volatility MSE loss: {aux_loss.item():.6f} (weighted {aux_weight})")
+        torch.nn.utils.clip_grad_norm_(self.policy.aux_head.parameters(), self.max_grad_norm)
+        aux_optimizer.step()
+        # CRIT-1 FIX: Zero stale gradients on non-aux params (same fix as RecurrentCustomPPO)
+        for name, param in self.policy.named_parameters():
+            if param.grad is not None and not name.startswith('aux_head'):
+                param.grad = None
+        logger.debug(f"Auxiliary volatility MSE loss: {aux_loss.item():.6f} (weighted {aux_weight}, n={n_targets})")
+        self._aux_vol_targets = []

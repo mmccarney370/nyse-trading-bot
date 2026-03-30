@@ -3,9 +3,14 @@
 # Renamed from logging.py (Feb 28 2026) to avoid shadowing stdlib logging module
 
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
-from config import CONFIG
+# FIX #73: Wrap config import in try/except so log_setup can be imported independently
+try:
+    from config import CONFIG
+except ImportError:
+    CONFIG = {'LOG_LEVEL': 'INFO'}
 
 # Global flag to ensure setup only runs once
 _setup_done = False
@@ -14,12 +19,14 @@ def setup_logging():
     """Configure logging for the entire bot — safe to call multiple times."""
     global _setup_done
     if _setup_done:
-        return  # already configured — skip
+        return logging.getLogger(__name__)  # L12 FIX: Consistent return type
 
     log_level = getattr(logging, CONFIG.get('LOG_LEVEL', 'INFO').upper(), logging.INFO)
     
-    # Create logs directory if it doesn't exist
-    Path("logs").mkdir(exist_ok=True)
+    # FIX #42: Use absolute path based on project root instead of relative path
+    _project_root = Path(__file__).resolve().parent.parent
+    _logs_dir = _project_root / "logs"
+    _logs_dir.mkdir(exist_ok=True)
     
     # Root logger
     root_logger = logging.getLogger()
@@ -39,8 +46,11 @@ def setup_logging():
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
     
-    # File handler
-    file_handler = logging.FileHandler('nyse_bot.log', mode='a', encoding='utf-8')
+    # File handler (rotating: 10 MB max, 5 backups)
+    file_handler = logging.handlers.RotatingFileHandler(
+        str(_logs_dir / 'nyse_bot.log'), mode='a', encoding='utf-8',
+        maxBytes=10 * 1024 * 1024, backupCount=5
+    )
     file_handler.setLevel(log_level)
     file_formatter = logging.Formatter(
         '%(asctime)s | %(name)s | %(levelname)s | %(message)s',
@@ -49,13 +59,17 @@ def setup_logging():
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
     
-    # Reduce noise from some libraries
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    logging.getLogger('httpcore').setLevel(logging.WARNING)
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    # M20 FIX: Comprehensive list of noisy library loggers
+    for noisy_lib in [
+        'httpx', 'httpcore', 'urllib3', 'websockets', 'asyncio',
+        'aiohttp', 'matplotlib', 'PIL', 'filelock', 'fsspec',
+        'pytorch_lightning', 'lightning', 'lightning.pytorch',
+        'sklearn', 'pgmpy', 'numba',
+    ]:
+        logging.getLogger(noisy_lib).setLevel(logging.WARNING)
     
     logger = logging.getLogger(__name__)
-    logger.info("✅ Logging setup complete — console + file logging active")
+    logger.info("Logging setup complete — console + file logging active")  # L11 FIX: removed emoji
     
     _setup_done = True  # Mark as done
     return logger

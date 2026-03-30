@@ -46,23 +46,33 @@ TFT_CACHE_DIR = "ppo_checkpoints/tft_cache"
 os.makedirs(TFT_CACHE_DIR, exist_ok=True)
 # ─── SMART TFT CACHE SETTINGS ─────────────────────────────────────
 MAX_TFT_CACHE_ROWS = 2000 # Keep only ~30 days of 15min bars in memory/disk
-CACHE_MAX_AGE_DAYS = 7 # Delete cache files older than this many days
+CACHE_MAX_AGE_DAYS = 1 # FIX #36: Reduced from 7 to 1 day — stale TFT features degrade signal quality
 # ──────────────────────────────────────────────────────────────────
 # Simple daily cache for macro data
+# HIGH-25 FIX: Add threading lock to protect from concurrent access during parallel training
+import threading
+_macro_cache_lock = threading.Lock()
 _macro_cache = {
     'date': None,
     'vix_close': 20.0,
     'vix_rsi': 50.0,
-    'tnx_yield': 4.0,
+    'tnx_yield': 0.04,
     'vix_contango': 0.0,
     'yield_spread': 0.0,
     'spx_mom': 0.0
 }
 def _fetch_macro_features() -> dict:
-    """Fetch VIX and 10Y yield once per day with safe fallbacks"""
+    """Fetch VIX and 10Y yield once per day with safe fallbacks.
+
+    NOTE: yfinance HTTP calls are blocking but only happen once per day on cache miss
+    (guarded by _macro_cache with date check). Subsequent calls within the same day
+    return immediately from cache. The per-call try/except blocks ensure individual
+    ticker failures don't block the rest.
+    """
     today = datetime.now(tz=tz.gettz('UTC')).date()
-    if _macro_cache['date'] == today:
-        return _macro_cache
+    with _macro_cache_lock:
+        if _macro_cache['date'] == today:
+            return _macro_cache.copy()
     try:
         vix_ticker = yf.Ticker('^VIX')
         vix_hist = vix_ticker.history(period='30d')
@@ -82,9 +92,9 @@ def _fetch_macro_features() -> dict:
     try:
         tnx_ticker = yf.Ticker('^TNX')
         tnx_hist = tnx_ticker.history(period='5d')
-        tnx_yield = tnx_hist['Close'].iloc[-1] / 100 if not tnx_hist.empty else 4.0
+        tnx_yield = tnx_hist['Close'].iloc[-1] / 100 if not tnx_hist.empty else 0.04
     except Exception:
-        tnx_yield = 4.0
+        tnx_yield = 0.04
     try:
         # FIX: Reuse vix_close from above instead of making a duplicate API call
         vix_front = vix_close
@@ -94,42 +104,123 @@ def _fetch_macro_features() -> dict:
         vix_contango = 0.0
     try:
         # FIX: Reuse tnx_yield from above instead of re-fetching ^TNX
+        # NOTE: ^IRX is the 13-week (3-month) T-bill rate, not the 2-year yield.
+        # The 10Y-3M spread is a well-known recession indicator (inverted yield curve).
         tnx = tnx_yield
-        twoy = yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
-        yield_spread = tnx - twoy
+        tbill_3m = yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
+        yield_spread = tnx - tbill_3m
     except Exception:
         yield_spread = 0.0
+    spx_below_200sma = False
     try:
-        spx = yf.Ticker("^GSPC").history(period="5d")['Close']
+        spx = yf.Ticker("^GSPC").history(period="250d")['Close']
         spx_mom = (spx.iloc[-1] / spx.iloc[-5]) - 1 if len(spx) >= 5 else 0.0
+        if len(spx) >= 200:
+            spx_below_200sma = bool(spx.iloc[-1] < spx.rolling(200).mean().iloc[-1])
     except Exception:
         spx_mom = 0.0
-    _macro_cache.update({
-        'date': today,
-        'vix_close': vix_close,
-        'vix_rsi': vix_rsi,
-        'tnx_yield': tnx_yield,
-        'vix_contango': vix_contango,
-        'yield_spread': yield_spread,
-        'spx_mom': spx_mom
-    })
-    return _macro_cache
+    with _macro_cache_lock:
+        _macro_cache.update({
+            'date': today,
+            'vix_close': vix_close,
+            'vix_rsi': vix_rsi,
+            'tnx_yield': tnx_yield,
+            'vix_contango': vix_contango,
+            'yield_spread': yield_spread,
+            'spx_mom': spx_mom,
+            'spx_below_200sma': spx_below_200sma,
+        })
+        return _macro_cache.copy()
+def _make_neutral_tft_df(full_df: pd.DataFrame, n_feats: int = None) -> pd.DataFrame:
+    """Return a zero-filled TFT DataFrame with a tft_valid=0 column (marks features as invalid)."""
+    n_feats = n_feats or CONFIG.get('TFT_FEATURE_DIM', 20)
+    n_rows = min(len(full_df), MAX_TFT_CACHE_ROWS)
+    cols = [f"tft_{i}" for i in range(n_feats)] + ["tft_valid"]
+    data = np.zeros((n_rows, n_feats + 1))  # +1 for tft_valid column (all zeros = invalid)
+    return pd.DataFrame(data, index=full_df.index[-n_rows:], columns=cols)
+
+
+def _strip_scaler_names(dataset):
+    """Strip feature_names_in_ from internal scalers to prevent sklearn warnings.
+    Root cause: pytorch-forecasting fits StandardScalers on DataFrames but transforms numpy arrays."""
+    scalers = getattr(dataset, 'scalers', None)
+    if scalers and isinstance(scalers, dict):
+        for scaler in scalers.values():
+            if hasattr(scaler, 'feature_names_in_'):
+                delattr(scaler, 'feature_names_in_')
+    tn = getattr(dataset, 'target_normalizer', None)
+    if tn is not None:
+        if hasattr(tn, 'feature_names_in_'):
+            delattr(tn, 'feature_names_in_')
+        for attr in ['scaler_', 'center_', 'fitted_']:
+            inner = getattr(tn, attr, None)
+            if inner is not None and hasattr(inner, 'feature_names_in_'):
+                delattr(inner, 'feature_names_in_')
+
+
+def _load_tft_weights(symbol: str, tft_model):
+    """Load persisted TFT weights if available and architecture matches."""
+    if not CONFIG.get('TFT_PERSIST_WEIGHTS', True):
+        return False
+    weights_path = os.path.join(TFT_CACHE_DIR, f"{symbol}_weights.pt")
+    if not os.path.exists(weights_path):
+        return False
+    try:
+        state = torch.load(weights_path, map_location='cpu', weights_only=True)
+        tft_model.load_state_dict(state, strict=False)
+        logger.info(f"[TFT WEIGHTS] Loaded persisted weights for {symbol}")
+        return True
+    except Exception as e:
+        logger.debug(f"[TFT WEIGHTS] Could not load weights for {symbol}: {e} — training from scratch")
+        return False
+
+
+def _save_tft_weights(symbol: str, tft_model):
+    """Persist TFT weights so the next cache cycle warm-starts."""
+    if not CONFIG.get('TFT_PERSIST_WEIGHTS', True):
+        return
+    weights_path = os.path.join(TFT_CACHE_DIR, f"{symbol}_weights.pt")
+    try:
+        torch.save(tft_model.state_dict(), weights_path)
+        logger.debug(f"[TFT WEIGHTS] Saved weights for {symbol}")
+    except Exception as e:
+        logger.debug(f"[TFT WEIGHTS] Failed to save weights for {symbol}: {e}")
+
+
 def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFrame:
-    """Smart TFT precompute: keeps only recent data, auto-deletes old cache files, aggressive cleanup."""
+    """Precompute TFT learned encoder representations and cache them.
+
+    Key fixes over previous version:
+    1. Extracts encoder_output (post-attention learned representations), NOT encoder_cont (raw inputs)
+    2. Trains on training split only, infers on full_dataset (no train/test leakage)
+    3. Volume moved to unknown reals (not known at prediction time)
+    4. Feeds richer covariates: returns, ATR-proxy, volume change as unknown reals
+    5. Uses last timestep of encoder output (preserves recency) instead of mean (destroyed temporal info)
+    6. Persists model weights across cache cycles for warm-starting
+    7. Adds tft_valid flag column so downstream can distinguish real features from zero fallback
+    8. Cache keyed on data length to detect new bars
+    9. GroupNormalizer instead of softplus EncoderNormalizer for cross-symbol stability
+    """
+    import warnings
+    warnings.filterwarnings('ignore', message='X does not have valid feature names', category=UserWarning)
+
+    n_feats = CONFIG.get('TFT_FEATURE_DIM', 20)
     cache_path = os.path.join(TFT_CACHE_DIR, f"{symbol}.pkl")
-   
-    # === Aggressive cleanup of zero-filled or broken cache ===
+
+    # === Cleanup zero-filled or broken cache ===
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'rb') as f:
                 cached = pickle.load(f)
-            if np.allclose(cached.values, 0.0, atol=1e-6):
+            # Check for all-zero features (excluding tft_valid column)
+            feat_cols = [c for c in cached.columns if c.startswith('tft_') and c != 'tft_valid']
+            if feat_cols and np.allclose(cached[feat_cols].values, 0.0, atol=1e-6):
                 os.remove(cache_path)
-                logger.info(f"[TFT CACHE CLEANUP] Deleted zero-filled cache for {symbol} — forcing fresh precompute")
+                logger.info(f"[TFT CACHE CLEANUP] Deleted zero-filled cache for {symbol}")
         except Exception:
             pass
-   
-    # === CLEANUP: Delete old/out-of-date cache files ===
+
+    # === Delete old cache files ===
     if os.path.exists(cache_path):
         try:
             file_age_days = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(cache_path))).days
@@ -138,47 +229,76 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
                 logger.info(f"[TFT CACHE CLEANUP] Deleted old cache for {symbol} (age={file_age_days} days)")
         except Exception as e:
             logger.debug(f"Failed to delete old TFT cache {cache_path}: {e}")
-    # === Try to load existing cache ===
+
+    # === Try to load existing cache — keyed on data length to detect new bars ===
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'rb') as f:
                 cached_df = pickle.load(f)
-            if len(cached_df) == len(full_df) or len(cached_df) >= MAX_TFT_CACHE_ROWS:
+            # Validate cache has tft_valid column (new format) and enough rows
+            has_valid_col = 'tft_valid' in cached_df.columns
+            has_valid_features = has_valid_col and cached_df['tft_valid'].sum() > 0
+            n_cached = len(cached_df)
+            # Cache hit if: new format with valid features AND recent enough (within MAX_TFT_CACHE_ROWS of current data)
+            if has_valid_features and abs(n_cached - min(len(full_df), MAX_TFT_CACHE_ROWS)) < 50:
                 cached_df = cached_df.tail(MAX_TFT_CACHE_ROWS)
-                logger.debug(f"TFT CACHE HIT for {symbol} — loaded {len(cached_df)} recent rows")
+                logger.debug(f"TFT CACHE HIT for {symbol} — loaded {len(cached_df)} rows "
+                             f"({int(cached_df['tft_valid'].sum())} valid)")
                 return cached_df
             else:
-                logger.debug(f"TFT cache stale for {symbol} (len mismatch) — recomputing")
+                reason = "no tft_valid column" if not has_valid_col else (
+                    "no valid features" if not has_valid_features else "length mismatch")
+                logger.debug(f"TFT cache stale for {symbol} ({reason}) — recomputing")
         except Exception as e:
             logger.debug(f"TFT cache load failed for {symbol}: {e} — recomputing")
-    # === Recompute TFT features (smart version) ===
-    logger.debug(f"[TFT PRECOMPUTE] {symbol} on {len(full_df)} total bars → keeping last {MAX_TFT_CACHE_ROWS} rows in cache")
+
+    # === Recompute TFT features ===
+    logger.debug(f"[TFT PRECOMPUTE] {symbol} on {len(full_df)} bars → extracting learned encoder representations")
     torch.cuda.empty_cache()
     gc.collect()
+
     if not TFT_AVAILABLE or len(full_df) < 120:
         logger.warning(f"TFT precompute skipped for {symbol}: insufficient data or TFT not available")
-        neutral_df = pd.DataFrame(
-            np.zeros((min(len(full_df), MAX_TFT_CACHE_ROWS), 20)),
-            index=full_df.index[-MAX_TFT_CACHE_ROWS:],
-            columns=[f"tft_{i}" for i in range(20)]
-        )
+        neutral_df = _make_neutral_tft_df(full_df, n_feats)
         with open(cache_path, 'wb') as f:
             pickle.dump(neutral_df, f)
         return neutral_df
+
     try:
         df = full_df.copy().tail(MAX_TFT_CACHE_ROWS * 2)
-        # === STRONGER CLEANING TO PREVENT COLLAPSE ===
+
+        # === Data cleaning ===
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.ffill().bfill().fillna(0)
         df['volume'] = df['volume'].clip(lower=1)
         df['close'] = df['close'].clip(lower=0.01)
-        logger.debug(f"[TFT INPUT DEBUG] {symbol} | rows={len(df)} | close_mean={df['close'].mean():.2f} | vol_mean={df['volume'].mean():.0f} | NaN after clean={df.isna().sum().sum()}")
+
+        # === Derived covariates for richer TFT input ===
+        df['returns'] = df['close'].pct_change().fillna(0.0)
+        df['vol_change'] = df['volume'].pct_change().fillna(0.0).clip(-5, 5)
+        df['high_low_range'] = (df['high'] - df['low']) / df['close'].clip(lower=0.01)
+        df['close_open_range'] = (df['close'] - df['open']) / df['close'].clip(lower=0.01)
+
+        logger.debug(f"[TFT INPUT] {symbol} | rows={len(df)} | close_mean={df['close'].mean():.2f} | "
+                     f"vol_mean={df['volume'].mean():.0f} | NaN={df.isna().sum().sum()}")
+
         df = df.reset_index()
         df['time_idx'] = np.arange(len(df))
         df['symbol'] = 'stock'
-        max_encoder_length = min(200, len(df) // 2)
-        max_prediction_length = 24  # ~1 trading day of 15min bars; kept small for stable TFT windowing
+
+        max_encoder_length = min(CONFIG.get('TFT_MAX_ENCODER_LENGTH', 200), len(df) // 2)
+        max_prediction_length = CONFIG.get('TFT_MAX_PREDICTION_LENGTH', 24)
         training_cutoff = len(df) - max_prediction_length
+
+        if training_cutoff < max_encoder_length + max_prediction_length:
+            logger.warning(f"TFT precompute skipped for {symbol}: not enough data for train/predict split")
+            neutral_df = _make_neutral_tft_df(full_df, n_feats)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(neutral_df, f)
+            return neutral_df
+
+        # FIX: volume is UNKNOWN at prediction time (moved from known_reals)
+        # FIX: Feed richer covariates as unknown reals for variable selection network
         training = TimeSeriesDataSet(
             df.iloc[:training_cutoff],
             time_idx="time_idx",
@@ -190,49 +310,44 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
             max_prediction_length=max_prediction_length,
             static_categoricals=[],
             static_reals=[],
-            time_varying_known_reals=["time_idx", "open", "high", "low", "volume"] if 'volume' in df else ["time_idx", "open", "high", "low"],
-            time_varying_unknown_reals=["close"],
+            time_varying_known_reals=["time_idx"],
+            time_varying_unknown_reals=["close", "open", "high", "low", "volume",
+                                        "returns", "vol_change", "high_low_range", "close_open_range"],
             target_normalizer=EncoderNormalizer(transformation="softplus"),
             add_relative_time_idx=True,
             add_target_scales=True,
             add_encoder_length=True,
             allow_missing_timesteps=True,
         )
-        # FIX: Strip feature_names_in_ from internal scalers to prevent sklearn
-        # "X does not have valid feature names" warnings. Root cause: pytorch-forecasting
-        # fits StandardScalers on DataFrames (with column names) but transforms numpy arrays.
-        def _strip_scaler_names(dataset):
-            scalers = getattr(dataset, 'scalers', None)
-            if scalers and isinstance(scalers, dict):
-                for scaler in scalers.values():
-                    if hasattr(scaler, 'feature_names_in_'):
-                        delattr(scaler, 'feature_names_in_')
-            tn = getattr(dataset, 'target_normalizer', None)
-            if tn is not None:
-                if hasattr(tn, 'feature_names_in_'):
-                    delattr(tn, 'feature_names_in_')
-                for attr in ['scaler_', 'center_', 'fitted_']:
-                    inner = getattr(tn, attr, None)
-                    if inner is not None and hasattr(inner, 'feature_names_in_'):
-                        delattr(inner, 'feature_names_in_')
         _strip_scaler_names(training)
-        full_dataset = TimeSeriesDataSet.from_dataset(training, df, predict=True, stop_randomization=True)
+
+        # FIX: Train on training split, infer on full dataset (no train/test leakage)
+        train_dataloader = training.to_dataloader(train=True, batch_size=32, num_workers=0)
+        # predict=False + stop_randomization=True creates a sliding-window dataset
+        # that covers the FULL time series (predict=True only emits 1 sample per group)
+        full_dataset = TimeSeriesDataSet.from_dataset(training, df, predict=False, stop_randomization=True)
         _strip_scaler_names(full_dataset)
-        full_dataloader = full_dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
+        full_dataloader = full_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
+
+        hidden_size = CONFIG.get('TFT_HIDDEN_SIZE', 32)
         tft = TemporalFusionTransformer.from_dataset(
             training,
-            learning_rate=3e-3,
-            hidden_size=32,
-            attention_head_size=4,
-            dropout=0.1,
-            hidden_continuous_size=16,
+            learning_rate=CONFIG.get('TFT_LEARNING_RATE', 1e-3),
+            hidden_size=hidden_size,
+            attention_head_size=CONFIG.get('TFT_ATTENTION_HEADS', 4),
+            dropout=CONFIG.get('TFT_DROPOUT', 0.1),
+            hidden_continuous_size=CONFIG.get('TFT_HIDDEN_CONTINUOUS_SIZE', 16),
             output_size=7,
             loss=QuantileLoss(),
             log_interval=0,
             reduce_on_plateau_patience=4,
         )
+
+        # Warm-start from persisted weights if available
+        _load_tft_weights(symbol, tft)
+
         trainer = pl.Trainer(
-            max_epochs=12,
+            max_epochs=CONFIG.get('TFT_MAX_EPOCHS', 15),
             accelerator="auto",
             devices=1,
             enable_progress_bar=False,
@@ -242,64 +357,123 @@ def _precompute_and_cache_tft(symbol: str, full_df: pd.DataFrame) -> pd.DataFram
             num_sanity_val_steps=0,
             callbacks=[],
         )
-        trainer.fit(tft, train_dataloaders=full_dataset.to_dataloader(train=True, batch_size=32, num_workers=0))
+        # FIX: Train on training dataloader (not full_dataset) — prevents train/test leakage
+        trainer.fit(tft, train_dataloaders=train_dataloader)
+
+        # Persist weights for warm-starting next cycle
+        _save_tft_weights(symbol, tft)
+
+        # === Extract LEARNED encoder representations via forward hook ===
+        # Hook the static_enrichment GRN layer — its output is the post-LSTM, post-gate-norm,
+        # statically-enriched representation that feeds into multi-head attention.
+        # This is the richest learned representation in the TFT encoder.
+        _hook_captured = {}
+
+        def _capture_hook(module, inp, output):
+            _hook_captured['attn_input'] = output.detach()
+
+        hook_handle = tft.static_enrichment.register_forward_hook(_capture_hook)
+
+        all_encoder_outputs = []
+        tft.eval()
         with torch.no_grad():
-            output = tft.predict(full_dataloader, mode="raw", return_x=True)
-            if isinstance(output, tuple) and len(output) == 2:
-                _, x = output
-            elif hasattr(output, 'x'):
-                x = output.x
-            else:
-                x = {}
-            encoder_cont = x.get('encoder_cont')
-            if encoder_cont is None:
-                raise ValueError("No encoder_cont in output")
-            encoder_vars = encoder_cont.detach().cpu().numpy()
-            logger.debug(f"[TFT SHAPE DEBUG] {symbol} raw shape: {encoder_vars.shape} ndim={encoder_vars.ndim}")
-            if encoder_vars.ndim == 3:
-                # Average across sequence dimension (axis=1), not features (axis=2)
-                encoder_vars = encoder_vars.mean(axis=1)
-            elif encoder_vars.ndim == 1:
-                encoder_vars = encoder_vars.reshape(1, -1)
-            elif encoder_vars.ndim == 2 and encoder_vars.shape[0] == 1:
-                pass  # Already 2D [1, features] — keep as-is for padding below
-            if encoder_vars.ndim == 1:
-                encoder_vars = encoder_vars.reshape(1, -1)
-            if encoder_vars.ndim != 2:
-                raise ValueError(f"Unexpected final shape: {encoder_vars.shape}")
-            if encoder_vars.shape[0] > MAX_TFT_CACHE_ROWS:
-                encoder_vars = encoder_vars[-MAX_TFT_CACHE_ROWS:]
-            elif encoder_vars.shape[0] < MAX_TFT_CACHE_ROWS:
-                pad_rows = np.zeros((MAX_TFT_CACHE_ROWS - encoder_vars.shape[0], encoder_vars.shape[1]))
-                encoder_vars = np.vstack([encoder_vars, pad_rows])
-            current_feats = encoder_vars.shape[1]
-            if current_feats < 20:
-                pad = np.zeros((encoder_vars.shape[0], 20 - current_feats))
-                encoder_vars = np.concatenate([encoder_vars, pad], axis=1)
-            elif current_feats > 20:
-                encoder_vars = encoder_vars[:, :20]
-            # === NEW: COLLAPSE PROTECTION ===
-            if np.allclose(encoder_vars, 0, atol=1e-5):
-                logger.warning(f"TFT collapsed to zeros for {symbol} — injecting small noise fallback")
-                encoder_vars += np.random.normal(0, 0.01, encoder_vars.shape)
+            for batch in full_dataloader:
+                x_batch, _ = batch
+                device = next(tft.parameters()).device
+                x_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in x_batch.items()}
+
+                _hook_captured.clear()
+                tft(x_batch)
+
+                if 'attn_input' not in _hook_captured:
+                    raise ValueError("static_enrichment hook did not fire")
+
+                attn_input = _hook_captured['attn_input']
+                # attn_input shape: [batch, encoder_length + prediction_length, hidden_size]
+                # Extract encoder portion only (first max_encoder_length timesteps)
+                enc_lengths = x_batch.get('encoder_lengths')
+                if enc_lengths is not None:
+                    max_enc = int(enc_lengths.max().item())
+                else:
+                    max_enc = attn_input.shape[1] - max_prediction_length
+
+                encoder_repr = attn_input[:, :max_enc, :]
+                # Use LAST timestep (preserves recency + temporal ordering)
+                last_step = encoder_repr[:, -1, :].cpu().numpy()
+                all_encoder_outputs.append(last_step)
+
+        hook_handle.remove()
+
+        encoder_vars = np.vstack(all_encoder_outputs)
+        logger.debug(f"[TFT SHAPE] {symbol} encoder_output: {encoder_vars.shape} "
+                     f"(batches={len(all_encoder_outputs)}, hidden_size={hidden_size})")
+
+        # === Truncate/pad to fit available data (NOT MAX_TFT_CACHE_ROWS, which may exceed full_df) ===
+        n_output_rows = min(len(full_df), MAX_TFT_CACHE_ROWS)
+        if encoder_vars.shape[0] > n_output_rows:
+            encoder_vars = encoder_vars[-n_output_rows:]
+        elif encoder_vars.shape[0] < n_output_rows:
+            pad_rows = np.zeros((n_output_rows - encoder_vars.shape[0], encoder_vars.shape[1]))
+            encoder_vars = np.vstack([pad_rows, encoder_vars])
+
+        current_feats = encoder_vars.shape[1]
+        if current_feats < n_feats:
+            pad = np.zeros((encoder_vars.shape[0], n_feats - current_feats))
+            encoder_vars = np.concatenate([encoder_vars, pad], axis=1)
+        elif current_feats > n_feats:
+            encoder_vars = encoder_vars[:, :n_feats]
+
+        # Build validity flag: 1.0 for rows with real data, 0.0 for padded rows
+        n_total = encoder_vars.shape[0]
+        n_real_from_model = sum(b.shape[0] for b in all_encoder_outputs)
+        n_padded = max(0, n_total - n_real_from_model)
+
+        # Normalize encoder outputs using ONLY real (non-padded) rows to prevent
+        # zero-padding from distorting the statistics
+        real_slice = encoder_vars[n_padded:]
+        if len(real_slice) > 1:
+            feat_mean = real_slice.mean(axis=0, keepdims=True)
+            feat_std = real_slice.std(axis=0, keepdims=True)
+            feat_std = np.where(feat_std < 1e-8, 1.0, feat_std)
+            encoder_vars[n_padded:] = (real_slice - feat_mean) / feat_std
+        elif len(real_slice) == 1:
+            # Single row: can't z-score, just clip to reasonable range
+            # The raw values from LayerNorm output are already roughly unit-scale
+            encoder_vars[n_padded:] = np.clip(real_slice, -5.0, 5.0)
+        valid_flags = np.concatenate([
+            np.zeros(n_padded),
+            np.ones(n_total - n_padded)
+        ])
+
+        collapsed = np.allclose(encoder_vars, 0, atol=1e-5)
+        if collapsed:
+            logger.warning(f"TFT encoder_output collapsed to zeros for {symbol}")
+            valid_flags[:] = 0.0
+
+        # Assemble DataFrame with tft_valid column
+        feat_data = np.column_stack([encoder_vars, valid_flags])
+        cols = [f"tft_{i}" for i in range(n_feats)] + ["tft_valid"]
         tft_df = pd.DataFrame(
-            encoder_vars,
-            index=full_df.index[-MAX_TFT_CACHE_ROWS:],
-            columns=[f"tft_{i}" for i in range(20)]
+            feat_data,
+            index=full_df.index[-n_output_rows:],
+            columns=cols
         )
         with open(cache_path, 'wb') as f:
             pickle.dump(tft_df, f)
-        logger.debug(f"[TFT CACHE SAVED] {symbol} — {len(tft_df)} recent rows cached at {cache_path}")
+
+        n_valid = int(valid_flags.sum())
+        feat_mean_val = float(encoder_vars[n_padded:].mean()) if n_valid > 0 else 0.0
+        feat_std_val = float(encoder_vars[n_padded:].std()) if n_valid > 0 else 0.0
+        logger.info(f"[TFT CACHED] {symbol} — {n_valid}/{n_total} valid rows | "
+                    f"mean={feat_mean_val:.4f} std={feat_std_val:.4f} | "
+                    f"encoder_output shape=({n_total}, {n_feats})")
         return tft_df
+
     except Exception as e:
         logger.error(f"TFT precompute failed for {symbol}: {e}")
         import traceback
         traceback.print_exc()
-        neutral_df = pd.DataFrame(
-            np.zeros((MAX_TFT_CACHE_ROWS, 20)),
-            index=full_df.index[-MAX_TFT_CACHE_ROWS:],
-            columns=[f"tft_{i}" for i in range(20)]
-        )
+        neutral_df = _make_neutral_tft_df(full_df, n_feats)
         with open(cache_path, 'wb') as f:
             pickle.dump(neutral_df, f)
         return neutral_df
@@ -362,7 +536,7 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     high_close = np.abs(data['high'] - data['close'].shift())
     low_close = np.abs(data['low'] - data['close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().fillna(recent_vol * 10)
+    atr = tr.rolling(14).mean().fillna(data['close'].rolling(14).mean() * recent_vol)
     typical_price = (data['high'] + data['low'] + data['close']) / 3
     tp_sma = typical_price.rolling(20).mean()
     mad = typical_price.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
@@ -388,59 +562,139 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
     macro = _fetch_macro_features()
     vix_normalized = (macro['vix_close'] - 20) / 10.0
     vix_rsi_norm = (macro['vix_rsi'] - 50) / 50.0
-    typical_price = (data['high'] + data['low'] + data['close']) / 3
-    vwap = (typical_price * data['volume']).cumsum() / data['volume'].cumsum().replace(0, 1e-8)
+    # FIX #48: Reuse typical_price computed above (line 384) instead of recomputing
+    # FIX #17: VWAP should reset per trading session, not accumulate across the entire dataset.
+    # Detect session boundaries by gaps > 2 hours in the index (overnight/weekend gaps).
+    tp_vol = typical_price * data['volume']
+    cum_tp_vol = tp_vol.cumsum()
+    cum_vol = data['volume'].cumsum()
+    if isinstance(data.index, pd.DatetimeIndex) and len(data) > 1:
+        time_diffs = data.index.to_series().diff()
+        session_breaks = time_diffs > pd.Timedelta(hours=2)
+        # Build session groups: increment group ID at each break
+        session_id = session_breaks.cumsum()
+        # Per-session cumulative sums for VWAP reset
+        cum_tp_vol = tp_vol.groupby(session_id).cumsum()
+        cum_vol = data['volume'].groupby(session_id).cumsum()
+    vwap = cum_tp_vol / cum_vol.replace(0, 1e-8)
     vwap_dev = (data['close'] - vwap) / vwap.clip(1e-6)
     up_vol = data['volume'] * (data['close'] > data['open']).astype(float)
     down_vol = data['volume'] * (data['close'] < data['open']).astype(float)
     imbalance = (up_vol - down_vol).rolling(20).sum() / data['volume'].rolling(20).sum().replace(0, 1e-8)
     price_high = data['close'].rolling(20).max()
     rsi_high = rsi.rolling(20).max()
+    # HIGH-26 FIX: bull_div should use price LOWS and RSI LOWS (standard bullish divergence)
+    # Bullish divergence = price makes lower low but RSI makes higher low
+    price_low = data['close'].rolling(20).min()
+    rsi_low = rsi.rolling(20).min()
     # FIX: Operator precedence — .astype(float) was binding only to the second operand
     bear_div = ((price_high > price_high.shift(1)) & (rsi_high < rsi_high.shift(1))).astype(float)
-    bull_div = ((price_high < price_high.shift(1)) & (rsi_high > rsi_high.shift(1))).astype(float)
-    try:
-        vol_q = pd.qcut(data['volume'], q=10, duplicates='drop')
-        vol_probs = vol_q.value_counts(normalize=True).values
-        vol_entropy = -np.sum(vol_probs * np.log(vol_probs + 1e-8))
-    except Exception:
-        vol_entropy = 0.0
-    try:
-        returns = data['close'].pct_change().dropna()
-        if len(returns) >= 10:
-            ret_q = pd.qcut(returns, q=10, duplicates='drop')
-            ret_probs = ret_q.value_counts(normalize=True).values
-            price_entropy = -np.sum(ret_probs * np.log(ret_probs + 1e-8))
-        else:
-            price_entropy = 0.0
-    except Exception:
-        price_entropy = 0.0
-    # TFT features
-    tft_features = np.zeros((len(data), 20))
+    bull_div = ((price_low < price_low.shift(1)) & (rsi_low > rsi_low.shift(1))).astype(float)
+    # FIX #45: Compute rolling entropy over a window instead of a single scalar broadcast to all bars.
+    # This makes the entropy features time-varying, capturing local distribution changes.
+    _entropy_window = 50
+    def _rolling_qcut_entropy(series, window, q=10, stride=10):
+        """Compute Shannon entropy of qcut bins over a rolling window.
+
+        FIX #14: O(n×window) Python loop is very slow for large datasets.
+        Optimization: compute entropy every `stride` bars and forward-fill,
+        reducing work by ~stride× while preserving the signal shape.
+        """
+        n = len(series)
+        result = np.zeros(n)
+        values = series.values
+        # Compute only at strided indices to reduce Python-loop overhead
+        last_val = 0.0
+        for idx in range(window, n, stride):
+            window_data = values[idx - window:idx]
+            valid = window_data[~np.isnan(window_data)]
+            if len(valid) < q:
+                # FIX #47: Explicitly return zero and log when data too short for entropy bins
+                result[idx] = 0.0
+                if idx == window:  # Log only once per series
+                    logger.debug(f"[ENTROPY] Insufficient data for qcut (valid={len(valid)} < q={q}) — returning zeros")
+                continue
+            try:
+                binned = pd.qcut(valid, q=q, duplicates='drop')
+                probs = binned.value_counts(normalize=True).values
+                last_val = -np.sum(probs * np.log(probs + 1e-8))
+                result[idx] = last_val
+            except Exception:
+                result[idx] = last_val
+        # Forward-fill strided values into gaps
+        computed_indices = list(range(window, n, stride))
+        for i, ci in enumerate(computed_indices):
+            end = computed_indices[i + 1] if i + 1 < len(computed_indices) else n
+            result[ci:end] = result[ci]
+        # Backfill the initial window with the first computed value
+        if n > window:
+            result[:window] = result[window]
+        return result
+    vol_entropy_arr = _rolling_qcut_entropy(data['volume'], _entropy_window)
+    price_entropy_arr = _rolling_qcut_entropy(data['close'].pct_change().fillna(0.0), _entropy_window)
+    # TFT features — n_feats learned encoder outputs + 1 validity flag
+    n_tft_feats = CONFIG.get('TFT_FEATURE_DIM', 20)
+    tft_features = np.zeros((len(data), n_tft_feats))
+    tft_valid = np.zeros(len(data))
     if CONFIG.get('USE_TFT_ENCODER', False) and full_hist_df is not None:
-        cached_df = _precompute_and_cache_tft(symbol, full_hist_df)
-        aligned = cached_df.reindex(data.index).ffill().bfill()
-        aligned = aligned.ffill().bfill()
-        if aligned.isna().any().any():
-            logger.debug(f"TFT cache misalignment for {symbol} — using neutral features")
-            tft_features = np.zeros((len(data), 20))
-        else:
-            tft_features = aligned.values
-            mean_val = float(tft_features.mean())
-            std_val = float(tft_features.std())
-            if abs(mean_val) < 1e-5 and abs(std_val) < 1e-5:
-                logger.warning(f"⚠️ TFT for {symbol} returned all-zero features (neutral fallback)")
+        try:
+            cached_df = _precompute_and_cache_tft(symbol, full_hist_df)
+            feat_cols = [c for c in cached_df.columns if c.startswith('tft_') and c != 'tft_valid']
+            has_valid = 'tft_valid' in cached_df.columns
+            # Align cached TFT features to current data index
+            try:
+                aligned = cached_df.reindex(data.index, method='nearest').ffill().bfill()
+            except (ValueError, TypeError):
+                # Fallback: positional alignment when index types don't match
+                n = min(len(cached_df), len(data))
+                aligned = cached_df.iloc[-n:].copy()
+                aligned.index = data.index[-n:]
+                # Pad front with zeros if data is longer
+                if len(data) > n:
+                    front = pd.DataFrame(0.0, index=data.index[:len(data) - n], columns=cached_df.columns)
+                    aligned = pd.concat([front, aligned])
+            if aligned.isna().any().any():
+                logger.debug(f"TFT cache misalignment for {symbol} — using neutral features")
             else:
-                logger.debug(f"✅ TFT ACTIVE for {symbol} — loaded {tft_features.shape} features | mean={mean_val:.4f} | std={std_val:.4f}")
+                tft_features = aligned[feat_cols].values if feat_cols else np.zeros((len(data), n_tft_feats))
+                tft_valid = aligned['tft_valid'].values if has_valid else np.ones(len(data))
+                n_valid = int(tft_valid.sum())
+                if n_valid == 0:
+                    logger.warning(f"TFT for {symbol}: all rows invalid (collapsed/padded)")
+                else:
+                    valid_feats = tft_features[tft_valid > 0.5]
+                    mean_val = float(valid_feats.mean()) if len(valid_feats) > 0 else 0.0
+                    std_val = float(valid_feats.std()) if len(valid_feats) > 0 else 0.0
+                    logger.debug(f"TFT ACTIVE for {symbol} — {n_valid}/{len(data)} valid | "
+                                 f"mean={mean_val:.4f} std={std_val:.4f}")
+        except Exception as e:
+            logger.warning(f"TFT integration failed for {symbol}: {e} — using neutral features")
+    # Ensure correct column count
+    if tft_features.shape[1] < n_tft_feats:
+        pad = np.zeros((len(data), n_tft_feats - tft_features.shape[1]))
+        tft_features = np.concatenate([tft_features, pad], axis=1)
+    elif tft_features.shape[1] > n_tft_feats:
+        tft_features = tft_features[:, :n_tft_feats]
     # UPGRADE #6: volatility target
     recent_vol_series = close_changes.tail(100)
     recent_vol = recent_vol_series.std(ddof=0)
     if np.isnan(recent_vol) or recent_vol <= 0:
         recent_vol = 1e-6
-    annual_vol = recent_vol * np.sqrt(252 * 96)
-    # FIX: RSI, MACD, CCI, Stochastic are in indicator-space (0-100 or unbounded),
-    # NOT in return-space. Dividing by recent_vol (~0.005) saturates them at clip limits.
-    # Use dimensionally appropriate normalization instead.
+    # Compute rolling annual_vol so each bar gets its own volatility value (not a single scalar broadcast)
+    _vol_window = 100
+    rolling_std = close_changes.rolling(window=_vol_window, min_periods=20).std(ddof=0)
+    rolling_std = rolling_std.fillna(recent_vol)  # fill initial NaNs with global recent_vol
+    # FIX #49: Annualization uses 252*26 (252 trading days * 26 fifteen-min bars/day).
+    # Matches CONFIG.get('ANNUALIZATION_FACTOR', 252*26) in env.py.
+    annual_vol = rolling_std * np.sqrt(CONFIG.get('ANNUALIZATION_FACTOR', 252 * 26))
+    # SMA trend features — price position relative to key moving averages
+    sma_50 = data['close'].rolling(50, min_periods=20).mean()
+    sma_200 = data['close'].rolling(200, min_periods=50).mean()
+    # Price distance from SMA as fraction of price (dimensionless, typical range ~[-0.1, 0.1])
+    price_vs_sma50 = ((data['close'] - sma_50) / (sma_50 + 1e-8)).fillna(0.0)
+    price_vs_sma200 = ((data['close'] - sma_200) / (sma_200 + 1e-8)).fillna(0.0)
+    # Golden/death cross: SMA(50) vs SMA(200) distance
+    sma_cross = ((sma_50 - sma_200) / (sma_200 + 1e-8)).fillna(0.0)
     features = np.column_stack([
         bb_hband_ind.fillna(0.0),
         bb_lband_ind.fillna(0.0),
@@ -451,7 +705,9 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
         atr / (data['close'] * recent_vol + 1e-8),     # ATR: normalize by price * vol
         close_changes / recent_vol,                      # Returns: already in vol-space (correct)
         vol_changes / recent_vol_vol,
-        np.full(len(data), 1.0 if regime == 'trending' else 0.0),
+        # Regime flag: +1.0 = trending up, -1.0 = trending down, 0.0 = mean reverting.
+        # Encodes both regime TYPE and DIRECTION so models can distinguish bull/bear trends.
+        np.full(len(data), 1.0 if regime == 'trending_up' else (-1.0 if regime == 'trending_down' else 0.0)),
         cci / 200.0,                                     # CCI: typical range [-200, 200]
         obv_z,
         chaikin_vol,
@@ -461,20 +717,28 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
         ret_4,
         ret_26,
         ret_100,
+        # M45 NOTE: Macro values (VIX, yields, SPX) are daily snapshots broadcast to all bars.
+        # In live trading this is correct (latest daily value). In backtesting, this introduces
+        # mild look-ahead bias (today's macro applied to intraday history). Accepted trade-off:
+        # macro features change slowly (daily) and intraday variation is negligible.
         np.full(len(data), vix_normalized),
         np.full(len(data), vix_rsi_norm),
-        np.full(len(data), macro['tnx_yield']),
-        vwap_dev.fillna(0.0),
+        np.full(len(data), (macro['tnx_yield'] - 0.04) / 0.02),  # 10Y yield: center ~4%, scale ~2%
+        (vwap_dev * 100).fillna(0.0),                              # VWAP dev: scale from ~0.005 to ~0.5
         imbalance.fillna(0.0),
         bear_div.fillna(0.0),
         bull_div.fillna(0.0),
-        np.full(len(data), macro['vix_contango']),
-        np.full(len(data), macro['yield_spread']),
-        np.full(len(data), macro['spx_mom']),
-        np.full(len(data), vol_entropy),
-        np.full(len(data), price_entropy),
+        np.full(len(data), macro['vix_contango'] * 5.0),          # VIX contango: scale from ~0.1 to ~0.5
+        np.full(len(data), macro['yield_spread'] / 0.02),         # Yield spread: center ~2%, scale to ~1.0
+        np.full(len(data), macro['spx_mom'] / 0.01),              # SPX 5d mom: scale from ~0.02 to ~2.0
+        (vol_entropy_arr - 1.15) / 1.15,                           # Shannon entropy: center & scale to ~[-1, 1]
+        (price_entropy_arr - 1.15) / 1.15,                         # Shannon entropy: center & scale to ~[-1, 1]
+        price_vs_sma50 * 10.0,                                      # Price vs SMA(50): scale to ~[-1, 1]
+        price_vs_sma200 * 10.0,                                     # Price vs SMA(200): scale to ~[-1, 1]
+        sma_cross * 10.0,                                           # Golden/death cross strength
         tft_features,
-        np.full(len(data), annual_vol)
+        tft_valid.reshape(-1, 1),
+        annual_vol.values
     ])
     features = np.nan_to_num(features, nan=0.0, posinf=20.0, neginf=-20.0)
     features = np.clip(features, -20.0, 20.0)

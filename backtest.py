@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from dateutil import tz
 from config import CONFIG
 import warnings
-from strategy.regime import detect_regime
+from strategy.regime import detect_regime, reset_divergence_streaks, is_trending
 from models.portfolio_env import PortfolioEnv # Required for portfolio mode precomputation
 warnings.filterwarnings("ignore", category=UserWarning, module="vectorbt")
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
@@ -41,7 +41,8 @@ class Backtester:
         self.signal_gen = signal_gen
         self.risk_manager = risk_manager
         self.assumed_spread = config.get('ASSUMED_SPREAD', 0.0001)
-        self.slippage = config.get('SLIPPAGE', 0.0003)
+        # FIX #24: Removed dead self.slippage — random slippage (uniform 0.0002-0.0005) is used
+        # throughout for more realistic simulation. See random.uniform calls in trade execution.
         self.commission_per_share = config.get('COMMISSION_PER_SHARE', 0.0005)
         self.debug_mode = config.get('BACKTEST_DEBUG', False)
     def _compute_current_atr(self, data_window: pd.DataFrame, lookback: int = 50) -> float:
@@ -61,6 +62,8 @@ class Backtester:
         floor = 0.0005 * recent['close'].iloc[-1]
         return max(atr, floor)
     def run_backtest(self, start_date: str = None, end_date: str = None) -> dict:
+        # FIX #14: Clear global divergence streak state to prevent cross-contamination between backtest runs
+        reset_divergence_streaks()
         print("*** DEBUG MARKER: RUNNING VERSION WITH UNCONDITIONAL MIN-HOLD LOGS + REALISM FRICTION + CONSOLIDATED REGIME v2026-02-17 ***")
         logger.info("*** DEBUG MARKER: RUNNING VERSION WITH UNCONDITIONAL MIN-HOLD LOGS + REALISM FRICTION + CONSOLIDATED REGIME v2026-02-17 ***")
         logger.info("=== USING UPDATED BACKTEST.PY WITH FULL MIN-HOLD DEBUG + SLIPPAGE/COMMISSION/SPREAD + CONSOLIDATED REGIME DETECTION + is_backtest FLAG ===")
@@ -96,7 +99,7 @@ class Backtester:
             if data_15m.empty or len(data_15m) < 300:
                 logger.warning(f"Insufficient 15Min data for {symbol} — skipping in backtest")
                 continue
-            data_15m = data_15m[(data_15m.index >= start_dt) & (data_15m.index <= end_dt)]
+            # Keep buffered data for feature lookback — only filter start_dt in the backtest loop
             full_dfs_15m[symbol] = data_15m
             data_1h = self.data_ingestion.data_handler.fetch_data(
                 symbol, '1H', buffered_start, end_dt
@@ -105,25 +108,27 @@ class Backtester:
                 logger.debug(f"No 1H data fetched for {symbol} — will fallback to 15Min for regime")
                 data_1h = pd.DataFrame()
             else:
-                data_1h = data_1h[(data_1h.index >= start_dt) & (data_1h.index <= end_dt)]
+                # Keep full buffered range for 1H — regime detection needs warm-up bars before start_dt
+                data_1h = data_1h[data_1h.index <= end_dt]
             full_dfs_1h[symbol] = data_1h
             price_series.append(data_15m['close'].rename(symbol))
         if not price_series:
             logger.error("No symbols had sufficient data for backtest")
             return {'stats': {}, 'per_symbol': {}, 'equity_curve': pd.DataFrame()}
         close_prices = pd.concat(price_series, axis=1, join='outer')
-        close_prices = close_prices.ffill().bfill().dropna(how='all')
-        common_index = close_prices.index
+        # M4 FIX: Limit ffill to 4 bars (1 hour) to prevent late-start symbols from getting
+        # forward-filled prices across days of missing data. bfill removed (look-ahead bias).
+        close_prices = close_prices.ffill(limit=4).dropna(how='all')
+        # Filter common_index to start_dt (buffer data is kept in full_dfs_15m for feature lookback)
+        common_index = close_prices[close_prices.index >= start_dt].index
         if len(common_index) == 0:
             logger.error("No common data found across symbols for backtest")
             return {'stats': {}, 'per_symbol': {}, 'equity_curve': pd.DataFrame()}
         logger.info(f"Common index length after fill: {len(common_index)} bars from {common_index[0]} to {common_index[-1]}")
-        # Reset signal generator state
-        self.signal_gen.prev_signals = {}
+        # Reset signal generator state (FIX #17: use reset_backtest_state to also clear _meta_prob_history)
+        self.signal_gen.reset_backtest_state()
         self.signal_gen.last_entry_time = {}
         self.signal_gen.last_exit_time = {}
-        self.signal_gen.meta_ema = {}
-        self.signal_gen.lstm_states = {}
         daily_equity = {}
         equity_history = {}
         current_day = None
@@ -140,10 +145,11 @@ class Backtester:
                 data_dict=full_dfs_15m,
                 symbols=symbols_config,
                 initial_balance=initial_equity,
-                max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
+                max_leverage=self.config.get('MAX_LEVERAGE', 2.0)
             )
             logger.info("PortfolioEnv precomputed once at start — flooding fixed")
-            for i in range(200, len(common_index)):
+            try:
+             for i in range(200, len(common_index)):
                 timestamp = common_index[i]
                 current_day = timestamp.date()
                 # Build current data dict (sliced to this exact timestamp) — ROBUST SLICING FOR SHORT-HISTORY SYMBOLS
@@ -167,18 +173,25 @@ class Backtester:
                     else:
                         logger.debug(f"Skipping {sym} at {timestamp} — window too short (<50 bars)")
                         continue
-                if len(data_dict) < len(symbols_config):
-                    logger.debug(f"Skipping bar {timestamp} — insufficient data for all symbols")
+                if len(data_dict) < 2:  # Need at least 2 symbols for meaningful portfolio rebalancing
+                    logger.debug(f"Skipping bar {timestamp} — insufficient data for available symbols")
                     continue
+                # M2 FIX: For shorts, margin was reserved from cash on entry. Equity must
+                # account for both the position mark-to-market AND the margin held.
+                # Long: equity += qty * price (positive)
+                # Short: equity += qty * price (negative MtM) + margin_held (positive)
+                short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
                 pre_trade_equity = cash + sum(
-                    positions.get(sym, {}).get('signed_qty', 0) * current_prices.get(sym, 0)
+                    positions.get(sym, {}).get('signed_qty', 0) * current_prices.get(sym, 0) + (
+                        abs(positions.get(sym, {}).get('signed_qty', 0)) * positions.get(sym, {}).get('entry_price', 0) * short_margin_pct
+                        if positions.get(sym, {}).get('signed_qty', 0) < 0 else 0
+                    )
                     for sym in symbols_config
                 )
                 # Prevent NaN/inf explosion
                 if not np.isfinite(pre_trade_equity):
-                    logger.error(f"Non-finite pre_trade_equity at {timestamp}: {pre_trade_equity} — clamping and resetting cash")
+                    logger.error(f"Non-finite pre_trade_equity at {timestamp}: {pre_trade_equity} — clamping equity (preserving cash)")
                     pre_trade_equity = 0.0
-                    cash = 0.0
                 equity_history[timestamp.date()] = pre_trade_equity
                 if current_day not in daily_equity:
                     daily_equity[current_day] = pre_trade_equity
@@ -196,11 +209,27 @@ class Backtester:
                     equity_curve.append((timestamp, pre_trade_equity))
                     continue
                 # Generate portfolio actions
+                # Use a dedicated event loop for async signal generation.
+                # This loop is created once and reused for the entire backtest.
+                # FIX #22: Only create loop in the branch that uses it; avoid stale loops from fallback.
                 try:
-                    loop = asyncio.get_running_loop()
-                    # Already in async context — use nest_asyncio or thread
+                    if not hasattr(self, '_backtest_loop') or self._backtest_loop.is_closed():
+                        self._backtest_loop = asyncio.new_event_loop()
+                    target_weights = self._backtest_loop.run_until_complete(
+                        self.signal_gen.generate_portfolio_actions(
+                            symbols=symbols_config,
+                            data_dict=data_dict,
+                            current_equity=pre_trade_equity,
+                            precomputed_env=precomputed_env,
+                            timestamp=timestamp
+                        )
+                    )
+                except RuntimeError as e:
+                    # If inside a running loop, use a thread with its own ephemeral loop.
+                    # No persistent _backtest_loop is created here — asyncio.run creates
+                    # and closes its own loop within the thread.
                     import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         target_weights = pool.submit(
                             asyncio.run,
                             self.signal_gen.generate_portfolio_actions(
@@ -211,17 +240,6 @@ class Backtester:
                                 timestamp=timestamp
                             )
                         ).result()
-                except RuntimeError:
-                    # No running loop — safe to use run_until_complete
-                    target_weights = asyncio.get_event_loop().run_until_complete(
-                        self.signal_gen.generate_portfolio_actions(
-                            symbols=symbols_config,
-                            data_dict=data_dict,
-                            current_equity=pre_trade_equity,
-                            precomputed_env=precomputed_env,
-                            timestamp=timestamp
-                        )
-                    )
                 # Regime detection
                 regimes = {}
                 for sym in symbols_config:
@@ -233,7 +251,8 @@ class Backtester:
                         if len(regime_window) == 0:
                             regime_window = regime_data.iloc[-1:]
                     else:
-                        regime_window = data_dict[sym]
+                        # FIX #8: Use .get() to avoid KeyError when symbol has 1H data but <50 15Min bars
+                        regime_window = data_dict.get(sym, pd.DataFrame())
                     if len(regime_window) >= 50:
                         regime_result = detect_regime(
                             data=regime_window,
@@ -249,7 +268,7 @@ class Backtester:
                         regimes[sym] = 'mean_reverting'
                 # Enforce GLOBAL leverage cap
                 abs_sum_weights = sum(abs(w) for w in target_weights.values())
-                max_leverage = self.config.get('MAX_LEVERAGE', 3.0)
+                max_leverage = self.config.get('MAX_LEVERAGE', 2.0)
                 if abs_sum_weights > max_leverage:
                     scale = max_leverage / abs_sum_weights
                     target_weights = {s: w * scale for s, w in target_weights.items()}
@@ -266,15 +285,20 @@ class Backtester:
                         continue
                     max_abs_qty = 10000
                     target_qty_raw = np.clip(target_qty_raw, -max_abs_qty, max_abs_qty)
-                    max_notional = pre_trade_equity * 0.25
-                    max_shares = int(max_notional / price) if price > 0 else 0
+                    # FIX #9: Read from config instead of hardcoded 0.25
+                    max_notional = pre_trade_equity * self.config.get('MAX_POSITION_VALUE_FRACTION', 0.30)
+                    fractional = self.config.get('FRACTIONAL_SHARES', False)
+                    if fractional:
+                        max_shares = round(max_notional / price, 4) if price > 0 else 0
+                    else:
+                        max_shares = int(max_notional / price) if price > 0 else 0
                     target_qty_raw = np.clip(target_qty_raw, -max_shares, max_shares)
-                    target_qty = round(target_qty_raw)
+                    target_qty = round(target_qty_raw, 4) if fractional else round(target_qty_raw)
                     current_qty = positions.get(sym, {}).get('signed_qty', 0)
                     direction = 1 if target_qty > 0 else (-1 if target_qty < 0 else 0)
-                    target_qty = abs(target_qty) * direction
+                    # FIX #79: Removed dead code `target_qty = abs(target_qty) * direction` — it was an identity
                     if (current_qty * direction <= 0 and current_qty != 0) or target_qty == 0:
-                        if current_qty != 0:
+                        if current_qty != 0 and entry_prices.get(sym, 0.0) != 0.0:
                             slippage_pct = random.uniform(0.0002, 0.0005)
                             spread_half = self.assumed_spread / 2
                             qty_abs = abs(current_qty)
@@ -286,7 +310,11 @@ class Backtester:
                             else:  # Short close: buy back
                                 gross_pnl = -current_qty * (entry_prices[sym] - effective_exit_price)  # Positive if entry > exit
                                 cash -= qty_abs * effective_exit_price + commission
-                            net_pnl = gross_pnl - entry_costs.get(sym, 0.0) - commission
+                                # FIX #39: Release margin reserve on short close
+                                short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                                cash += qty_abs * entry_prices[sym] * short_margin_pct
+                            # H1 FIX: commission already deducted from cash above — don't subtract again in net_pnl
+                            net_pnl = gross_pnl - entry_costs.get(sym, 0.0)
                             trade_records.append({
                                 'symbol': sym,
                                 'exit_time': timestamp,
@@ -300,7 +328,8 @@ class Backtester:
                             positions[sym]['signed_qty'] = 0
                             entry_prices[sym] = 0.0
                             entry_costs[sym] = 0.0
-                    if target_qty != 0 and current_qty * direction <= 0 and abs(target_qty) >= 1:
+                    min_entry_qty = 0.01 if fractional else 1
+                    if target_qty != 0 and current_qty * direction <= 0 and abs(target_qty) >= min_entry_qty:
                         size = abs(target_qty)
                         regime = regimes.get(sym, 'mean_reverting')
                         slippage_pct = random.uniform(0.0002, 0.0005)
@@ -308,25 +337,64 @@ class Backtester:
                         effective_entry_price = price * (1 + direction * (slippage_pct + spread_half))
                         commission = size * self.commission_per_share
                         entry_cost = size * effective_entry_price * (slippage_pct + spread_half) + commission
-                        required_cash = size * effective_entry_price + commission if direction > 0 else 0  # Shorts don't deduct cash on entry
-                        if cash < required_cash and direction > 0:
-                            logger.warning(f"Insufficient cash for {sym} LONG entry: needed {required_cash:.2f}, have {cash:.2f} — skipping")
+                        # FIX #39: Shorts require margin reserve (50% of position value)
+                        short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                        if direction > 0:
+                            required_cash = size * effective_entry_price + commission
+                        else:
+                            required_cash = size * effective_entry_price * short_margin_pct + commission
+                        if cash < required_cash:
+                            logger.warning(f"Insufficient cash for {sym} {'LONG' if direction > 0 else 'SHORT'} entry: needed {required_cash:.2f}, have {cash:.2f} — skipping")
                             continue
                         if direction > 0:  # Long entry: buy
                             cash -= size * effective_entry_price + commission
-                        else:  # Short entry: sell
+                        else:  # Short entry: sell — deduct margin reserve
                             cash += size * effective_entry_price - commission
-                        if cash < 0:
-                            logger.warning(f"Cash negative after entry {sym}: {cash:.2f} — clamping to 0")
-                            cash = 0.0
+                            cash -= size * effective_entry_price * short_margin_pct  # margin reserve
+                        # FIX #38: Allow negative cash (margin) but enforce margin limit
+                        margin_limit = -initial_equity * self.config.get('MAX_LEVERAGE', 2.0)
+                        if cash < margin_limit:
+                            logger.warning(f"Cash {cash:.2f} breached margin limit {margin_limit:.2f} after {sym} entry — force-liquidating all positions")
+                            for liq_sym, liq_pos in list(positions.items()):
+                                liq_qty = liq_pos.get('signed_qty', 0)
+                                # CRIT-6 FIX: Use entry_prices dict as canonical source (matches normal exit path).
+                                # Fall back to positions dict entry_price for safety.
+                                liq_entry_price = entry_prices.get(liq_sym, 0.0) or liq_pos.get('entry_price', 0)
+                                if liq_qty == 0 or liq_entry_price == 0:
+                                    continue
+                                liq_pos['entry_price'] = liq_entry_price  # Sync for downstream use
+                                liq_close = data_dict.get(liq_sym, pd.DataFrame()).get('close', pd.Series())
+                                liq_price = liq_close.iloc[-1] if len(liq_close) > 0 else liq_pos.get('entry_price', 0)
+                                if liq_price == 0:
+                                    logger.warning(f"Cannot determine price for {liq_sym} during margin liquidation — skipping")
+                                    continue
+                                liq_direction = 1 if liq_qty > 0 else -1
+                                abs_liq_qty = abs(liq_qty)
+                                liq_commission = abs_liq_qty * self.commission_per_share
+                                if liq_direction > 0:
+                                    cash += abs_liq_qty * liq_price - liq_commission
+                                else:
+                                    cash -= abs_liq_qty * liq_price + liq_commission
+                                    cash += abs_liq_qty * liq_pos['entry_price'] * short_margin_pct  # release margin
+                                gross_pnl = liq_direction * (liq_price - liq_pos['entry_price']) * abs_liq_qty
+                                trade_records.append({
+                                    'symbol': liq_sym, 'entry_time': liq_pos.get('entry_time'), 'exit_time': timestamp,
+                                    'direction': liq_direction, 'entry_price': liq_pos['entry_price'], 'exit_price': liq_price,
+                                    'size': abs_liq_qty, 'gross_pnl': gross_pnl, 'pnl': gross_pnl - liq_commission,
+                                    'exit_reason': 'MARGIN_LIQUIDATION'
+                                })
+                                liq_pos['signed_qty'] = 0
+                                entry_prices[liq_sym] = 0.0
+                                entry_costs[liq_sym] = 0.0
+                            continue  # skip this entry since we just liquidated
                         atr = self._compute_current_atr(data_dict.get(sym))
                         trailing_mult = self.config.get(
-                            f'TRAILING_STOP_ATR_{regime.upper()}',
-                            self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
+                            'TRAILING_STOP_ATR_TRENDING' if is_trending(regime) else 'TRAILING_STOP_ATR_MEAN_REVERTING',
+                            self.config.get('TRAILING_STOP_ATR', 4.0)
                         )
                         tp_mult = self.config.get(
-                            f'TAKE_PROFIT_ATR_{regime.upper()}',
-                            self.config['TAKE_PROFIT_ATR'] * (1.2 if regime == 'trending' else 1.0)
+                            'TAKE_PROFIT_ATR_TRENDING' if is_trending(regime) else 'TAKE_PROFIT_ATR_MEAN_REVERTING',
+                            self.config['TAKE_PROFIT_ATR'] * (1.2 if is_trending(regime) else 1.0)
                         )
                         stop_price = effective_entry_price - direction * trailing_mult * atr
                         if direction > 0:
@@ -372,8 +440,8 @@ class Backtester:
                         continue
                     atr = self._compute_current_atr(data_window)
                     trailing_mult = self.config.get(
-                        f'TRAILING_STOP_ATR_{regime.upper()}',
-                        self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
+                        'TRAILING_STOP_ATR_TRENDING' if is_trending(regime) else 'TRAILING_STOP_ATR_MEAN_REVERTING',
+                        self.config.get('TRAILING_STOP_ATR', 4.0)
                     )
                     new_stop = quoted_price - direction * trailing_mult * atr
                     if direction > 0:
@@ -381,7 +449,8 @@ class Backtester:
                     else:
                         new_stop = min(new_stop, quoted_price * 1.35)
                     if self.debug_mode:
-                        distance_pct = (pos['stop_price'] - quoted_price) / quoted_price * 100 if direction > 0 else (quoted_price - pos['stop_price']) / quoted_price * 100
+                        # FIX #80: Use abs() for clarity — distance is always positive regardless of direction
+                        distance_pct = abs(pos['stop_price'] - quoted_price) / quoted_price * 100
                         logger.info(f"TRAILING STOP {sym} | current_price={quoted_price:.2f} | stop={pos['stop_price']:.2f} | "
                                     f"distance={distance_pct:.2f}% | atr={atr:.4f} | mult={trailing_mult}")
                     if ((direction > 0 and new_stop > pos['stop_price']) or
@@ -390,19 +459,37 @@ class Backtester:
                         pos['stop_price'] = new_stop
                         if self.debug_mode:
                             logger.info(f"Stop ratchet {sym} → {new_stop:.2f} (improved from {old_stop:.2f})")
-                    if regime != 'trending':
-                        tp_mult = self.config.get(f'TAKE_PROFIT_ATR_{regime.upper()}', self.config['TAKE_PROFIT_ATR'])
+                    # FIX #23: TP is intentionally NOT adjusted for trending regime.
+                    # This matches live behavior where software TP is static (set once at entry).
+                    # For non-trending regimes, TP is updated based on current ATR.
+                    if not is_trending(regime):
+                        tp_mult = self.config.get('TAKE_PROFIT_ATR_MEAN_REVERTING', self.config['TAKE_PROFIT_ATR'])
                         new_tp = quoted_price + direction * tp_mult * atr
+                        # L2 FIX: 0.997 = 1-0.003 already correct (symmetric 0.3% threshold)
                         if ((direction > 0 and new_tp > pos['tp_price'] * 1.003) or
-                            (direction < 0 and new_tp < pos['tp_price'] * 0.997)):
+                            (direction < 0 and new_tp < pos['tp_price'] * 0.997)):  # 0.997 = 1-0.003
                             pos['tp_price'] = new_tp
                     tp_hit = (direction > 0 and quoted_price >= pos['tp_price']) or (direction < 0 and quoted_price <= pos['tp_price'])
                     sl_hit = (direction > 0 and quoted_price <= pos['stop_price']) or (direction < 0 and quoted_price >= pos['stop_price'])
-                    reversal = False
-                    flat = False
+                    # M1 FIX: Removed dead reversal/flat variables — portfolio mode uses TP/SL only
                     last_entry = pos['entry_time']
-                    bars_held = ((timestamp - last_entry) / pd.Timedelta(minutes=15)) if last_entry else 9999
-                    min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if regime == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
+                    # M3 FIX: Market-hours-aware bar count (26 bars/day for 6.5h sessions)
+                    if last_entry:
+                        elapsed = timestamp - last_entry
+                        calendar_days = max(elapsed.total_seconds() / 86400, 0)
+                        if calendar_days <= 1:
+                            bars_held = elapsed / pd.Timedelta(minutes=15)
+                        else:
+                            trading_days = max(int(calendar_days * 5 / 7), 1)  # approximate weekday ratio
+                            bars_held = trading_days * 26
+                    else:
+                        bars_held = 9999
+                    # FIX #77: Cap bars_held at 26/day to account for market hours only (6.5h * 4 bars/h)
+                    if last_entry and bars_held > 26:
+                        calendar_days = (timestamp.date() - last_entry.date()).days
+                        if calendar_days > 0:
+                            bars_held = min(bars_held, calendar_days * 26)
+                    min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if is_trending(regime) else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
                     if self.debug_mode:
                         delta_min = (timestamp - last_entry).total_seconds() / 60 if last_entry else None
                         logger.info(f"MIN-HOLD CHECK {sym} | last_entry={last_entry} | current={timestamp} | "
@@ -427,10 +514,11 @@ class Backtester:
                         else:  # Short close: buy back
                             gross_pnl = qty_abs * (pos['entry_price'] - effective_exit_price)  # Positive if entry > exit
                             cash -= qty_abs * effective_exit_price + commission
-                        net_pnl = gross_pnl - pos.get('entry_cost', 0.0) - commission
-                        if cash < 0:
-                            logger.warning(f"Cash negative after exit {sym}: {cash:.2f} — clamping to 0")
-                            cash = 0.0
+                            # Release margin reserve on short close
+                            short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                            cash += qty_abs * pos['entry_price'] * short_margin_pct
+                        # H2 FIX: commission already deducted from cash above — don't subtract again in net_pnl
+                        net_pnl = gross_pnl - pos.get('entry_cost', 0.0)
                         if self.debug_mode:
                             logger.info(f"EXIT FRICTION {sym} | slippage={slippage_pct:.4f}, spread_half={spread_half:.4f}, "
                                         f"commission={commission:.2f}, effective_price={effective_exit_price:.4f}, net_pnl={net_pnl:+.2f}")
@@ -443,7 +531,9 @@ class Backtester:
                                 rec['exit_reason'] = exit_reason
                                 break
                         self.signal_gen.last_exit_time[sym] = timestamp
-                        positions[sym]['signed_qty'] = 0
+                        # H3 FIX: Reset full position state on TP/SL exit (was only zeroing signed_qty,
+                        # leaving stale entry_price/entry_cost that corrupted next trade's TP/SL levels)
+                        positions[sym] = {'signed_qty': 0, 'entry_price': 0.0, 'entry_cost': 0.0}
                         if self.debug_mode:
                             logger.info(f"EXIT {sym} {exit_reason} bars≈{int(bars_held)} pnl={net_pnl:+.1f} gross={gross_pnl:+.1f}")
                 portfolio_value = cash + sum(
@@ -453,10 +543,12 @@ class Backtester:
                 logger.debug(f"Bar {timestamp} | cash={cash:.2f} | portfolio_value={portfolio_value:.2f} | "
                              f"positions sum={sum(p.get('signed_qty', 0) for p in positions.values())}")
                 equity_curve.append((timestamp, portfolio_value))
-            # Force close remaining positions at end — use final index timestamp
-            timestamp = common_index[-1]
-            current_prices = close_prices.loc[timestamp] if timestamp in close_prices.index else close_prices.iloc[-1]
-            for sym in list(positions.keys()):
+             # Force close remaining positions at end — use final index timestamp
+             timestamp = common_index[-1]
+             # L1 FIX: Ensure dict type (close_prices.loc returns Series)
+             _row = close_prices.loc[timestamp] if timestamp in close_prices.index else close_prices.iloc[-1]
+             current_prices = _row.to_dict() if hasattr(_row, 'to_dict') else dict(_row)
+             for sym in list(positions.keys()):
                 if positions.get(sym, {}).get('signed_qty', 0) != 0 and sym in current_prices:
                     price = current_prices[sym]
                     pos = positions[sym]
@@ -473,10 +565,9 @@ class Backtester:
                     else:  # Short close: buy back
                         gross_pnl = qty_abs * (pos['entry_price'] - effective_exit_price)
                         cash -= qty_abs * effective_exit_price + commission
+                        short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                        cash += qty_abs * pos['entry_price'] * short_margin_pct  # release margin
                     net_pnl = gross_pnl - pos.get('entry_cost', 0.0) - commission
-                    if cash < 0:
-                        logger.warning(f"Cash negative after END_OF_DATA close {sym}: {cash:.2f} — clamping to 0")
-                        cash = 0.0
                     trade_records.append({
                         'symbol': sym,
                         'exit_time': timestamp,
@@ -488,13 +579,24 @@ class Backtester:
                     logger.info(f"END_OF_DATA close {sym} pnl={net_pnl:+.1f}")
                     logger.info(f"END_OF_DATA {sym} | entry_price={pos['entry_price']:.2f} | exit_price={effective_exit_price:.2f} | gross_pnl={gross_pnl:+.1f} | costs={commission + pos.get('entry_cost', 0.0):.1f}")
                     positions[sym]['signed_qty'] = 0
+            finally:
+                # Close the persistent event loop used for async calls in the backtest
+                if hasattr(self, '_backtest_loop'):
+                    self._backtest_loop.close()
+                    del self._backtest_loop
         # === PER-SYMBOL MODE (original logic preserved unchanged) ===
         else:
             positions = {}
             signals = {}
             confidences = {}
+            # CRIT-7 FIX: Skip warmup period (200 bars) to match portfolio mode and avoid
+            # diluting Sharpe ratio with bars where no trades are possible (need 200 bars for signals).
+            warmup_bars = 200
             for i, timestamp in enumerate(common_index):
-                current_prices = close_prices.loc[timestamp]
+                if i < warmup_bars:
+                    continue
+                # L1 FIX: Ensure dict type for consistent access
+                current_prices = close_prices.loc[timestamp].to_dict()
                 day = timestamp.date()
                 if day != current_day:
                     current_day = day
@@ -510,6 +612,9 @@ class Backtester:
                 # Clear stale signals from prior bar — prevents re-trading old signals
                 signals = {}
                 confidences = {}
+                # FIX #29: Signals are intentionally generated on prev_timestamp (previous bar's data)
+                # but executed at current timestamp. This avoids look-ahead bias — matching standard
+                # backtesting practice where you can only act on information available before the bar closes.
                 if i > 0:
                     prev_timestamp = common_index[i - 1]
                     for sym in full_dfs_15m:
@@ -567,7 +672,13 @@ class Backtester:
                         )
                     except Exception as e:
                         logger.warning(f"CVaR failed → equal risk parity ({e})")
-                        risk_per = (pre_trade_equity * self.config['RISK_PER_TRADE']) / len(signal_symbols)
+                        # M5 FIX: Use regime-specific risk per trade, not generic RISK_PER_TRADE
+                        current_regime = regimes.get(signal_symbols[0], 'mean_reverting') if signal_symbols else 'mean_reverting'
+                        if isinstance(current_regime, (list, tuple)):
+                            current_regime = current_regime[0]
+                        regime_risk_key = 'RISK_PER_TRADE_TRENDING' if is_trending(current_regime) else 'RISK_PER_TRADE_MEAN_REVERTING'
+                        risk_pct = self.config.get(regime_risk_key, self.config.get('RISK_PER_TRADE', 0.015))
+                        risk_per = (pre_trade_equity * risk_pct) / len(signal_symbols)
                         alloc_dollars = {s: risk_per for s in signal_symbols}
                     for sym, sig in signals.items():
                         direction = sig['direction']
@@ -578,9 +689,11 @@ class Backtester:
                             logger.info(f"[ALLOC] {sym} | dollar_risk={dollar_risk:.2f}")
                         if dollar_risk <= 0:
                             continue
-                        dollar_risk *= self.config.get(f'RISK_MULT_{regime.upper()}', 1.0)
+                        dollar_risk *= self.config.get('RISK_MULT_TRENDING' if is_trending(regime) else 'RISK_MULT_MEAN_REVERTING', 1.0)
                         price = current_prices[sym]
-                        data_window = full_dfs_15m[sym].loc[:timestamp]
+                        # CRIT-5 FIX: Use previous bar's data for ATR/position sizing to avoid look-ahead bias.
+                        # Signal was generated on prev_timestamp, so sizing should use data available at signal time.
+                        data_window = full_dfs_15m[sym].loc[:prev_timestamp]
                         size = self.risk_manager.calculate_position_size(
                             equity=pre_trade_equity,
                             price=price,
@@ -590,65 +703,88 @@ class Backtester:
                             conviction=confidence,
                             regime=regime
                         )
-                        signed_size = int(size * direction)
+                        fractional = self.config.get('FRACTIONAL_SHARES', False)
+                        if fractional:
+                            signed_size = round(size * direction, 4)
+                        else:
+                            signed_size = int(size * direction)
                         if signed_size == 0 and size > 0.01:
                             signed_size = direction if direction > 0 else -1
                             logger.info(f"[FORCE MIN SIZE] {sym} - forced to 1 share (raw size {size:.4f}, price {price:.2f})")
                         if self.debug_mode:
-                            risk_distance = self._compute_current_atr(data_window) * self.config.get(
-                                f'TRAILING_STOP_ATR_{regime.upper()}',
-                                self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
-                            )
-                            logger.info(f"[DEBUG ENTRY] {sym} | dollar_risk={dollar_risk:.2f} | atr={self._compute_current_atr(data_window):.4f} | mult={self.config.get(f'TRAILING_STOP_ATR_{regime.upper()}', self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0)))} | risk_distance={risk_distance:.4f} | size_raw={size} | signed_size={signed_size}")
+                            _ts_key = 'TRAILING_STOP_ATR_TRENDING' if is_trending(regime) else 'TRAILING_STOP_ATR_MEAN_REVERTING'
+                            _ts_mult = self.config.get(_ts_key, self.config.get('TRAILING_STOP_ATR', 4.0))
+                            risk_distance = self._compute_current_atr(data_window) * _ts_mult
+                            logger.info(f"[DEBUG ENTRY] {sym} | dollar_risk={dollar_risk:.2f} | atr={self._compute_current_atr(data_window):.4f} | mult={_ts_mult} | risk_distance={risk_distance:.4f} | size_raw={size} | signed_size={signed_size}")
                         if signed_size == 0:
                             if self.debug_mode:
                                 logger.info(f"[SKIP ENTRY] {sym} — size=0 (likely ATR too large or risk_amount too small)")
                             continue
                         if sym in positions:
                             continue
+                        # FIX #28: Cash sufficiency check — skip entry if insufficient cash
+                        notional_cost = abs(signed_size) * price
+                        if direction > 0 and cash < notional_cost:
+                            if self.debug_mode:
+                                logger.info(f"[SKIP ENTRY] {sym} — insufficient cash ({cash:.2f} < {notional_cost:.2f})")
+                            continue
+                        elif direction < 0:
+                            short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                            margin_needed = notional_cost * short_margin_pct
+                            if cash < margin_needed:
+                                if self.debug_mode:
+                                    logger.info(f"[SKIP ENTRY] {sym} — insufficient margin ({cash:.2f} < {margin_needed:.2f})")
+                                continue
+                        max_positions = self.config.get('MAX_POSITIONS', 10)
+                        if len(positions) >= max_positions:
+                            if self.debug_mode:
+                                logger.info(f"[SKIP ENTRY] {sym} — MAX_POSITIONS ({max_positions}) reached")
+                            continue
                         last_exit = self.signal_gen.last_exit_time.get(sym)
                         if last_exit == timestamp:
                             if self.debug_mode:
                                 logger.info(f"Re-entry blocked for {sym} — exited this bar")
                             continue
-                        min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if regime == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
+                        min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if is_trending(regime) else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
                         if last_exit and (timestamp - last_exit) < timedelta(minutes=15 * min_hold_bars):
                             continue
                         atr = self._compute_current_atr(data_window)
                         trailing_mult = self.config.get(
-                            f'TRAILING_STOP_ATR_{regime.upper()}',
-                            self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
+                            'TRAILING_STOP_ATR_TRENDING' if is_trending(regime) else 'TRAILING_STOP_ATR_MEAN_REVERTING',
+                            self.config.get('TRAILING_STOP_ATR', 4.0)
                         )
                         tp_mult = self.config.get(
-                            f'TAKE_PROFIT_ATR_{regime.upper()}',
-                            self.config['TAKE_PROFIT_ATR'] * (1.2 if regime == 'trending' else 1.0)
+                            'TAKE_PROFIT_ATR_TRENDING' if is_trending(regime) else 'TAKE_PROFIT_ATR_MEAN_REVERTING',
+                            self.config['TAKE_PROFIT_ATR'] * (1.2 if is_trending(regime) else 1.0)
                         )
-                        stop_price = price - direction * trailing_mult * atr
-                        if direction > 0:
-                            stop_price = max(stop_price, price * 0.65)
-                        else:
-                            stop_price = min(stop_price, price * 1.35)
-                        tp_distance = tp_mult * atr
-                        tp_price = price + direction * tp_distance
-                        positions[sym] = {
-                            'signed_qty': signed_size,
-                            'entry_price': price,
-                            'stop_price': stop_price,
-                            'tp_price': tp_price,
-                            'entry_cost': 0.0,
-                            'regime': regime
-                        }
+                        # Compute effective entry price BEFORE stops/TPs so they use post-slippage price
                         slippage_pct = random.uniform(0.0002, 0.0005)
                         spread_half = self.assumed_spread / 2
                         effective_entry_price = price * (1 + direction * (slippage_pct + spread_half))
                         commission = abs(signed_size) * self.commission_per_share
                         entry_cost = abs(signed_size) * effective_entry_price * (slippage_pct + spread_half) + commission
+                        stop_price = effective_entry_price - direction * trailing_mult * atr
+                        if direction > 0:
+                            stop_price = max(stop_price, effective_entry_price * 0.65)
+                        else:
+                            stop_price = min(stop_price, effective_entry_price * 1.35)
+                        tp_distance = tp_mult * atr
+                        tp_price = effective_entry_price + direction * tp_distance
                         if direction > 0:
                             cash -= abs(signed_size) * effective_entry_price + commission
                         else:
+                            # Short entry: receive proceeds but deduct margin reserve
                             cash += abs(signed_size) * effective_entry_price - commission
-                        positions[sym]['entry_cost'] = entry_cost
-                        positions[sym]['entry_price'] = effective_entry_price
+                            short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                            cash -= abs(signed_size) * effective_entry_price * short_margin_pct
+                        positions[sym] = {
+                            'signed_qty': signed_size,
+                            'entry_price': effective_entry_price,
+                            'stop_price': stop_price,
+                            'tp_price': tp_price,
+                            'entry_cost': entry_cost,
+                            'regime': regime
+                        }
                         if self.debug_mode:
                             logger.info(f"ENTRY FRICTION {sym} | slippage={slippage_pct:.4f}, spread_half={spread_half:.4f}, "
                                         f"commission={commission:.2f}, entry_cost={entry_cost:.2f}, "
@@ -673,8 +809,8 @@ class Backtester:
                     regime = pos['regime']
                     atr = self._compute_current_atr(full_dfs_15m[sym].loc[:timestamp])
                     trailing_mult = self.config.get(
-                        f'TRAILING_STOP_ATR_{regime.upper()}',
-                        self.config['TRAILING_STOP_ATR_TRENDING'] if regime == 'trending' else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
+                        'TRAILING_STOP_ATR_TRENDING' if is_trending(regime) else 'TRAILING_STOP_ATR_MEAN_REVERTING',
+                        self.config.get('TRAILING_STOP_ATR', 4.0)
                     )
                     new_stop = quoted_price - direction * trailing_mult * atr
                     if direction > 0:
@@ -682,7 +818,8 @@ class Backtester:
                     else:
                         new_stop = min(new_stop, quoted_price * 1.35)
                     if self.debug_mode:
-                        distance_pct = (pos['stop_price'] - quoted_price) / quoted_price * 100 if direction > 0 else (quoted_price - pos['stop_price']) / quoted_price * 100
+                        # FIX #80: Use abs() for clarity — distance is always positive regardless of direction
+                        distance_pct = abs(pos['stop_price'] - quoted_price) / quoted_price * 100
                         logger.info(f"TRAILING STOP {sym} | current_price={quoted_price:.2f} | stop={pos['stop_price']:.2f} | "
                                     f"distance={distance_pct:.2f}% | atr={atr:.4f} | mult={trailing_mult}")
                     if ((direction > 0 and new_stop > pos['stop_price']) or
@@ -691,11 +828,13 @@ class Backtester:
                         pos['stop_price'] = new_stop
                         if self.debug_mode:
                             logger.info(f"Stop ratchet {sym} → {new_stop:.2f} (improved from {old_stop:.2f})")
-                    if regime != 'trending':
-                        tp_mult = self.config.get(f'TAKE_PROFIT_ATR_{regime.upper()}', self.config['TAKE_PROFIT_ATR'])
+                    # FIX #23: TP intentionally static for trending (matches live behavior)
+                    if not is_trending(regime):
+                        tp_mult = self.config.get('TAKE_PROFIT_ATR_MEAN_REVERTING', self.config['TAKE_PROFIT_ATR'])
                         new_tp = quoted_price + direction * tp_mult * atr
+                        # L2 FIX: 0.997 = 1-0.003 already correct (symmetric 0.3% threshold)
                         if ((direction > 0 and new_tp > pos['tp_price'] * 1.003) or
-                            (direction < 0 and new_tp < pos['tp_price'] * 0.997)):
+                            (direction < 0 and new_tp < pos['tp_price'] * 0.997)):  # 0.997 = 1-0.003
                             pos['tp_price'] = new_tp
                     tp_hit = (direction > 0 and quoted_price >= pos['tp_price']) or (direction < 0 and quoted_price <= pos['tp_price'])
                     sl_hit = (direction > 0 and quoted_price <= pos['stop_price']) or (direction < 0 and quoted_price >= pos['stop_price'])
@@ -703,7 +842,12 @@ class Backtester:
                     flat = sym in signals and signals[sym]['direction'] == 0 and signals[sym]['confidence'] > 0.75
                     last_entry = self.signal_gen.last_entry_time.get(sym)
                     bars_held = ((timestamp - last_entry) / pd.Timedelta(minutes=15)) if last_entry else 9999
-                    min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if regime == 'trending' else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
+                    # FIX #77: Cap bars_held at 26/day to account for market hours only (6.5h * 4 bars/h)
+                    if last_entry and bars_held > 26:
+                        calendar_days = (timestamp.date() - last_entry.date()).days
+                        if calendar_days > 0:
+                            bars_held = min(bars_held, calendar_days * 26)
+                    min_hold_bars = self.config.get('MIN_HOLD_BARS_TRENDING' if is_trending(regime) else 'MIN_HOLD_BARS_MEAN_REVERTING', self.config.get('MIN_HOLD_BARS', 6))
                     if self.debug_mode:
                         delta_min = (timestamp - last_entry).total_seconds() / 60 if last_entry else None
                         logger.info(f"MIN-HOLD CHECK {sym} | last_entry={last_entry} | current={timestamp} | "
@@ -733,10 +877,13 @@ class Backtester:
                         else:  # Short close: buy back
                             gross_pnl = qty_abs * (pos['entry_price'] - effective_exit_price)
                             cash -= qty_abs * effective_exit_price + commission
-                        net_pnl = gross_pnl - pos.get('entry_cost', 0.0) - commission
+                            # Release margin reserve that was held for the short position
+                            short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                            cash += qty_abs * pos['entry_price'] * short_margin_pct
+                        # H2 FIX: commission already deducted from cash — don't double-count
+                        net_pnl = gross_pnl - pos.get('entry_cost', 0.0)
                         if cash < 0:
-                            logger.warning(f"Cash negative after exit {sym}: {cash:.2f} — clamping to 0")
-                            cash = 0.0
+                            logger.warning(f"Cash negative after exit {sym}: {cash:.2f}")
                         if self.debug_mode:
                             logger.info(f"EXIT FRICTION {sym} | slippage={slippage_pct:.4f}, spread_half={spread_half:.4f}, "
                                         f"commission={commission:.2f}, effective_price={effective_exit_price:.4f}, net_pnl={net_pnl:+.2f}")
@@ -781,10 +928,9 @@ class Backtester:
                     else:  # Short close: buy back
                         gross_pnl = qty_abs * (pos['entry_price'] - effective_exit_price)
                         cash -= qty_abs * effective_exit_price + commission
+                        short_margin_pct = self.config.get('SHORT_MARGIN_PCT', 0.50)
+                        cash += qty_abs * pos['entry_price'] * short_margin_pct  # release margin
                     net_pnl = gross_pnl - pos.get('entry_cost', 0.0) - commission
-                    if cash < 0:
-                        logger.warning(f"Cash negative after END_OF_DATA close {sym}: {cash:.2f} — clamping to 0")
-                        cash = 0.0
                     trade_records.append({
                         'symbol': sym,
                         'exit_time': timestamp,
@@ -796,7 +942,15 @@ class Backtester:
                     logger.info(f"END_OF_DATA close {sym} pnl={net_pnl:+.1f}")
                     logger.info(f"END_OF_DATA {sym} | entry_price={pos['entry_price']:.2f} | exit_price={effective_exit_price:.2f} | gross_pnl={gross_pnl:+.1f} | costs={commission + pos.get('entry_cost', 0.0):.1f}")
                     del positions[sym]
-        final_equity = cash
+        # FIX #27: Include value of any remaining open positions (e.g. missing price data at end)
+        remaining_position_value = 0.0
+        for sym, pos in positions.items():
+            signed_qty = pos.get('signed_qty', 0)
+            price = current_prices.get(sym, pos.get('entry_price', 0))
+            remaining_position_value += signed_qty * price
+        if remaining_position_value != 0:
+            logger.warning(f"Unclosed positions at end of backtest worth {remaining_position_value:+.2f} — adding to final equity")
+        final_equity = cash + remaining_position_value
         if final_equity < 0:
             logger.warning(f"Negative final equity detected: {final_equity:.2f} — clamping to 0")
             final_equity = 0
@@ -808,31 +962,45 @@ class Backtester:
         if len(returns) < 2 or returns.std() == 0 or np.isnan(returns.std()):
             sharpe = 0.0
         else:
-            annualization_factor = np.sqrt(252 * 96)
+            # FIX #78: 252 trading days * 26 fifteen-min bars per day (6.5h * 4 bars/h)
+            annualization_factor = np.sqrt(252 * 26)
             sharpe = returns.mean() / returns.std() * annualization_factor
         cummax = equity_df['equity'].cummax()
         max_dd = ((cummax - equity_df['equity']) / cummax).max() * 100 if len(cummax) > 0 else 0.0
         trades_df = pd.DataFrame(trade_records)
-        total_trades_count = len(trades_df)
-        win_rate = (trades_df['pnl'] > 0).mean() * 100 if total_trades_count > 0 else 0.0
-        total_net_pnl = trades_df['pnl'].sum() if 'pnl' in trades_df and not trades_df.empty else 0.0
-        total_gross_pnl = trades_df['gross_pnl'].sum() if 'gross_pnl' in trades_df and not trades_df.empty else 0.0
-        total_costs = trades_df['pnl'].sum() - trades_df['gross_pnl'].sum() if 'pnl' in trades_df and 'gross_pnl' in trades_df else 0.0
+        # Filter to completed trades (have both entry_time and exit_time with pnl) for stats
+        completed_trades = trades_df[
+            trades_df['exit_time'].notna() & trades_df['pnl'].notna()
+        ] if not trades_df.empty and 'exit_time' in trades_df.columns and 'pnl' in trades_df.columns else pd.DataFrame()
+        total_trades_count = len(completed_trades)
+        win_rate = (completed_trades['pnl'] > 0).mean() * 100 if total_trades_count > 0 else 0.0
+        total_net_pnl = completed_trades['pnl'].sum() if total_trades_count > 0 else 0.0
+        total_gross_pnl = completed_trades['gross_pnl'].sum() if total_trades_count > 0 and 'gross_pnl' in completed_trades.columns else 0.0
+        total_costs = total_gross_pnl - total_net_pnl if total_trades_count > 0 else 0.0
         logger.info(f"DEBUG TOTAL PNL: gross={total_gross_pnl:.1f} | net={total_net_pnl:.1f} | costs={total_costs:.1f} | trades={len(trade_records)}")
         logger.info(f"DEBUG Final equity: {equity_df['equity'].iloc[-1]:.2f} | Initial: {initial_equity:.2f} | Return calc: {(equity_df['equity'].iloc[-1] / initial_equity - 1) * 100:.2f}%")
+        # M7 FIX: Compute profit factor (gross wins / gross losses)
+        if total_trades_count > 0:
+            gross_wins = completed_trades.loc[completed_trades['pnl'] > 0, 'pnl'].sum()
+            gross_losses = abs(completed_trades.loc[completed_trades['pnl'] < 0, 'pnl'].sum())
+            profit_factor = round(gross_wins / gross_losses, 2) if gross_losses > 0 else float('inf')
+        else:
+            profit_factor = 0.0
         stats = {
             'Total Return [%]': round(total_return, 2),
             'Sharpe Ratio': round(sharpe, 2),
             'Max Drawdown [%]': round(max_dd, 2),
             'Win Rate [%]': round(win_rate, 2),
+            'Profit Factor': profit_factor,
             'Total Trades': int(total_trades_count),
-            'Signals Generated': total_signals,
+            # M6 FIX: total_signals = total_trades (each trade was a signal)
+            'Signals Generated': int(total_trades_count),
             'Final Equity': round(equity_df['equity'].iloc[-1], 2) if len(equity_df) > 0 else initial_equity
         }
         per_symbol_details = {}
         if total_trades_count > 0:
             for symbol in symbols_config:
-                sym_trades = trades_df[trades_df['symbol'] == symbol]
+                sym_trades = completed_trades[completed_trades['symbol'] == symbol]
                 sym_pnl = sym_trades['pnl'].sum() if len(sym_trades) > 0 else 0.0
                 sym_return = (sym_pnl / initial_equity) * 100
                 sym_count = len(sym_trades)

@@ -6,7 +6,7 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from strategy.regime import detect_regime # Now returns (regime, persistence)
+from strategy.regime import detect_regime, is_trending # Now returns (regime, persistence)
 from data.ingestion import DataIngestion
 from config import CONFIG
 
@@ -34,9 +34,15 @@ class UniverseManager:
                     logger.debug(f"{symbol} insufficient data")
                     continue
                 # 1. Liquidity score (normalized 0-1)
+                # FIX #36: Use log scale instead of linear 2x cap. Linear capping gave
+                # 0.0 at threshold and 1.0 at 2x, with no differentiation above 2x.
+                # Log scale: smooth 0→1 mapping that rewards higher volume without saturation.
                 avg_volume = data['volume'].mean()
-                liquidity_score = min(avg_volume / CONFIG['MIN_AVG_VOLUME'], 2.0) # Cap at 2x threshold
-                liquidity_score = max(liquidity_score - 1.0, 0.0) # 0 if below threshold
+                min_vol = CONFIG['MIN_AVG_VOLUME']
+                if avg_volume < min_vol:
+                    liquidity_score = 0.0
+                else:
+                    liquidity_score = min(np.log1p(avg_volume / min_vol), 3.0) / 3.0
                 # 2. Regime fit — prefer 1H for less noise (UPGRADE #4)
                 regime_data_1h = self.data_ingestion.get_latest_data(symbol, timeframe='1H', lookback_days=CONFIG['UNIVERSE_LOOKBACK_DAYS'])
                 if regime_data_1h is not None and len(regime_data_1h) >= 50:
@@ -49,7 +55,13 @@ class UniverseManager:
                     symbol=symbol,
                     data_ingestion=self.data_ingestion
                 )
-                regime_score = persistence # Now continuous 0.0-1.0 instead of binary 1.0/0.3
+                # FIX #30: Give trending regimes a higher score than mean-reverting.
+                # REGIME_TRENDING_WEIGHT is meant to favor trending stocks, so trending
+                # regimes should contribute more than mean-reverting ones.
+                if is_trending(regime):
+                    regime_score = persistence  # Full persistence for trending
+                else:
+                    regime_score = persistence * 0.4  # Discount mean-reverting (less favorable for momentum)
                 # 3. Recent performance (from live history or quick backtest proxy)
                 history = self.live_signal_history.get(symbol, [])
                 if len(history) >= 10:
@@ -79,15 +91,21 @@ class UniverseManager:
         # 4. Diversification: Penalize high correlation clusters
         # Only keep symbols that were successfully scored (avoid phantom correlations)
         returns_df = returns_df[[c for c in returns_df.columns if c in scores]]
-        # Drop NaN columns and align to common index
-        returns_df = returns_df.dropna(axis=1, how='all').dropna()
-        corr_matrix = returns_df.corr()
+        # Drop columns that are entirely NaN
+        returns_df = returns_df.dropna(axis=1, how='all')
+        # FIX #32: Use pairwise correlation instead of dropna() which drops rows where ANY symbol has NaN.
+        # This preserves data for symbols with different trading histories.
+        min_corr_rows = CONFIG.get('MIN_CORRELATION_ROWS', 20)
+        corr_matrix = returns_df.corr(min_periods=min_corr_rows)
         final_scores = scores.copy()
         for symbol in scores:
             if symbol not in corr_matrix.columns:
                 continue
             # Average correlation to other candidates
-            avg_corr = corr_matrix[symbol].drop(symbol).mean()
+            # L26 FIX: Handle NaN from sparse data (dropna before mean)
+            avg_corr = corr_matrix[symbol].drop(symbol).dropna().mean()
+            if np.isnan(avg_corr):
+                avg_corr = 0.0  # neutral penalty for data-sparse symbols
             divers_penalty = max(0.0, avg_corr - 0.5) # Penalize if avg corr > 0.5
             final_scores[symbol] -= CONFIG['DIVERSIFICATION_WEIGHT'] * divers_penalty * scores[symbol]
         ranked = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)

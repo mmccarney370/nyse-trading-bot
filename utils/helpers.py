@@ -50,8 +50,19 @@ def _is_nyse_holiday(d: datetime.date) -> bool:
     # Remove non-NYSE federal holidays
     if d.month == 10 and d.weekday() == 0 and 8 <= d.day <= 14:   # 2nd Monday Oct = Columbus
         return False
-    if d.month == 11 and d.day == 11:                              # Veterans Day
-        return False
+    # FIX #48: Veterans Day (Nov 11) AND its observed date — NYSE is OPEN on both.
+    # When Nov 11 falls on Saturday, holidays.US(observed=True) marks Friday Nov 10.
+    # When Nov 11 falls on Sunday, it marks Monday Nov 12. Exclude all of these.
+    if d.month == 11:
+        nov11 = datetime(d.year, 11, 11).date()
+        nov11_weekday = nov11.weekday()
+        veterans_dates = {nov11}
+        if nov11_weekday == 5:  # Saturday → observed Friday
+            veterans_dates.add(nov11 - timedelta(days=1))
+        elif nov11_weekday == 6:  # Sunday → observed Monday
+            veterans_dates.add(nov11 + timedelta(days=1))
+        if d in veterans_dates:
+            return False
 
     return True
 
@@ -66,14 +77,39 @@ def _is_early_close_day(d: datetime.date) -> bool:
         if d == thanksgiving + timedelta(days=1):
             return True
 
-    # July 3 when July 4 falls on Tue/Wed/Thu
-    if d.month == 7 and d.day == 3:
-        july4 = datetime(d.year, 7, 4).weekday()
-        if july4 in (1, 2, 3):  # Tue, Wed, Thu
+    # July 3 early close when July 4 falls on Tue/Wed/Thu/Sat
+    # When July 4 is Sunday, observed holiday is Monday July 5, early close is Friday July 2
+    if d.month == 7:
+        july4_weekday = datetime(d.year, 7, 4).weekday()
+        if july4_weekday == 6 and d.day == 2:  # FIX #39: Sunday → early close Friday July 2
+            return True
+        if d.day == 3 and july4_weekday in (1, 2, 3, 5):  # Tue, Wed, Thu, Sat
             return True
 
-    # Christmas Eve (always early close)
-    if d.month == 12 and d.day == 24:
+    # Christmas Eve early close (1:00 PM ET)
+    # If Dec 24 is Saturday, early close moves to Friday Dec 23
+    # If Dec 24 is Sunday, early close moves to Friday Dec 22
+    dec24 = datetime(d.year, 12, 24).date()
+    dec24_weekday = dec24.weekday()
+    if dec24_weekday == 5:       # Saturday → Friday Dec 23
+        early_close_date = dec24 - timedelta(days=1)
+    elif dec24_weekday == 6:     # Sunday → Friday Dec 22
+        early_close_date = dec24 - timedelta(days=2)
+    else:
+        early_close_date = dec24
+    if d == early_close_date:
+        return True
+
+    # L16 FIX: New Year's Eve early close (1:00 PM ET)
+    dec31 = datetime(d.year, 12, 31).date()
+    dec31_weekday = dec31.weekday()
+    if dec31_weekday == 5:
+        early_nye = dec31 - timedelta(days=1)  # Friday Dec 30
+    elif dec31_weekday == 6:
+        early_nye = dec31 - timedelta(days=2)  # Friday Dec 29
+    else:
+        early_nye = dec31
+    if d == early_nye:
         return True
 
     return False
@@ -96,11 +132,7 @@ def is_market_open(now: datetime = None) -> bool:
         # Naive datetime — assume it's already Eastern
         now = now.replace(tzinfo=eastern)
 
-    # Weekend
-    if now.weekday() >= 5:
-        return False
-
-    # NYSE holiday (accurate version)
+    # L15 FIX: _is_nyse_holiday already checks weekends, so skip redundant check
     if _is_nyse_holiday(now.date()):
         return False
 

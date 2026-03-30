@@ -30,12 +30,12 @@ CONFIG = {
     'CURRENT_REGIME': 'mean_reverting',
 }
 # ==================== Pydantic Validation Layer — SINGLE SOURCE OF TRUTH ====================
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Any
 class TradingBotConfig(BaseModel):
     # ==================== API & Broker Settings ====================
-    API_KEY: str
-    API_SECRET: str
+    API_KEY: str = Field(min_length=1)
+    API_SECRET: str = Field(min_length=1)
     BASE_URL: str
     POLYGON_API_KEY: str | None = None
     TIINGO_API_KEY: str | None = None
@@ -53,10 +53,12 @@ class TradingBotConfig(BaseModel):
     UNIVERSE_UPDATE_INTERVAL_HOURS: int = 168
     MIN_AVG_VOLUME: int = 5_000_000
     UNIVERSE_LOOKBACK_DAYS: int = 90
+    # L34 NOTE: LIQUIDITY + REGIME + PERFORMANCE = 0.90 (scoring weights, sum to ~1.0).
+    # DIVERSIFICATION_WEIGHT is a penalty multiplier, not a scoring weight — applied separately.
     LIQUIDITY_WEIGHT: float = 0.15
     REGIME_TRENDING_WEIGHT: float = 0.45
     PERFORMANCE_WEIGHT: float = 0.30
-    DIVERSIFICATION_WEIGHT: float = 0.10
+    DIVERSIFICATION_WEIGHT: float = 0.10  # Penalty multiplier, not additive weight
     TIMEFRAMES: List[str] = Field(default_factory=lambda: ['15Min', '1H'])
     # ==================== Risk & Position Sizing ====================
     RISK_PER_TRADE: float = 0.015                      # Was 0.012 — deploy more per trade with improved signals
@@ -64,8 +66,9 @@ class TradingBotConfig(BaseModel):
     TAKE_PROFIT_ATR: float = 20.0                      # Was 18.0 — larger targets
     RISK_PER_TRADE_MEAN_REVERTING: float = 0.008       # Was 0.006 — MR is lower risk, can allocate more
     RISK_PER_TRADE_TRENDING: float = 0.03              # Was 0.025 — trends are the main profit driver
-    TRAILING_STOP_ATR_MEAN_REVERTING: float = 4.5      # Was 4.0 — wider to reduce stop-hunt exits
-    TRAILING_STOP_ATR_TRENDING: float = 3.5            # Was 3.0 — more room for trend pullbacks
+    # M54 FIX: Swapped — trends need wider stops (ride momentum), MR needs tighter (quick exits)
+    TRAILING_STOP_ATR_MEAN_REVERTING: float = 3.5      # Tight for quick MR trades
+    TRAILING_STOP_ATR_TRENDING: float = 4.5            # Wide to ride trend momentum
     TAKE_PROFIT_ATR_MEAN_REVERTING: float = 8.0        # Was 10.0 — MR trades should book profit faster
     TAKE_PROFIT_ATR_TRENDING: float = 35.0             # Was 30.0 — let trend winners run further
     MAX_POSITIONS: int = 5                             # Was 6 — concentrate capital in higher-conviction trades
@@ -75,8 +78,8 @@ class TradingBotConfig(BaseModel):
     SLIPPAGE: float = 0.0001
     ASSUMED_SPREAD: float = 0.0
     LIMIT_PRICE_OFFSET: float = 0.003                  # Was 0.004 — tighter limit orders for better fills
-    DAILY_LOSS_THRESHOLD: float = -0.20                # Was -0.25 — cut losses sooner to preserve capital
-    API_FAILURE_THRESHOLD: int = 5000
+    DAILY_LOSS_THRESHOLD: float = -0.03                # HIGH-19 FIX: Was -0.20 (20% daily loss!) — 3% is standard
+    API_FAILURE_THRESHOLD: int = 5                    # HIGH-20 FIX: Was 5000 — circuit breaker never fired
     MIN_LIQUIDITY: int = 100000
     MAX_SECTOR_CONCENTRATION: float = 0.30
     MAX_TOTAL_RISK_PCT: float = 0.18                   # Was 0.15 — allow more total risk with better signals
@@ -86,6 +89,7 @@ class TradingBotConfig(BaseModel):
     MIN_CONFIDENCE: float = 0.72                       # Was 0.78 — take more trades with improved signal pipeline
     PORTFOLIO_SENTIMENT_WEIGHT: float = 0.25           # Was 0.35 — sentiment is noisy, reduce influence
     SENTIMENT_WEIGHT: float = 0.18                     # Was 0.25 — let PPO/stacking dominate more
+    PPO_SIGNAL_WEIGHT: float = 0.20                    # PPO's direct contribution to combined signal (rest is LightGBM ensemble)
     USE_LLM_DEBATE: bool = True
     LLM_DEBATE_WEIGHT: float = 0.6
     MIN_VOLATILITY: float = 0.005                      # Was 0.006 — trade in calmer conditions
@@ -109,48 +113,56 @@ class TradingBotConfig(BaseModel):
     REGIME_SHORT_LOOKBACK: int = 96
     REGIME_SHORT_WEIGHT: float = 0.55                  # Was 0.6 — slightly more long-term bias
     REGIME_CONFIDENCE_MIN_SIZE_PCT: float = 0.45       # Was 0.3 — more engaged on marginal regimes
+    REGIME_OVERRIDE_PERSISTENCE: float = 0.80          # Block counter-trend entries above this persistence
     # ==================== Multi-Regime Filters ====================
     MOM_THRESHOLD_TRENDING: float = 0.015
     MOM_THRESHOLD_MEAN_REVERTING: float = 0.03
     BREAKOUT_BOOST_FACTOR: float = 1.2
     # ==================== Model Training (Stacking + PPO) ====================
-    PPO_TIMESTEPS: int = 200_000                       # More training for proper GTrXL convergence
+    PPO_TIMESTEPS: int = 200_000                       # Per-symbol PPO training budget
     PPO_RECURRENT: bool = True
     USE_CUSTOM_GTRXL: bool = True
     GTRXL_HIDDEN_SIZE: int = 256
-    GTRXL_NUM_LAYERS: int = 2                           # Was 4 — fewer layers = less sensitivity to weight changes
-    GTRXL_NUM_HEADS: int = 8                            # Was 16 — 256/8=32 dims per head (was 16, too small)
-    GTRXL_MEMORY_LENGTH: int = 64                       # XL memory: past hidden states per layer retained across chunks
-    GTRXL_EVAL_CHUNK_SIZE: int = 64                     # Chunk size for batched evaluate_actions (~64x speedup)
+    GTRXL_NUM_LAYERS: int = 2                           # 2 layers — stable for 53-dim obs
+    GTRXL_NUM_HEADS: int = 8                            # 256/8=32 dims per head — good attention resolution
+    GTRXL_MEMORY_LENGTH: int = 64                       # XL memory length per layer
+    GTRXL_EVAL_CHUNK_SIZE: int = 64                     # Chunk size for batched evaluate_actions
     PPO_LSTM_HIDDEN_SIZE: int = 512
     PPO_N_LSTM_LAYERS: int = 4
-    PPO_LEARNING_RATE: float = 8e-5
-    PPO_LEARNING_RATE_MIN: float = 5e-6
-    PPO_ONLINE_LEARNING_RATE: float = 3e-5
-    PPO_ENTROPY_COEFF: float = 0.02                    # Was 0.03 — less exploration, more exploitation of learned policy
-    PPO_GAMMA: float = 0.97
-    PPO_GAE_LAMBDA: float = 0.93
-    PPO_CLIP_RANGE: float = 0.15                       # Was 0.18 — tighter updates for stable policy
-    PPO_OVERRIDE_CONF: float = 0.85                    # Was 0.90 — slightly more conservative PPO override
-    vf_coef: float = 1.0                               # Critic needs equal weight with GTrXL architecture
+    # === Learning rate: linear warmup then constant — cosine decayed too fast, killing learning in back half ===
+    PPO_LEARNING_RATE: float = 2.5e-5                  # Was 3e-5 — slightly lower for stability; held constant after warmup
+    PPO_LEARNING_RATE_MIN: float = 1.5e-5              # Was 5e-6 — higher floor keeps policy learning throughout training
+    PPO_LR_WARMUP_FRAC: float = 0.05                   # Warmup first 5% of training (ramp 0 → PPO_LEARNING_RATE)
+    PPO_ONLINE_LEARNING_RATE: float = 1.5e-5           # Online must be gentler than initial training
+    # === Entropy: slightly more exploration to avoid premature convergence ===
+    PPO_ENTROPY_COEFF: float = 0.015                   # Was 0.01 — policy converged too fast then couldn't escape suboptimal plateau
+    # === Discount + GAE: tuned for 15min bars, ~6.5h trading day ===
+    PPO_GAMMA: float = 0.995                           # Was 0.97 — higher gamma for longer horizon (2048-step episodes need longer credit assignment)
+    PPO_GAE_LAMBDA: float = 0.95                       # Was 0.93 — smoother advantage estimation reduces variance
+    # === Clipping: tighter to prevent the runaway updates we saw ===
+    PPO_CLIP_RANGE: float = 0.12                       # Was 0.15 — tighter clip keeps policy updates conservative
+    PPO_OVERRIDE_CONF: float = 0.85
+    VF_COEF: float = 0.75                              # Was 0.5 — critic needs more gradient to fit 8-asset reward surface (explained_var was ~0.35)
     RISK_PENALTY_COEF: float = 0.10
-    VOL_PENALTY_COEF: float = 0.02                     # Moderate vol penalty — discourages erratic sizing
-    DD_PENALTY_COEF: float = 2.0                       # Stronger DD penalty — teach risk management from fresh start
+    # === Reward shaping: lighter penalties so profitable actions dominate the signal ===
+    VOL_PENALTY_COEF: float = 0.01                     # Was 0.02 — too heavy kills profitable vol strategies
+    DD_PENALTY_COEF: float = 1.0                       # Was 2.0 — DD penalty was 2x the base return, drowning profit signal
     PPO_AUX_TASK: bool = True
-    PPO_AUX_LOSS_WEIGHT: float = 0.25                  # Was 0.2 — slightly stronger aux signal
-    NUM_BASE_MODELS: int = 20                          # Was 15 — larger ensemble for better stacking
-    PPO_ONLINE_UPDATE_TIMESTEPS: int = 75_000          # Was 100k — faster online adaptation
-    PPO_MAX_GRAD_NORM: float = 0.4                     # Slightly tighter for GTrXL gradient stability
-    PPO_N_STEPS: int = 2048                            # Rollout buffer — full episodes fit within
-    PPO_BATCH_SIZE: int = 256                          # Larger batches = more stable gradients for transformer
-    PPO_N_EPOCHS: int = 4                              # More epochs to extract value from each rollout
-    MAX_EPISODE_STEPS: int = 2048                      # Truncate portfolio episodes so they complete within rollouts
+    PPO_AUX_LOSS_WEIGHT: float = 0.10                  # Was 0.25 — aux loss is a known no-op (SB3 buffer lacks infos); minimize interference
+    LABEL_HORIZON_BARS: int = 8                        # Forward return horizon for LightGBM labels (matches MIN_HOLD_BARS_TRENDING)
+    NUM_BASE_MODELS: int = 20                          # LightGBM ensemble size
+    PPO_ONLINE_UPDATE_TIMESTEPS: int = 75_000
+    PPO_MAX_GRAD_NORM: float = 0.5                     # Was 0.4 — slightly relaxed (LR reduction already tames gradients)
+    PPO_N_STEPS: int = 2048                            # 1 full episode per rollout
+    PPO_BATCH_SIZE: int = 512                          # Was 256 — larger minibatches = lower gradient variance for transformers
+    PPO_N_EPOCHS: int = 3                              # Was 4 — fewer passes reduces overfitting to single rollout (was causing high clip_fraction)
+    MAX_EPISODE_STEPS: int = 2048                      # Full episode length
     # ==================== PORTFOLIO-LEVEL PPO ====================
     PORTFOLIO_PPO: bool = True
-    MAX_LEVERAGE: float = 2.0                          # Was 2.15 — slightly more conservative
-    PORTFOLIO_TIMESTEPS: int = 500_000                  # Reduced for faster startup — nightly online updates continue learning
-    PORTFOLIO_ONLINE_TIMESTEPS: int = 75_000           # Was 100k — faster online updates
-    ONLINE_PPO_UPDATE_HOURS: int = 4                   # Was 6 — more frequent adaptation
+    MAX_LEVERAGE: float = 2.0
+    PORTFOLIO_TIMESTEPS: int = 500_000                  # Full training budget — ~244 episodes
+    PORTFOLIO_ONLINE_TIMESTEPS: int = 75_000
+    ONLINE_PPO_UPDATE_HOURS: int = 4
     LIGHTGBM_PARAMS: Dict[str, Any] = Field(
         default_factory=lambda: {
             'objective': 'binary',
@@ -168,15 +180,25 @@ class TradingBotConfig(BaseModel):
     )
     # ==================== Advanced Feature Encoding (TFT) ====================
     USE_TFT_ENCODER: bool = True
+    TFT_HIDDEN_SIZE: int = 32
+    TFT_ATTENTION_HEADS: int = 4
+    TFT_DROPOUT: float = 0.1
+    TFT_HIDDEN_CONTINUOUS_SIZE: int = 16
+    TFT_MAX_EPOCHS: int = 15
+    TFT_FEATURE_DIM: int = 20                              # Encoder output features extracted per bar
+    TFT_MAX_ENCODER_LENGTH: int = 200                      # Max lookback for TFT encoder window
+    TFT_MAX_PREDICTION_LENGTH: int = 24                    # ~1 trading day of 15min bars
+    TFT_LEARNING_RATE: float = 1e-3
+    TFT_PERSIST_WEIGHTS: bool = True                       # Save/reload model weights across cache cycles
     # ==================== Walk-Forward Threshold Optimization ====================
     OPTUNA_TRIALS: int = 500
     OPTUNA_TIMEOUT: int = 900
     THRESHOLD_PENALTY_WEIGHT: float = 0.50
     # ==================== Reward Shaping (env.py / portfolio_env.py) ====================
-    TURNOVER_COST_MULT: float = 0.05                   # Was 0.3 but turnover was bugged (always 0) — introduce gradually
-    SORTINO_WEIGHT: float = 0.25                       # Stronger Sortino emphasis for risk-adjusted returns
-    SORTINO_ZERO_DD_BONUS: float = 0.02                # Small bonus for no-drawdown steps
-    PERSISTENCE_BONUS_SCALE: float = 0.15              # Low — avoid reward noise from persistence signal
+    TURNOVER_COST_MULT: float = 0.03                   # Was 0.05 — lighter turnover penalty lets policy rebalance freely
+    SORTINO_WEIGHT: float = 0.30                       # Was 0.25 — stronger Sortino drives Sharpe-optimal behavior
+    SORTINO_ZERO_DD_BONUS: float = 0.03                # Was 0.02 — reward no-drawdown periods more
+    PERSISTENCE_BONUS_SCALE: float = 0.10              # Was 0.15 — reduced since it's now action-dependent (earned, not free)
     CURRENT_REGIME: str = 'mean_reverting'
     # ==================== Operational & Misc ====================
     TRADING_INTERVAL: int = 45                         # Was 60 — faster reaction to market opportunities
@@ -192,7 +214,7 @@ class TradingBotConfig(BaseModel):
     USE_LOCAL_TICKDB: bool = True
     TICKDB_ENGINE: str = 'arcticdb'
     USE_TENSORBOARD: bool = True
-    BACKTEST_DEBUG: bool = True
+    BACKTEST_DEBUG: bool = False
     LOG_LEVEL: str = 'INFO'
     RUN_BACKTEST_ON_STARTUP: bool = False
     FORCE_PPO_RETRAIN: bool = False                    # Set True to force full retrain (PPO already trained with new params)
@@ -205,14 +227,13 @@ class TradingBotConfig(BaseModel):
     NEWS_LOOKBACK_DAYS: int = 10
     # ==================== Causal RL Settings ====================
     USE_CAUSAL_RL: bool = True
-    CAUSAL_DISCOVERY_METHOD: str = 'pc'
+    CAUSAL_DISCOVERY_METHOD: str = 'ges'  # FIX #43: Changed from 'pc' to match actual GES implementation
     CAUSAL_LLM_REFINEMENT: bool = True
     CAUSAL_PENALTY_WEIGHT: float = 0.40                # Was 0.34 — stronger causal influence
     CAUSAL_REWARD_FACTOR: float = 0.7                  # NEW — was hardcoded 0.5 in env.py
-    CAUSAL_EDGE_THRESHOLD: float = 0.30                # Was 0.35 — discover more edges
-    COUNTERFACTUAL_SAMPLES: int = 8                    # Was 5 — more robust estimates
+    # L33: CAUSAL_EDGE_THRESHOLD and COUNTERFACTUAL_SAMPLES removed (dead code, never read by GES fast-path)
     # ==================== Multi-Agent RL Settings ====================
-    USE_MULTI_AGENT: bool = True
+    USE_MULTI_AGENT: bool = False  # M55 FIX: Feature is dead code (not imported anywhere) — disabled
     AGENT_HIERARCHY: str = 'regime-signal-execution'
     SIGNAL_AGENTS_MODE: str = 'per_symbol'
     USE_AGENT_DEBATE: bool = True
@@ -236,7 +257,17 @@ class TradingBotConfig(BaseModel):
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty
     STREAM_RECONNECT_DELAY_SEC: int = 5                  # Websocket reconnect delay
+
+    @model_validator(mode='after')
+    def _symbols_subset_of_universe(self):
+        missing = set(self.SYMBOLS) - set(self.UNIVERSE_CANDIDATES)
+        if missing:
+            raise ValueError(f"SYMBOLS contains tickers not in UNIVERSE_CANDIDATES: {missing}")
+        return self
 # ==================== Apply Validation ====================
+# NOTE: CONFIG is a plain dict after this point. Direct mutations (e.g. from Gemini tuner)
+# bypass Pydantic validation. The Gemini tuner validates via staged_changes + ABSOLUTE_BOUNDS
+# after applying changes. Any other CONFIG mutators should re-validate similarly.
 settings = TradingBotConfig.model_validate(CONFIG)
 CONFIG.update(settings.model_dump())
 print("✅ Pydantic validation passed — CONFIG is now fully type-safe")

@@ -72,6 +72,25 @@ async def main():
                     print(f"[TFT CACHE CLEANUP] Deleted old cache file: {f}")
             except Exception as e:
                 print(f"[TFT CACHE CLEANUP] Failed to delete {f}: {e}")
+    # Cleanup old tensorboard logs (keep only the latest run per directory)
+    for tb_dir in glob.glob("ppo_tensorboard/*/"):
+        runs = sorted(glob.glob(os.path.join(tb_dir, "RecurrentPPO_*")), key=os.path.getmtime)
+        if len(runs) > 1:
+            for old_run in runs[:-1]:
+                try:
+                    shutil.rmtree(old_run)
+                    print(f"[TB CLEANUP] Deleted old tensorboard run: {old_run}")
+                except Exception as e:
+                    print(f"[TB CLEANUP] Failed to delete {old_run}: {e}")
+    # Cleanup old log files (keep last 7 days)
+    log_cutoff = datetime.now() - timedelta(days=7)
+    for log_file in glob.glob("logs/*.log*"):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(log_file)) < log_cutoff:
+                os.remove(log_file)
+                print(f"[LOG CLEANUP] Deleted old log: {log_file}")
+        except Exception:
+            pass
     # Extra memory cleanup at startup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

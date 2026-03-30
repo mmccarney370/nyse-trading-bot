@@ -27,7 +27,7 @@ from models.bot_initializer import BotInitializer # ← NEW IMPORT (Phase 3)
 from models.causal_signal_manager import CausalSignalManager # ← NEW: Phase 1 modularization
 from backtest import Backtester
 from utils.helpers import is_market_open, time_until_next_open # ← UPDATED IMPORT (Bug #1 fix)
-from strategy.regime import detect_regime
+from strategy.regime import detect_regime, is_trending
 from strategy.universe import UniverseManager
 from gemini_tuner import query_gemini_for_tuning, load_dynamic_config
 from models.features import generate_features
@@ -35,6 +35,9 @@ from models.portfolio_env import PortfolioEnv # B-12: required for real portfoli
 # NEW IMPORT FOR SHUTDOWN FIX (matches exactly how GetOrdersRequest is used in alpaca.py)
 from alpaca.trading.requests import GetOrdersRequest
 # ─── CLEAN LOGGING SETUP (fixes double logging in nyse_bot.log) ───────────────────────────────
+# NOTE: This runs at import time (before __main__.py calls setup_logging()).
+# It configures the bot.py module logger specifically to prevent duplicate handlers.
+# setup_logging() in __main__.py configures the root logger for all other modules.
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 # Remove any existing handlers to prevent duplication
@@ -66,6 +69,8 @@ HISTORY_FILE = "live_signal_history.json"
 LAST_ENTRY_FILE = "last_entry_times.json"
 # NEW: Path for persistent portfolio causal ReplayBuffer (Bug #22 fix)
 PORTFOLIO_REPLAY_BUFFER_FILE = "portfolio_replay_buffer.json"
+# Path for persistent starting equity (survives restarts for accurate Gemini return_pct)
+STARTING_EQUITY_FILE = "starting_equity.json"
 # ==================== CONFIGURABLE SCHEDULE TIMES ====================
 GEMINI_HOUR = 3
 GEMINI_MINUTE = 30
@@ -120,28 +125,40 @@ class TradingBot:
         # === NEW: PortfolioRebalancer (Phase 1 extraction) ===
         self.rebalancer = PortfolioRebalancer(config, self.signal_gen, self.risk_manager)
         # === NEW: CausalRLManager (Phase 2 extraction) ===
-        self.causal_manager = CausalRLManager(self.signal_gen, self.config)
+        self.live_signal_history = {}
+        self._signal_history_lock = threading.Lock()  # protects live_signal_history mutations (shared with stream thread)
+        self.causal_manager = CausalRLManager(self.signal_gen, self.config, signal_history_lock=self._signal_history_lock)
         # === NEW: BotInitializer (Phase 3 extraction) ===
         self.initializer = BotInitializer(self)
         self.daily_equity = {}
         self.equity_history = {}
-        self.live_signal_history = {}
-        self._signal_history_max = 500  # max entries per symbol in memory
+        self._signal_history_max = 1000  # M50 FIX: Match disk cap (was 500 vs disk 1000)
+        # BUG-13 FIX: Instance-level latest_prices cache — must be initialized BEFORE sharing with SignalGenerator
+        self.latest_prices = {}
+        self._prices_lock = threading.Lock()  # H21 FIX: protects latest_prices from concurrent mutation
+        # BUG-12 FIX + ISSUE #6 PATCH: Persistent PortfolioEnv instance (created once, reused every cycle)
+        self.portfolio_env = None
+        # CRIT-1/2 FIX: Share live_signal_history and latest_prices with SignalGenerator
+        # so sync_daily_rewards(), _monitor_oos_decay(), and causal warmup operate on real data
+        self.signal_gen.live_signal_history = self.live_signal_history
+        self.signal_gen.latest_prices = self.latest_prices
         self.cycle_count = 0
         self.performance_check_interval = 10
         self.portfolio_ppo = config.get('PORTFOLIO_PPO', False)
         # ISSUE #5 FIX: Pass CONFIG to UniverseManager (required after universe.py update)
         self.universe_manager = UniverseManager(self.data_ingestion, self.live_signal_history, CONFIG)
         self.last_universe_update = datetime.now(tz=tz.gettz('America/New_York'))
-        # BUG-12 FIX + ISSUE #6 PATCH: Persistent PortfolioEnv instance (created once, reused every cycle)
-        self.portfolio_env = None
-        # BUG-13 FIX: Instance-level latest_prices cache (reused across trading_loop, gemini_scheduled_task, _monitor_oos_decay)
-        self.latest_prices = {}
     def _load_regime_cache(self):
         if os.path.exists(REGIME_CACHE_FILE):
             try:
                 with open(REGIME_CACHE_FILE, 'r') as f:
                     data = json.load(f)
+                # Validate types: ensure persistence values are float (JSON may deserialize as int)
+                for key, value in data.items():
+                    if isinstance(value, (list, tuple)) and len(value) == 2:
+                        data[key] = (value[0], float(value[1]))
+                    elif isinstance(value, str):
+                        data[key] = (value, 0.5)
                 logger.info(f"Loaded persistent regime cache with {len(data)} symbols")
                 return data
             except Exception as e:
@@ -153,41 +170,31 @@ class TradingBot:
             path = REGIME_CACHE_FILE
             dir_name = os.path.dirname(path) or '.'
             with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
-                json.dump(self.regime_cache, tmp, default=str)
+                json.dump(self.regime_cache, tmp, default=lambda x: float(x) if isinstance(x, (np.integer, np.floating)) else (x.tolist() if isinstance(x, np.ndarray) else str(x)))
                 tmp.flush()
                 os.fsync(tmp.fileno())
             shutil.move(tmp.name, path)
             logger.debug(f"[ATOMIC SAVE] Saved regime cache with {len(self.regime_cache)} symbols")
         except Exception as e:
             logger.warning(f"Failed to save regime cache: {e}")
-    def _save_last_entry_times(self):
-        """B-23: Save last_entry_times atomically (Priority 1 fix)"""
-        try:
-            serializable_entry_times = {sym: ts.isoformat() for sym, ts in self.broker.last_entry_times.items()}
-            path = LAST_ENTRY_FILE
-            dir_name = os.path.dirname(path) or '.'
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
-                json.dump(serializable_entry_times, tmp, indent=2)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            shutil.move(tmp.name, path)
-            logger.debug(f"[ATOMIC SAVE B-23] Saved {len(serializable_entry_times)} last_entry_times to disk")
-        except Exception as e:
-            logger.warning(f"[B-23] Failed atomic save LAST_ENTRY_FILE: {e}")
+    # FIX: _save_last_entry_times removed — use self.broker._save_last_entry_times() to avoid
+    # race condition with broker's own saves (both were writing to the same file)
     def _save_live_signal_history(self):
         """B-28: Save pruned live_signal_history atomically (Priority 1 fix)"""
         try:
-            serializable_history = {}
-            for sym, entries in self.live_signal_history.items():
-                serializable_entries = []
-                for entry in entries:
-                    serial_entry = entry.copy()
-                    if 'timestamp' in serial_entry and isinstance(serial_entry['timestamp'], datetime):
-                        serial_entry['timestamp'] = serial_entry['timestamp'].isoformat()
-                    serializable_entries.append(serial_entry)
-                # Keep last 1000 per symbol (consistent with shutdown cap)
-                serializable_history[sym] = serializable_entries[-1000:]
-    
+            # Snapshot under lock to avoid racing with stream thread mutations
+            with self._signal_history_lock:
+                serializable_history = {}
+                for sym, entries in self.live_signal_history.items():
+                    serializable_entries = []
+                    for entry in entries:
+                        serial_entry = entry.copy()
+                        if 'timestamp' in serial_entry and isinstance(serial_entry['timestamp'], datetime):
+                            serial_entry['timestamp'] = serial_entry['timestamp'].isoformat()
+                        serializable_entries.append(serial_entry)
+                    # Keep last 1000 per symbol (consistent with shutdown cap)
+                    serializable_history[sym] = serializable_entries[-1000:]
+
             path = HISTORY_FILE
             dir_name = os.path.dirname(path) or '.'
             with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
@@ -198,6 +205,32 @@ class TradingBot:
             logger.debug(f"[ATOMIC SAVE B-28] Saved pruned live_signal_history to disk ({sum(len(v) for v in serializable_history.values())} entries)")
         except Exception as e:
             logger.warning(f"[B-28] Failed atomic save live_signal_history: {e}")
+    def _load_starting_equity(self, fallback: float) -> float:
+        """Load persistent starting equity — survives restarts so Gemini return_pct is accurate."""
+        if os.path.exists(STARTING_EQUITY_FILE):
+            try:
+                with open(STARTING_EQUITY_FILE, 'r') as f:
+                    data = json.load(f)
+                return float(data.get('starting_equity', fallback))
+            except Exception:
+                pass
+        # First run — save current equity as starting point
+        self._save_starting_equity(fallback)
+        return fallback
+
+    def _save_starting_equity(self, equity: float):
+        """Save starting equity atomically."""
+        try:
+            path = STARTING_EQUITY_FILE
+            dir_name = os.path.dirname(path) or '.'
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
+                json.dump({'starting_equity': equity, 'saved_at': datetime.now(tz=tz.gettz('UTC')).isoformat()}, tmp)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            shutil.move(tmp.name, path)
+        except Exception as e:
+            logger.warning(f"Failed to save starting equity: {e}")
+
     def _emergency_save_all(self):
         """B-33: Centralized emergency save — now using atomic writes where possible"""
         saved = 0
@@ -207,7 +240,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"[B-33] Failed atomic save live_signal_history: {e}")
         try:
-            self._save_last_entry_times()
+            self.broker._save_last_entry_times()
             saved += 1
         except Exception as e:
             logger.error(f"[B-33] Failed atomic save last_entry_times: {e}")
@@ -261,7 +294,8 @@ class TradingBot:
             await asyncio.sleep(sleep_seconds)
             try:
                 logger.info("Running dynamic universe evaluation (Friday 8PM rotation)...")
-                new_symbols = self.universe_manager.evaluate_universe()
+                # HIGH-23 FIX: evaluate_universe() is blocking (34 symbols × 5 HMMs) — run in thread
+                new_symbols = await asyncio.to_thread(self.universe_manager.evaluate_universe)
                 if set(new_symbols) != set(self.config['SYMBOLS']):
                     await self._perform_universe_rotation(new_symbols)
                 else:
@@ -275,18 +309,25 @@ class TradingBot:
         self.config['SYMBOLS'] = new_symbols
         self.data_ingestion.symbols = new_symbols
         await asyncio.to_thread(self.data_ingestion.initialize_data)
-        self.live_signal_history = {s: self.live_signal_history.get(s, []) for s in new_symbols}
+        # CRIT-1 FIX: Mutate in-place to preserve shared reference with signal_gen
+        with self._signal_history_lock:
+            pruned_history = {s: self.live_signal_history.get(s, []) for s in new_symbols}
+            self.live_signal_history.clear()
+            self.live_signal_history.update(pruned_history)
         # B-24 FIX: Also prune last_entry_times and save file to prevent stale timestamps/bloat for removed symbols
         self.broker.last_entry_times = {s: self.broker.last_entry_times.get(s) for s in new_symbols if s in self.broker.last_entry_times}
-        self._save_last_entry_times()
+        await asyncio.to_thread(self.broker._save_last_entry_times)
         # B-26 FIX: Also prune regime_cache for removed symbols and save to prevent stale regimes
         with self._regime_lock:
             pruned = {s: self.regime_cache.get(s) for s in new_symbols if s in self.regime_cache}
             self.regime_cache.clear()
             self.regime_cache.update(pruned)
         self._save_regime_cache()
-        # BUG #16 PATCH: Also prune latest_prices for removed symbols to prevent stale prices + memory leak on rotation
-        self.latest_prices = {s: self.latest_prices.get(s) for s in new_symbols if s in self.latest_prices}
+        # H21 FIX: Protect latest_prices mutation with lock (shared with regime thread)
+        with self._prices_lock:
+            pruned_prices = {s: self.latest_prices.get(s) for s in new_symbols if s in self.latest_prices}
+            self.latest_prices.clear()
+            self.latest_prices.update(pruned_prices)
         # ISSUE #6 PATCH: Update persistent portfolio_env with new symbols' data (lightweight)
         if self.portfolio_env is not None:
             self.portfolio_env.data_dict = {sym: self.data_ingestion.get_latest_data(sym, timeframe='15Min') for sym in new_symbols}
@@ -294,7 +335,8 @@ class TradingBot:
         logger.info("Starting full retrain on new universe...")
         await asyncio.to_thread(self.trainer.train_symbols_parallel, new_symbols, True)
         # BUG #19 PATCH: Rebuild causal wrappers for the new universe (new symbols must get causal graph + ReplayBuffer)
-        if CONFIG.get('USE_CAUSAL_RL', False):
+        # M53 FIX: Use self.config consistently (CONFIG is the module-level dict, self.config is the instance ref)
+        if self.config.get('USE_CAUSAL_RL', False):
             await asyncio.to_thread(self.signal_gen.refresh_causal_wrappers)
             logger.info("Causal wrappers refreshed for new universe symbols after rotation")
             # C-3 SAFETY: Ensure graphs are ready right after refresh/warmup
@@ -324,12 +366,13 @@ class TradingBot:
     async def trading_loop(self):
         while True:
             if not is_market_open():
-                sleep_seconds = self.time_until_market_open()
+                sleep_seconds = max(self.time_until_market_open(), 60)
                 logger.info(f"Market closed — sleeping {sleep_seconds / 3600:.1f} hours until next open")
                 await asyncio.sleep(sleep_seconds)
                 continue
             current_equity = await asyncio.to_thread(self.broker.get_equity)
-            today = datetime.now(tz=tz.gettz('UTC')).date()
+            # FIX #4: Use ET timezone for daily equity key — NYSE operates on ET
+            today = datetime.now(tz=tz.gettz('America/New_York')).date()
             if today not in self.daily_equity:
                 self.daily_equity[today] = current_equity
             self.equity_history[today] = current_equity
@@ -363,11 +406,18 @@ class TradingBot:
                             data_dict[sym] = df
                             prices[sym] = df['close'].iloc[-1]
                     # BUG-13 FIX: Update persistent instance cache so gemini_scheduled_task / _monitor_oos_decay can reuse it
-                    self.latest_prices = prices.copy()
-                    if len(data_dict) < len(self.config['SYMBOLS']):
-                        logger.warning("Some symbols lack sufficient data — skipping portfolio inference")
+                    # CRIT-2 FIX: Mutate in-place to preserve shared reference with signal_gen
+                    # CRIT-4 FIX: Atomic update under lock — clear+update was racy (other threads see empty dict)
+                    with self._signal_history_lock:
+                        self.latest_prices.clear()
+                        self.latest_prices.update(prices)
+                    if len(data_dict) < 2:
+                        logger.warning(f"Only {len(data_dict)} symbol(s) have sufficient data — need at least 2, skipping portfolio inference")
                         await asyncio.sleep(self.config['TRADING_INTERVAL'])
                         continue
+                    if len(data_dict) < len(self.config['SYMBOLS']):
+                        missing = set(self.config['SYMBOLS']) - set(data_dict.keys())
+                        logger.info(f"Proceeding with {len(data_dict)}/{len(self.config['SYMBOLS'])} symbols (excluded {missing} — insufficient bars)")
                     # C-3 SAFETY: Ensure portfolio causal graph is ready before rebalance/inference
                     if self.signal_gen.portfolio_causal_manager:
                         self.signal_gen.portfolio_causal_manager._ensure_graph_exists()
@@ -393,35 +443,52 @@ class TradingBot:
                             continue
                         raw_qty = (target_weight * current_equity) / price
                         # Use fractional shares if enabled, otherwise truncate to int
-                        if self.config.get('FRACTIONAL_SHARES', False):
+                        if self.config.get('FRACTIONAL_SHARES', True):
                             target_qty = round(raw_qty, 4)  # Alpaca supports up to 9 decimals
                         else:
                             target_qty = int(raw_qty)
                         current_qty = positions.get(sym, 0)
+                        # CRIT-9 FIX: Treat dust positions (< 0.01 shares) as zero — partial fills
+                        # or fractional close can leave tiny remnants that block new entries.
+                        dust_threshold = self.config.get('DUST_THRESHOLD', 0.01)
+                        if abs(current_qty) < dust_threshold:
+                            current_qty = 0
                         direction = 1 if target_qty > 0 else (-1 if target_qty < 0 else 0)
-                        target_qty = abs(target_qty) * direction
                         # === MIN-HOLD CHECK (Gemini-tuned, consistent with signals.py) ===
+                        # Only enforce min-hold when we HAVE a position — no position means no hold to enforce
                         last_entry = self.broker.last_entry_times.get(sym)
-                        if last_entry:
-                            bars_since = (datetime.now(tz=tz.gettz('UTC')) - last_entry) / pd.Timedelta(minutes=15)
+                        if last_entry and current_qty != 0:
+                            # FIX #24: Market-hours-aware bars_since (26 fifteen-min bars per trading day)
+                            elapsed = datetime.now(tz=tz.gettz('UTC')) - last_entry
+                            elapsed_days = elapsed.total_seconds() / 86400
+                            if elapsed_days <= 1:
+                                bars_since = elapsed / pd.Timedelta(minutes=15)
+                            else:
+                                full_days = int(elapsed_days)
+                                partial_frac = elapsed_days - full_days
+                                bars_since = full_days * 26 + partial_frac * 26
                             regime = regimes.get(sym, ('mean_reverting', 0.5))
                             # Defensive tuple unpack for regime
                             if isinstance(regime, (list, tuple)):
                                 regime = regime[0]
                             # FIX: Add fallback defaults — config.get() returns None if key missing, causing TypeError on < comparison
-                            if regime == 'trending':
+                            if is_trending(regime):
                                 min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 6)
                             else:
                                 min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
                             if bars_since < min_hold:
-                                if abs(target_qty) != abs(current_qty) or np.sign(target_qty) != np.sign(current_qty):
+                                # HIGH-1 FIX: Use tolerance-based float comparison instead of exact equality
+                                # and only block direction changes, not size adjustments
+                                qty_diff = abs(abs(target_qty) - abs(current_qty))
+                                same_direction = np.sign(target_qty) == np.sign(current_qty)
+                                if not same_direction or qty_diff > max(0.01, abs(current_qty) * 0.05):
                                     logger.debug(f"MIN-HOLD ACTIVE {sym} → skipping rebalance (Gemini-tuned {min_hold} bars)")
                                     continue
                         # Respect existing positions
                         if abs(current_qty) > 0 and np.sign(current_qty) == np.sign(target_qty) and abs(target_qty) > 0:
                             logger.debug(f"{sym} already has position in correct direction — skipping new bracket")
                             continue
-                        if (current_qty * direction <= 0 and current_qty != 0) or target_qty == 0:
+                        if (current_qty * direction <= 0 and current_qty != 0) or (target_qty == 0 and current_qty != 0):
                             try:
                                 # B-02 / B-10 FIX: Use safe async method (awaited) instead of raw client.close_position
                                 # C-2 NOTE: If you ever refactor this to use risk_manager.safe_close_position,
@@ -431,24 +498,29 @@ class TradingBot:
                                 success = await self.broker.close_position_safely(sym)
                                 if success:
                                     logger.info(f"PORTFOLIO PPO SAFE CLOSE {sym} completed")
-                                    # Clean up tracker group so symbol can be re-entered
-                                    self.broker.tracker.mark_closed(sym)
-                                    self.broker.tracker.remove_group(sym)
-                                    logger.debug(f"[TRACKER CLEANUP] Removed tracker group for {sym} after safe close")
+                                    # Update local qty so the entry block below doesn't use stale value
+                                    current_qty = 0
+                                    if self.broker.tracker.groups.get(sym):
+                                        self.broker.tracker.mark_closed(sym)
+                                        self.broker.tracker.remove_group(sym)
+                                        logger.debug(f"[TRACKER CLEANUP] Removed tracker group for {sym} after safe close")
                                 else:
                                     logger.error(f"PORTFOLIO PPO SAFE CLOSE {sym} failed")
-                                # B-22 FIX: Clear timestamp when position is closed so min-hold resets for next signal
+                                    continue  # Don't attempt entry if close failed
                                 if sym in self.broker.last_entry_times:
                                     del self.broker.last_entry_times[sym]
                                     logger.debug(f"[B-22] Cleared last_entry_time for closed {sym}")
-                                    self._save_last_entry_times() # B-23: immediate save after clear
+                                    await asyncio.to_thread(self.broker._save_last_entry_times)
                             except Exception as e:
                                 logger.error(f"Failed to safely close {sym}: {e}")
-                        min_qty = 0.01 if self.config.get('FRACTIONAL_SHARES', False) else 1
+                                continue  # Don't attempt entry if close raised
+                        min_qty = 0.01 if self.config.get('FRACTIONAL_SHARES', True) else 1
                         if target_qty != 0 and current_qty * direction <= 0 and abs(target_qty) >= min_qty:
-                            # MAX_POSITIONS enforcement: skip new entries when at capacity
-                            if len(self.broker.existing_positions) >= self.config.get('MAX_POSITIONS', 6):
-                                logger.info(f"Max positions reached ({len(self.broker.existing_positions)}/{self.config.get('MAX_POSITIONS', 6)}) — skipping entry for {sym}")
+                            # H22 FIX: Read existing_positions under lock to prevent race with sync thread
+                            with self.broker._positions_lock:
+                                n_positions = len(self.broker.existing_positions)
+                            if n_positions >= self.config.get('MAX_POSITIONS', 5):
+                                logger.info(f"Max positions reached ({n_positions}/{self.config.get('MAX_POSITIONS', 5)}) — skipping entry for {sym}")
                                 continue
                             size = abs(target_qty)
                             regime = regimes.get(sym, ('mean_reverting', 0.5))
@@ -456,10 +528,13 @@ class TradingBot:
                             if isinstance(regime, (list, tuple)):
                                 regime = regime[0]
                             # ====================== BUG #1 FIX START ======================
-                            # Define the missing variables that were only present in the else branch
-                            confidence = target_weights_dict.get(sym, 0.0)
-                            ppo_strength = abs(confidence)
-                            conviction = confidence
+                            # HIGH-2 FIX: confidence should be the PPO signal strength (0-1), not the portfolio weight.
+                            # target_weights_dict contains allocation weights (e.g. 0.15), not signal confidence.
+                            # Use abs(weight) normalized to 0-1 range as a proxy for PPO confidence.
+                            raw_weight = target_weights_dict.get(sym, 0.0)
+                            ppo_strength = min(1.0, abs(raw_weight) / max(0.01, max(abs(w) for w in target_weights_dict.values())))
+                            confidence = ppo_strength
+                            conviction = ppo_strength
                             # ====================== BUG #1 FIX END ======================
                             # M-5 FIX: Cap size by real-time buying power before placing order
                             buying_power = await asyncio.to_thread(self.broker.get_buying_power)
@@ -488,24 +563,27 @@ class TradingBot:
                                 # ====================== BUG #1 FIX (symbol → sym) ======================
                                 self.broker.last_entry_times[sym] = datetime.now(tz=tz.gettz('UTC'))
                                 # B-32 FIX: Store original observation for accurate causal reward push later
-                                features = generate_features(data_dict[sym], regime, sym, data_dict[sym])
+                                # FIX #6: Pass full history from data_ingestion as full_hist_df (not windowed slice)
+                                full_hist = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
+                                features = await asyncio.to_thread(generate_features, data_dict[sym], regime, sym, full_hist)
                                 obs_for_storage = features[-1:].astype(np.float32).flatten().tolist() if features is not None and features.shape[0] > 0 else []
-                                hist = self.live_signal_history.setdefault(sym, [])
-                                hist.append({
-                                    'timestamp': datetime.now(tz=tz.gettz('UTC')),
-                                    'direction': direction,
-                                    'price': price,
-                                    'confidence': confidence,
-                                    'ppo_strength': ppo_strength,
-                                    'conviction': conviction,
-                                    'realized_return': None,
-                                    'size': size, # B-15: store entry size for accurate dollar P&L later
-                                    'obs': obs_for_storage # ← BUG-2 FIX
-                                })
-                                if len(hist) > self._signal_history_max:
-                                    self.live_signal_history[sym] = hist[-self._signal_history_max:]
-                                self._save_last_entry_times() # B-23: immediate save after new entry
-                                self._save_live_signal_history() # FIX: persist signal history immediately (was only saved on emergency shutdown)
+                                with self._signal_history_lock:
+                                    hist = self.live_signal_history.setdefault(sym, [])
+                                    hist.append({
+                                        'timestamp': datetime.now(tz=tz.gettz('UTC')),
+                                        'direction': direction,
+                                        'price': price,
+                                        'confidence': confidence,
+                                        'ppo_strength': ppo_strength,
+                                        'conviction': conviction,
+                                        'realized_return': None,
+                                        'size': size, # B-15: store entry size for accurate dollar P&L later
+                                        'obs': obs_for_storage # ← BUG-2 FIX
+                                    })
+                                    if len(hist) > self._signal_history_max:
+                                        self.live_signal_history[sym] = hist[-self._signal_history_max:]
+                                await asyncio.to_thread(self.broker._save_last_entry_times) # B-23: immediate save after new entry
+                                await asyncio.to_thread(self._save_live_signal_history) # FIX: persist signal history off async loop
                 except Exception as e:
                     logger.error(f"Portfolio PPO inference/rebalance failed: {e}", exc_info=True)
             else:
@@ -528,7 +606,9 @@ class TradingBot:
                     )
                     # B-09 FIX: Populate ReplayBuffer with real transition for causal RL
                     if symbol in self.signal_gen.causal_manager and self.signal_gen.causal_manager[symbol] is not None: # ← UPDATED for Phase 1
-                        features = generate_features(signal_data, regime, symbol, signal_data)
+                        # FIX #6: Pass full history from data_ingestion as full_hist_df (not windowed slice)
+                        full_hist = self.data_ingestion.get_latest_data(symbol, timeframe='15Min')
+                        features = await asyncio.to_thread(generate_features, signal_data, regime, symbol, full_hist)
                         if features is not None and features.shape[0] > 0:
                             obs = features[-1:].astype(np.float32).reshape(1, -1)
                             action_for_buffer = direction * confidence # signed final action
@@ -538,15 +618,19 @@ class TradingBot:
                     conviction = np.clip(conviction, 0.0, 1.0)
                     # FIX: Block shorts in strong trending regimes
                     regime_override_threshold = self.config.get('REGIME_OVERRIDE_PERSISTENCE', 0.80)
-                    if direction == -1 and regime == 'trending' and persistence >= regime_override_threshold:
+                    if direction == -1 and is_trending(regime) and persistence >= regime_override_threshold:
                         logger.warning(f"[REGIME OVERRIDE] {symbol} SHORT blocked — strong trending regime "
                                        f"(persistence={persistence:.3f})")
                         direction = 0
                     if direction != 0 and prev_direction == 0:
                         # MAX_POSITIONS enforcement: skip new entries when at capacity
-                        if len(self.broker.existing_positions) >= self.config.get('MAX_POSITIONS', 6):
-                            logger.info(f"Max positions reached ({len(self.broker.existing_positions)}/{self.config.get('MAX_POSITIONS', 6)}) — skipping entry for {symbol}")
+                        if len(self.broker.existing_positions) >= self.config.get('MAX_POSITIONS', 5):
+                            logger.info(f"Max positions reached ({len(self.broker.existing_positions)}/{self.config.get('MAX_POSITIONS', 5)}) — skipping entry for {symbol}")
                             continue
+                        # CRIT-7 FIX: Pre-fetch buying power and cache on risk_manager
+                        # so calculate_position_size doesn't make a blocking sync API call
+                        buying_power = await asyncio.to_thread(self.broker.get_buying_power)
+                        self.risk_manager._cached_buying_power = buying_power
                         size = self.risk_manager.calculate_position_size(
                             equity=current_equity,
                             price=price,
@@ -556,9 +640,10 @@ class TradingBot:
                             regime=regime,
                             persistence=persistence # ← NEW: pass regime confidence for dynamic sizing
                         )
-                        if size >= 1:
+                        # FIX: If fractional shares enabled, allow sizes as small as 0.01 (Alpaca minimum)
+                        min_size = 0.01 if self.config.get('FRACTIONAL_SHARES', True) else 1
+                        if size >= min_size:
                             # M-5 FIX: Cap size by real-time buying power before placing order
-                            buying_power = await asyncio.to_thread(self.broker.get_buying_power)
                             safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
                             if self.config.get('FRACTIONAL_SHARES', True):
                                 max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
@@ -583,45 +668,52 @@ class TradingBot:
                                 logger.info(f"Entered {'LONG' if direction > 0 else 'SHORT'} {symbol} {size} shares (regime {regime})")
                                 self.broker.last_entry_times[symbol] = datetime.now(tz=tz.gettz('UTC'))
                                 # B-32 FIX: Store original observation for accurate causal reward push later
-                                features = generate_features(signal_data, regime, symbol, signal_data)
+                                # FIX #6: Pass full history from data_ingestion as full_hist_df (not windowed slice)
+                                full_hist = self.data_ingestion.get_latest_data(symbol, timeframe='15Min')
+                                features = await asyncio.to_thread(generate_features, signal_data, regime, symbol, full_hist)
                                 obs_for_storage = features[-1:].astype(np.float32).flatten().tolist() if features is not None and features.shape[0] > 0 else []
-                                hist = self.live_signal_history.setdefault(symbol, [])
-                                hist.append({
-                                    'timestamp': datetime.now(tz=tz.gettz('UTC')),
-                                    'direction': direction,
-                                    'price': price,
-                                    'confidence': confidence,
-                                    'ppo_strength': ppo_strength,
-                                    'conviction': conviction,
-                                    'realized_return': None,
-                                    'size': size, # B-15: store entry size for accurate dollar P&L later
-                                    'obs': obs_for_storage # ← BUG-2 FIX
-                                })
-                                if len(hist) > self._signal_history_max:
-                                    self.live_signal_history[symbol] = hist[-self._signal_history_max:]
-                                self._save_last_entry_times() # B-23: immediate save after new entry
-                                self._save_live_signal_history() # FIX: persist signal history immediately (was only saved on emergency shutdown)
-                    if direction == 0 and symbol in positions and positions[symbol] != 0:
+                                with self._signal_history_lock:
+                                    hist = self.live_signal_history.setdefault(symbol, [])
+                                    hist.append({
+                                        'timestamp': datetime.now(tz=tz.gettz('UTC')),
+                                        'direction': direction,
+                                        'price': price,
+                                        'confidence': confidence,
+                                        'ppo_strength': ppo_strength,
+                                        'conviction': conviction,
+                                        'realized_return': None,
+                                        'size': size, # B-15: store entry size for accurate dollar P&L later
+                                        'obs': obs_for_storage # ← BUG-2 FIX
+                                    })
+                                    if len(hist) > self._signal_history_max:
+                                        self.live_signal_history[symbol] = hist[-self._signal_history_max:]
+                                await asyncio.to_thread(self.broker._save_last_entry_times) # B-23: immediate save after new entry
+                                await asyncio.to_thread(self._save_live_signal_history) # FIX: persist signal history off async loop
+                    # HIGH-4 FIX: Close on flat signal OR signal reversal (e.g. long→short)
+                    # direction==0 means flat; direction*current_qty<0 means reversal
+                    current_pos = positions.get(symbol, 0)
+                    should_close = (
+                        (direction == 0 and current_pos != 0) or
+                        (direction != 0 and current_pos != 0 and direction * current_pos < 0)
+                    )
+                    if should_close:
+                        close_reason = "flat signal" if direction == 0 else f"signal reversal ({'long→short' if current_pos > 0 else 'short→long'})"
                         try:
-                            # B-02 / B-10 FIX: Use safe async method (awaited) instead of raw client.close_position
-                            # C-2 NOTE: This is the direct broker call — correct with await.
-                            # If you ever switch to risk_manager.safe_close_position, use:
-                            # success = await self.safe_close_via_manager(symbol)
-                            logger.debug(f"Preparing safe close for {symbol} (awaiting close_position_safely)")
+                            logger.debug(f"Preparing safe close for {symbol} ({close_reason}, awaiting close_position_safely)")
                             success = await self.broker.close_position_safely(symbol)
                             if success:
-                                logger.info(f"Closed position in {symbol} (flat signal) — safe close completed")
-                                # Clean up tracker group so symbol can be re-entered
-                                self.broker.tracker.mark_closed(symbol)
-                                self.broker.tracker.remove_group(symbol)
-                                logger.debug(f"[TRACKER CLEANUP] Removed tracker group for {symbol} after safe close")
+                                logger.info(f"Closed position in {symbol} ({close_reason}) — safe close completed")
+                                if self.broker.tracker.groups.get(symbol):
+                                    self.broker.tracker.mark_closed(symbol)
+                                    self.broker.tracker.remove_group(symbol)
+                                    logger.debug(f"[TRACKER CLEANUP] Removed tracker group for {symbol} after safe close")
                             else:
                                 logger.error(f"Safe close failed for {symbol} — position may still be open")
                             # B-22 FIX: Clear timestamp when position is closed so min-hold resets for next signal
                             if symbol in self.broker.last_entry_times:
                                 del self.broker.last_entry_times[symbol]
                                 logger.debug(f"[B-22] Cleared last_entry_time for closed {symbol}")
-                                self._save_last_entry_times() # B-23: immediate save after clear
+                                await asyncio.to_thread(self.broker._save_last_entry_times)
                         except Exception as e:
                             logger.error(f"Failed to safely close position in {symbol}: {e}")
             self.cycle_count += 1
@@ -640,7 +732,7 @@ class TradingBot:
                 data_dict=data_dict,
                 symbols=self.config['SYMBOLS'],
                 initial_balance=await asyncio.to_thread(self.broker.get_equity),
-                max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
+                max_leverage=self.config.get('MAX_LEVERAGE', 2.0)
             )
             logger.info(f"Persistent PortfolioEnv created with {len(self.portfolio_env.timeline)} steps")
         # C-3 SAFETY: After full startup (including warmup_causal_buffers), ensure causal graphs are ready
@@ -655,27 +747,58 @@ class TradingBot:
             while True:
                 try:
                     await self.data_ingestion.stream_data()
+                except asyncio.CancelledError:
+                    # HIGH-4 FIX: Let CancelledError propagate for clean shutdown
+                    logger.info("[DATA STREAM] Task cancelled — shutting down cleanly")
+                    raise
                 except Exception as e:
                     logger.error(f"Live data stream crashed: {e}. Restarting in 10 seconds...")
                     await asyncio.sleep(10)
         # Trade updates websocket (fill-driven OCO, slippage, causal push)
         self.trade_stream_handler = TradeStreamHandler(self.broker)
         # ==================== SCHEDULED TASKS ====================
-        trading_task = asyncio.create_task(self.trading_loop())
-        monitor_task = asyncio.create_task(self.broker.monitor_positions())
-        trade_stream_task = asyncio.create_task(self.trade_stream_handler.run())
-        universe_task = asyncio.create_task(self._universe_update_task())
-        gemini_task = asyncio.create_task(self.gemini_scheduled_task())
-        ppo_nightly_task = asyncio.create_task(self.ppo_nightly_retrain_task())
-        data_stream_wrapper = asyncio.create_task(data_stream_task())
-        tasks = asyncio.gather(data_stream_wrapper, trading_task, monitor_task,
-                               trade_stream_task, universe_task, gemini_task, ppo_nightly_task)
+        # HIGH-5 FIX: Keep individual task references so we can cancel each one
+        all_tasks = [
+            asyncio.create_task(data_stream_task(), name='data_stream'),
+            asyncio.create_task(self.trading_loop(), name='trading'),
+            asyncio.create_task(self.broker.monitor_positions(), name='monitor'),
+            asyncio.create_task(self.trade_stream_handler.run(), name='trade_stream'),
+            asyncio.create_task(self._universe_update_task(), name='universe'),
+            asyncio.create_task(self.gemini_scheduled_task(), name='gemini'),
+            asyncio.create_task(self.ppo_nightly_retrain_task(), name='ppo_nightly'),
+        ]
+        # Critical tasks that must be restarted if they crash
+        critical_task_names = {'trading', 'monitor', 'data_stream', 'trade_stream'}
         try:
-            await tasks
+            while True:
+                done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
+                restart_needed = False
+                for task in done:
+                    name = task.get_name()
+                    exc = task.exception() if not task.cancelled() else None
+                    if exc:
+                        logger.error(f"Task '{name}' crashed: {exc}")
+                        if name in critical_task_names:
+                            logger.warning(f"Restarting critical task '{name}' in 5s...")
+                            await asyncio.sleep(5)
+                            # Recreate the failed task
+                            task_factories = {
+                                'data_stream': lambda: asyncio.create_task(data_stream_task(), name='data_stream'),
+                                'trading': lambda: asyncio.create_task(self.trading_loop(), name='trading'),
+                                'monitor': lambda: asyncio.create_task(self.broker.monitor_positions(), name='monitor'),
+                                'trade_stream': lambda: asyncio.create_task(self.trade_stream_handler.run(), name='trade_stream'),
+                            }
+                            if name in task_factories:
+                                new_task = task_factories[name]()
+                                all_tasks = [t for t in all_tasks if t is not task] + [new_task]
+                                restart_needed = True
+                                logger.info(f"Critical task '{name}' restarted")
+                    elif task.cancelled():
+                        logger.debug(f"Task '{name}' was cancelled")
+                if not restart_needed and not pending:
+                    break  # All tasks completed normally
         except asyncio.CancelledError:
             logger.info("Tasks cancelled during shutdown (Ctrl+C or external cancellation)")
-        except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
         finally:
             logger.info("Shutdown signal received. Cleaning up...")
             try:
@@ -689,11 +812,11 @@ class TradingBot:
                 logger.info(f"All {len(open_orders)} open orders cancelled on shutdown")
             except Exception as e:
                 logger.error(f"Failed to cancel orders on shutdown: {e}")
-            tasks.cancel()
-            try:
-                await tasks
-            except asyncio.CancelledError:
-                pass
+            # HIGH-5 FIX: Cancel individual tasks, not just the gather future
+            for task in all_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
     # ==================== BACKGROUND REGIME PRECOMPUTE ====================
     def _background_regime_precompute(self):
         logger.info("Background regime precompute thread started")
@@ -737,11 +860,13 @@ class TradingBot:
                     regimes[sym] = str(regime_tuple)
         # B-07 REGIME PROPAGATION FIX: Set global CURRENT_REGIME so RiskManager (CVaR), min-hold, etc. always see the latest regime
         if regimes:
-
             regime_list = [r[0] if isinstance(r, (list,tuple)) else r for r in regimes.values()]
             dominant_regime = Counter(regime_list).most_common(1)[0][0]
-            self.config['CURRENT_REGIME'] = dominant_regime
-            CONFIG['CURRENT_REGIME'] = dominant_regime # BUG #11 PATCH: also sync the imported global CONFIG (used by risk.py / other modules)
+            # FIX #30: Protect CURRENT_REGIME writes with _regime_lock — this runs from
+            # _background_regime_precompute thread and would otherwise race with main thread reads
+            with self._regime_lock:
+                self.config['CURRENT_REGIME'] = dominant_regime
+                CONFIG['CURRENT_REGIME'] = dominant_regime  # BUG #11 PATCH: also sync the imported global CONFIG
             logger.info(f"[REGIME PROPAGATION] Set CURRENT_REGIME = {dominant_regime} (dominant across {len(regimes)} symbols)")
         self._save_regime_cache()
         return regimes
@@ -764,23 +889,42 @@ class TradingBot:
                 else:
                     cache_misses.append(sym)
         # Phase 2: Fetch data outside lock (no I/O under lock)
+        new_prices = {}
         for sym in cache_misses:
             data = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
             if data is not None and len(data) > 0:
-                self.latest_prices[sym] = data['close'].iloc[-1]
+                new_prices[sym] = data['close'].iloc[-1]
             if data is None or len(data) < 50:
                 regime = 'mean_reverting'
                 persistence = 0.5
             else:
                 recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
-                regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
-                persistence = 0.5
+                # Compute rolling volatility ratio to distinguish trending from mean-reverting
+                # High ratio of directional move to volatility → trending
+                returns = data['close'].pct_change().dropna().iloc[-20:]
+                rolling_vol = returns.std() if len(returns) > 1 else 0.01
+                threshold = 0.015
+                directional_strength = abs(recent_return) / max(rolling_vol * np.sqrt(20), 1e-6)
+                if directional_strength > 1.5:
+                    regime = 'trending_up' if recent_return >= 0 else 'trending_down'
+                elif directional_strength < 0.5:
+                    regime = 'mean_reverting'
+                else:
+                    if abs(recent_return) > threshold:
+                        regime = 'trending_up' if recent_return >= 0 else 'trending_down'
+                    else:
+                        regime = 'mean_reverting'
+                # Scale persistence by signal strength (clamped 0.3–0.8)
+                persistence = float(np.clip(0.3 + 0.5 * min(directional_strength / 2.0, 1.0), 0.3, 0.8))
             regimes[sym] = (regime, persistence)
         # Phase 3: Update cache (lock held briefly)
         if cache_misses:
             with self._regime_lock:
                 for sym in cache_misses:
                     self.regime_cache[sym] = regimes[sym]
+            # FIX: Update latest_prices via in-place mutation to preserve shared reference
+            # and avoid torn reads from other threads
+            self.latest_prices.update(new_prices)
         return regimes
     # ==================== GEMINI + CAUSAL REFRESH (3:30 AM) ====================
     async def gemini_scheduled_task(self):
@@ -804,12 +948,34 @@ class TradingBot:
                     try:
                         current_equity = await asyncio.to_thread(self.broker.get_equity)
                         buying_power = await asyncio.to_thread(self.broker.get_buying_power)
-                        starting_equity = list(self.equity_history.values())[0] if self.equity_history else current_equity
+                        # H24 FIX: _load_starting_equity does blocking file I/O — wrap in to_thread
+                        starting_equity = await asyncio.to_thread(self._load_starting_equity, current_equity)
                         positions = await asyncio.to_thread(self.broker.get_positions_dict)
                         # === Aggregate trade statistics ===
+                        # FIX #7: Filter to recent trades only (configurable window, default 30 days)
+                        # Using all-time history biases Gemini toward stale regime conditions
+                        gemini_lookback_days = self.config.get('GEMINI_HISTORY_DAYS', 30)
+                        cutoff_time = datetime.now(tz=tz.gettz('UTC')) - timedelta(days=gemini_lookback_days)
                         all_closed = []
-                        for hist in self.live_signal_history.values():
-                            all_closed.extend([e for e in hist if e.get('realized_return') is not None])
+                        # HIGH-6 FIX: Snapshot live_signal_history under lock to prevent
+                        # RuntimeError from concurrent modification by stream thread
+                        with self._signal_history_lock:
+                            history_snapshot = {sym: list(entries) for sym, entries in self.live_signal_history.items()}
+                        for hist in history_snapshot.values():
+                            for e in hist:
+                                if e.get('realized_return') is None:
+                                    continue
+                                ts = e.get('timestamp', cutoff_time)
+                                # Handle string timestamps from JSON-loaded history
+                                if isinstance(ts, str):
+                                    try:
+                                        ts = datetime.fromisoformat(ts)
+                                        if ts.tzinfo is None:
+                                            ts = ts.replace(tzinfo=tz.gettz('UTC'))
+                                    except (ValueError, TypeError):
+                                        continue
+                                if ts >= cutoff_time:
+                                    all_closed.append(e)
                         total_closed = len(all_closed)
                         wins = sum(1 for e in all_closed if e.get('realized_return', 0) > 0)
                         win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
@@ -835,8 +1001,8 @@ class TradingBot:
                             avg_win = round(np.mean(winners), 5) if winners else 0.0
                             avg_loss = round(np.mean(losers), 5) if losers else 0.0
                             profit_factor = round(sum(winners) / sum(losers), 3) if sum(losers) > 0 else 99.0
-                            # Max drawdown from equity history
-                            if self.equity_history:
+                            # Max drawdown from equity history (need >= 2 entries for meaningful drawdown)
+                            if self.equity_history and len(self.equity_history) >= 2:
                                 eq_vals = list(self.equity_history.values())
                                 peak = eq_vals[0]
                                 max_dd = 0.0
@@ -859,8 +1025,11 @@ class TradingBot:
                         # === Per-symbol performance with regime breakdown ===
                         symbol_performance = {}
                         regimes = await asyncio.to_thread(self._get_all_regimes)
+                        # H23 FIX: Snapshot live_signal_history under lock (shared with stream thread)
+                        with self._signal_history_lock:
+                            _sym_history_snap = {sym: list(self.live_signal_history.get(sym, [])) for sym in self.config['SYMBOLS']}
                         for sym in self.config['SYMBOLS']:
-                            history = self.live_signal_history.get(sym, [])
+                            history = _sym_history_snap.get(sym, [])
                             closed = [e for e in history if e.get('realized_return') is not None]
                             current_price = self.latest_prices.get(sym)
                             sym_regime = regimes.get(sym, ('mixed', 0.5)) if regimes else ('mixed', 0.5)
@@ -872,12 +1041,14 @@ class TradingBot:
                                 total_pnl_dollars = 0.0
                                 recent_pnl_dollars = 0.0
                                 sym_returns = []
+                                # FIX #21: Pre-compute recent set to avoid O(n^2) re-slicing
+                                recent_set = set(id(e) for e in closed[-10:])
                                 for e in closed:
                                     size = e.get('size', 1)
                                     pnl = e['realized_return'] * e['price'] * size
                                     total_pnl_dollars += pnl
                                     sym_returns.append(e['realized_return'])
-                                    if e in closed[-10:]:
+                                    if id(e) in recent_set:
                                         recent_pnl_dollars += pnl
                                 sym_sharpe = 0.0
                                 if len(sym_returns) > 2:
@@ -885,6 +1056,8 @@ class TradingBot:
                                     sym_sharpe = round((np.mean(sym_returns) / s_std * np.sqrt(252)) if s_std > 1e-8 else 0.0, 3)
                             else:
                                 unrealized_pnl = 0.0
+                                total_pnl_dollars = 0.0
+                                recent_pnl_dollars = 0.0
                                 win_rate_sym = 0.5
                                 recent_win = win_rate_sym
                                 sym_sharpe = 0.0
@@ -897,8 +1070,8 @@ class TradingBot:
                                     unrealized_pnl = unrealized * entry_price * size
                                     win_rate_sym = 1.0 if unrealized > 0 else 0.0
                                     recent_win = win_rate_sym
-                                total_pnl_dollars = unrealized_pnl if 'unrealized_pnl' in locals() else 0.0
-                                recent_pnl_dollars = total_pnl_dollars
+                                total_pnl_dollars = unrealized_pnl
+                                recent_pnl_dollars = unrealized_pnl
                             symbol_performance[sym] = {
                                 'win_rate': round(win_rate_sym, 3),
                                 'recent_10_win_rate': round(recent_win, 3),
@@ -980,9 +1153,16 @@ class TradingBot:
                             # ==================== END STRUCTURED BATCH LOG ====================
                         break
                     except Exception as e:
-                        if "503" in str(e) or "UNAVAILABLE" in str(e):
+                        # HIGH-7 FIX: Retry on all transient API errors (429, 500, 502, 503, timeout),
+                        # not just 503. Non-transient errors still break immediately.
+                        err_str = str(e).lower()
+                        transient_indicators = ("503", "429", "500", "502", "unavailable",
+                                                "timeout", "timed out", "deadline exceeded",
+                                                "rate limit", "resource exhausted", "internal")
+                        is_transient = any(indicator in err_str for indicator in transient_indicators)
+                        if is_transient:
                             delay = 30 * (2 ** attempt)
-                            logger.warning(f"[GEMINI TUNER] Attempt {attempt+1}/3 failed with 503. Retrying in {delay}s...")
+                            logger.warning(f"[GEMINI TUNER] Attempt {attempt+1}/3 failed (transient: {type(e).__name__}). Retrying in {delay}s...")
                             await asyncio.sleep(delay)
                         else:
                             logger.error(f"[GEMINI TUNER] Non-retryable error on attempt {attempt+1}: {e}")

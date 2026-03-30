@@ -14,7 +14,9 @@ from .ppo_utils import (
     save_ppo_model,
     load_ppo_model,
     update_model_weights as ppo_update_model_weights,
-    cosine_annealing_schedule,
+    make_cosine_annealing_schedule,
+    AuxVolatilityCallback,
+    NaNStopCallback as _PpoNaNStopCallback,  # FIX #53: Import from canonical source
 )
 from .stacking_ensemble import train_stacking
 from config import CONFIG
@@ -37,15 +39,8 @@ from models.causal_signal_manager import CausalSignalManager # ← Phase 1 modul
 
 logger = logging.getLogger(__name__)
 
-class NaNStopCallback(BaseCallback):
-    def __init__(self, verbose: int = 0):
-        super().__init__(verbose)
-    def _on_step(self) -> bool:
-        for param in self.model.policy.parameters():
-            if torch.isnan(param).any():
-                logger.warning("NaN detected in portfolio model parameters — stopping training")
-                return False
-        return True
+# FIX #53: Removed duplicate NaNStopCallback — now imported from ppo_utils as _PpoNaNStopCallback
+NaNStopCallback = _PpoNaNStopCallback
 
 class ProfitLoggingCallback(BaseCallback):
     """
@@ -127,8 +122,11 @@ class Trainer:
         """Cached regime detection — now uses the shared persistent cache (simple symbol key)
         B-04 FIX: Fully defensive unpacking for legacy plain-string / float / malformed entries"""
         cache_key = symbol # Simple key — matches bot.py exactly
-        if cache_key in self.regime_cache:
-            value = self.regime_cache[cache_key]
+        # Thread-safe read: regime_cache may be written by parallel training threads
+        with self._lock:
+            cached_value = self.regime_cache.get(cache_key)
+        if cached_value is not None:
+            value = cached_value
             # B-04 DEFENSIVE HANDLING (legacy cache from bot.py precompute)
             if isinstance(value, (list, tuple)) and len(value) == 2:
                 regime, persistence = value
@@ -139,7 +137,7 @@ class Trainer:
                 logger.warning(f"[B-04 LEGACY FIX] Converted plain string cache for {symbol} → ({regime}, {persistence:.3f})")
             elif isinstance(value, (int, float)):
                 # Legacy float-only (persistence score)
-                regime = 'trending' if value > 0.5 else 'mean_reverting'
+                regime = 'trending_up' if value > 0.5 else 'mean_reverting'
                 persistence = float(value)
                 logger.warning(f"[B-04 LEGACY FIX] Converted plain numeric cache for {symbol} → ({regime}, {persistence:.3f})")
             else:
@@ -156,16 +154,24 @@ class Trainer:
             persistence = 0.5 # BUG-11 FIX: neutral fallback instead of aggressive 0.35
         else:
             recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
-            regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
+            regime = ('trending_up' if recent_return >= 0 else 'trending_down') if abs(recent_return) > 0.015 else 'mean_reverting'
             persistence = 0.5 # BUG-11 FIX: neutral fallback instead of aggressive 0.92/0.35
         # Log fallback usage (helps track cache miss frequency)
         logger.debug(f"[REGIME FALLBACK] {symbol} → {regime} (persistence={persistence:.3f})")
         # Save to shared cache (as list for JSON compatibility)
-        self.regime_cache[cache_key] = [regime, persistence]
+        # FIX #23: Wrap dict mutation in lock to prevent race with concurrent threads
+        with self._lock:
+            self.regime_cache[cache_key] = [regime, persistence]
         self._save_regime_cache()
         return regime, persistence
 
     def walk_forward_optimize_thresholds(self, symbol: str, data: pd.DataFrame):
+        # ARCHITECTURAL LIMITATION: Stacking models (train_stacking) are trained on the full
+        # dataset before this walk-forward threshold optimization runs. This means stacking
+        # model predictions on the OOS folds are contaminated (the model has seen the OOS data
+        # during training). The 20-bar embargo partially mitigates short-horizon leakage, but
+        # the thresholds found here may be overfit. A proper fix would require per-fold stacking
+        # model retraining, which is prohibitively expensive with 15 LightGBM models per fold.
         # Use cached regime — now unpacks persistence as well (UPGRADE #4)
         regime, persistence = self.get_cached_regime(symbol, data)
         logger.info(f"Regime for {symbol}: {regime} (persistence score {persistence:.3f})")
@@ -187,6 +193,15 @@ class Trainer:
             meta_probs = []
             stacking_models = self.stacking_models.get(symbol, [])
             if stacking_models:
+                # FIX #23: Validate feature count matches what models were trained on.
+                # If feature count changed (e.g., new indicators added), predict will crash.
+                expected_ncols = stacking_models[0].num_feature()
+                actual_ncols = features.shape[1] if features.ndim == 2 else features.shape[0]
+                if actual_ncols != expected_ncols:
+                    logger.warning(f"[STACKING] {symbol}: feature count mismatch (got {actual_ncols}, "
+                                   f"model expects {expected_ncols}) — using 0.5 fallback")
+                    ensemble_prob = np.full(len(features), 0.5)
+                    stacking_models = []  # skip prediction loop
                 for model in stacking_models:
                     if hasattr(model, 'predict_proba'):
                         probs = model.predict_proba(features)[:, 1]
@@ -197,6 +212,13 @@ class Trainer:
             else:
                 ensemble_prob = np.full(len(features), 0.5)
             ensemble_prob = ensemble_prob[:-1] # drop last (no future return for it)
+            # Rescale predictions to percentile ranks [0, 1] so thresholds are meaningful
+            # regardless of raw prediction spread. LightGBM with early stopping often produces
+            # predictions clustered in [0.48, 0.52], making fixed thresholds at 0.55+ useless.
+            prob_spread = np.std(ensemble_prob)
+            if prob_spread < 0.05:
+                logger.info(f"[THRESHOLD FIX] {symbol} prediction spread too narrow ({prob_spread:.4f}) — rescaling to percentile ranks")
+                ensemble_prob = pd.Series(ensemble_prob).rank(pct=True).values
         # Compute forward returns for alignment
         returns = data['close'].pct_change().shift(-1).dropna()
         # Features correspond to the TAIL of data (rolling windows drop leading rows)
@@ -212,16 +234,21 @@ class Trainer:
             'return': aligned_returns.values
         }, index=aligned_returns.index)
         n_windows = 6
+        # HIGH FIX: Increased embargo from 1 to 20 bars to reduce look-ahead bias.
+        # The stacking models were trained on the full dataset before this function,
+        # so ensemble_prob contains predictions from a model that saw future data.
+        # A larger embargo creates a buffer zone between train/OOS splits, reducing
+        # the information leakage from model training on the full dataset.
+        embargo = 20
         window_size = len(df) // n_windows
         for w in range(n_windows):
             chunk_start = w * window_size
             chunk_end = (w + 1) * window_size if w < n_windows - 1 else len(df)
             chunk_df = df.iloc[chunk_start:chunk_end]
-            # ==================== TRUE OOS VALIDATION (70/30 split per window, 1-bar embargo) ====================
+            # ==================== TRUE OOS VALIDATION (70/30 split per window, embargo gap) ====================
             train_size = int(len(chunk_df) * 0.70)
-            embargo = 1  # Prevent forward-return leakage at the train/OOS boundary
             train_df = chunk_df.iloc[:train_size]
-            oos_df = chunk_df.iloc[train_size + embargo:]
+            oos_df = chunk_df.iloc[train_size + embargo:]  # embargo bars gap between train and OOS
             if len(train_df) < 20 or len(oos_df) < 10:
                 logger.warning(f"{symbol} window {w+1} too small (train={len(train_df)}, oos={len(oos_df)}) — skipping")
                 continue
@@ -233,27 +260,35 @@ class Trainer:
                 signals = np.where(train_df['meta_prob'] > long_thresh, 1,
                                    np.where(train_df['meta_prob'] < short_thresh, -1, 0))
                 strat_returns = signals * train_df['return']
-                sharpe = strat_returns.mean() / (strat_returns.std() + 1e-8) * np.sqrt(252 * 96)
+                sharpe = strat_returns.mean() / (strat_returns.std() + 1e-8) * np.sqrt(252 * 26)
                 penalty = penalty_weight * (abs(long_thresh - 0.65) + abs(short_thresh - 0.35))
                 return sharpe - penalty
+            # Scale trials to window size — prevents overfitting small samples
+            max_trials = min(self.config.get('OPTUNA_TRIALS', 350), max(50, len(train_df) // 5))
             study = optuna.create_study(direction='maximize', sampler=TPESampler())
-            study.optimize(objective, n_trials=self.config.get('OPTUNA_TRIALS', 350),
+            study.optimize(objective, n_trials=max_trials,
                            timeout=self.config.get('OPTUNA_TIMEOUT', 900))
             best = study.best_trial
-            best_score_is = best.value # in-sample score
+            # Compute raw IS Sharpe (without penalty) for fair comparison with OOS
+            best_signals_is = np.where(train_df['meta_prob'] > best.params['long_thresh'], 1,
+                                       np.where(train_df['meta_prob'] < best.params['short_thresh'], -1, 0))
+            best_rets_is = best_signals_is * train_df['return']
+            is_sharpe = best_rets_is.mean() / (best_rets_is.std() + 1e-8) * np.sqrt(252 * 26)
             # Compute true OOS score on unseen data
             signals_oos = np.where(oos_df['meta_prob'] > best.params['long_thresh'], 1,
                                    np.where(oos_df['meta_prob'] < best.params['short_thresh'], -1, 0))
             strat_returns_oos = signals_oos * oos_df['return']
-            oos_sharpe = strat_returns_oos.mean() / (strat_returns_oos.std() + 1e-8) * np.sqrt(252 * 96)
-            is_oos_gap = best_score_is - oos_sharpe
+            oos_sharpe = strat_returns_oos.mean() / (strat_returns_oos.std() + 1e-8) * np.sqrt(252 * 26)
+            # Use ratio-based gap detection — absolute gap is misleading for high-Sharpe windows
+            is_oos_gap = is_sharpe - oos_sharpe
+            gap_ratio = is_oos_gap / (abs(is_sharpe) + 1e-8)
             logger.info(
-                f"{symbol} window {w+1}/{n_windows} — IS Sharpe: {best_score_is:.3f} | "
-                f"OOS Sharpe: {oos_sharpe:.3f} | gap: {is_oos_gap:.3f} "
+                f"{symbol} window {w+1}/{n_windows} — IS Sharpe: {is_sharpe:.3f} | "
+                f"OOS Sharpe: {oos_sharpe:.3f} | gap: {is_oos_gap:.3f} ({gap_ratio:.0%}) "
                 f"(long={best.params['long_thresh']:.3f}, short={best.params['short_thresh']:.3f})"
             )
-            if is_oos_gap > 1.0:
-                logger.warning(f"{symbol} window {w+1} shows significant overfitting — IS/OOS gap {is_oos_gap:.2f}")
+            if gap_ratio > 0.50 and is_oos_gap > 2.0:
+                logger.warning(f"{symbol} window {w+1} shows significant overfitting — gap {is_oos_gap:.2f} ({gap_ratio:.0%} of IS)")
             # Only accept if OOS is non-negative (prevents accepting money-losing thresholds)
             if oos_sharpe > 0.0:
                 final_long_thresh = best.params['long_thresh']
@@ -267,7 +302,7 @@ class Trainer:
                     'valid_from': chunk_start_time,
                     'long': final_long_thresh,
                     'short': final_short_thresh,
-                    'sharpe_is': best_score_is,
+                    'sharpe_is': is_sharpe,
                     'sharpe_oos': oos_sharpe
                 })
                 # Prune to last 12 entries inline to prevent memory bloat
@@ -275,7 +310,7 @@ class Trainer:
                     self.confidence_thresholds[symbol] = thresh_list[-12:]
                 logger.info(
                     f"{symbol} walk-forward window {w+1}/{n_windows} ({chunk_start_time.date()}): "
-                    f"long>{final_long_thresh:.3f}, short<{final_short_thresh:.3f} (IS {best_score_is:.2f} | OOS {oos_sharpe:.2f})"
+                    f"long>{final_long_thresh:.3f}, short<{final_short_thresh:.3f} (IS {is_sharpe:.2f} | OOS {oos_sharpe:.2f})"
                 )
             else:
                 logger.warning(f"{symbol} window {w+1} rejected — poor OOS performance")
@@ -337,7 +372,8 @@ class Trainer:
             symbol=symbol,
             data=data,
             full_hist_df=data,
-            regime_cache=regime_cache or self.regime_cache  # ← NEW: pass shared cache
+            # M49 FIX: Pass a copy to prevent cross-thread mutation
+            regime_cache=dict(regime_cache or self.regime_cache)
         )
         if full_ppo:
             success = False
@@ -368,7 +404,6 @@ class Trainer:
                     )
                     self.causal_wrappers[symbol] = CausalSignalManager(
                         self.ppo_models[symbol],
-                        features_df,
                         symbol=symbol,
                         data_ingestion=self.data_ingestion
                     )
@@ -390,26 +425,9 @@ class Trainer:
             logger.info("Existing portfolio PPO model found — skipping full training, ready for inference/online updates")
             self.portfolio_ppo_model = existing_model
             self.portfolio_vec_norm = existing_norm
-            # CRIT-14 FIX: Causal warmup after loading existing model (replays historical rewards)
-            if hasattr(self, 'signal_gen') and hasattr(self.signal_gen, 'live_signal_history'):
-                logger.info("Replaying historical rewards into loaded portfolio causal buffer...")
-                all_closed = [e for hist in self.signal_gen.live_signal_history.values() for e in hist if e.get('realized_return') is not None]
-                for entry in all_closed:
-                    obs = entry.get('obs')
-                    if obs is not None and isinstance(obs, list) and len(obs) > 0:
-                        try:
-                            obs_array = np.array(obs, dtype=np.float32).reshape(1, -1)
-                            action = entry.get('direction', 0) * entry.get('confidence', 1.0)
-                            reward = entry.get('realized_return', 0.0)
-                            if self.portfolio_causal_manager is not None:
-                                self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
-                        except Exception:
-                            pass
-                if self.portfolio_causal_manager is not None:
-                    loaded_count = len(self.portfolio_causal_manager.replay_buffer.buffer)
-                    logger.info(f"[CAUSAL WARMUP AFTER LOAD] Loaded {loaded_count} historical rewards into portfolio causal buffer")
-                else:
-                    logger.debug("[CAUSAL WARMUP AFTER LOAD] portfolio_causal_manager is None — skipping warmup")
+            # FIX #41: Removed dead causal warmup code. Trainer does not have signal_gen attribute,
+            # so hasattr(self, 'signal_gen') was always False. Causal warmup is handled by
+            # CausalRLManager.sync_daily_rewards() which has access to signal_gen.
             return
         logger.info(f"Starting portfolio-level PPO training on {len(symbols)} symbols: {symbols}")
         # Fetch full data for all symbols
@@ -442,9 +460,12 @@ class Trainer:
                 use_custom_gtrxl = CONFIG.get('USE_CUSTOM_GTRXL', True) and use_recurrent
                 # FIXED: Removed use_sde=False to avoid duplicate argument error
                 policy_kwargs = dict(
-                    features_extractor_class=None, # PortfolioEnv handles features internally
                     net_arch=dict(pi=[256, 256], vf=[512, 256]), # Asymmetric: bigger critic for randomized starts
                 )
+                # NOTE: Do NOT set features_extractor_class=None for any path.
+                # GTrXL uses its own DummyFeaturesExtractor (set inside AuxGTrXLPolicy).
+                # LSTM/RecurrentPPO uses the default FlattenExtractor.
+                # Passing None crashes non-GTrXL recurrent policies.
                 if use_recurrent:
                     if use_custom_gtrxl:
                         from .policies import AuxGTrXLPolicy
@@ -459,7 +480,7 @@ class Trainer:
                         policy_kwargs=policy_kwargs,
                         verbose=1,
                         tensorboard_log="./ppo_tensorboard/portfolio" if CONFIG.get('USE_TENSORBOARD') else None,
-                        learning_rate=cosine_annealing_schedule,
+                        learning_rate=make_cosine_annealing_schedule(),
                         n_steps=CONFIG.get('PPO_N_STEPS', 2048),
                         batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
                         n_epochs=CONFIG.get('PPO_N_EPOCHS', 4),
@@ -467,20 +488,19 @@ class Trainer:
                         gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
                         clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.18),
                         ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.03),
-                        vf_coef=CONFIG.get('vf_coef', 1.0),
+                        vf_coef=CONFIG.get('VF_COEF', 1.0),
                         max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.4),
                         device="auto"
                     )
                 else:
-                    from .policies import AuxMlpPolicy
-                    from stable_baselines3 import PPO as CustomPPO
+                    from .policies import AuxMlpPolicy, CustomPPO
                     model = CustomPPO(
                         policy=AuxMlpPolicy,
                         env=vec_env,
                         policy_kwargs=policy_kwargs,
                         verbose=1,
                         tensorboard_log="./ppo_tensorboard/portfolio" if CONFIG.get('USE_TENSORBOARD') else None,
-                        learning_rate=cosine_annealing_schedule,
+                        learning_rate=make_cosine_annealing_schedule(),
                         n_steps=CONFIG.get('PPO_N_STEPS', 2048),
                         batch_size=CONFIG.get('PPO_BATCH_SIZE', 256),
                         n_epochs=CONFIG.get('PPO_N_EPOCHS', 4),
@@ -488,16 +508,18 @@ class Trainer:
                         gae_lambda=CONFIG.get('PPO_GAE_LAMBDA', 0.93),
                         clip_range=CONFIG.get('PPO_CLIP_RANGE', 0.18),
                         ent_coef=CONFIG.get('PPO_ENTROPY_COEFF', 0.03),
-                        vf_coef=CONFIG.get('vf_coef', 1.0),
+                        vf_coef=CONFIG.get('VF_COEF', 1.0),
                         max_grad_norm=CONFIG.get('PPO_MAX_GRAD_NORM', 0.4),
                         device="auto"
                     )
                 nan_callback = NaNStopCallback()
-                profit_callback = ProfitLoggingCallback() # Enhanced profit logging
+                profit_callback = ProfitLoggingCallback()
+                aux_callback = AuxVolatilityCallback() if CONFIG.get('PPO_AUX_TASK', True) else None
+                callbacks = [nan_callback, profit_callback] + ([aux_callback] if aux_callback else [])
                 logger.info(f"Training portfolio PPO for {timesteps} timesteps")
                 model.learn(
                     total_timesteps=timesteps,
-                    callback=[nan_callback, profit_callback],
+                    callback=callbacks,
                     reset_num_timesteps=True
                 )
                 success = True
@@ -527,7 +549,6 @@ class Trainer:
                 full_df['symbol_id'] = symbol_ids
                 self.portfolio_causal_manager = CausalSignalManager(
                     self.portfolio_ppo_model,
-                    full_df,
                     symbol="portfolio",
                     data_ingestion=self.data_ingestion
                 )
@@ -606,26 +627,35 @@ class Trainer:
             # Attach new environment to existing model
             model = self.portfolio_ppo_model
             model.set_env(new_vec_env)
-            # Lower learning rate for safe online fine-tuning
-            original_lr = model.learning_rate
+            # Lower learning rate for safe online fine-tuning.
+            # Save the original lr_schedule (may be a callable like cosine annealing).
+            # After the online update we restore the exact same object so the schedule
+            # state (progress_remaining tracking) is preserved, not flattened to a scalar.
+            original_lr = model.learning_rate  # callable or float
             online_lr = CONFIG.get('PPO_ONLINE_LEARNING_RATE', 5e-5)
-            model.learning_rate = online_lr
-            logger.info(f"Reduced learning rate to {online_lr} for online portfolio update (original was {original_lr})")
+            model.learning_rate = online_lr  # scalar for online fine-tuning
+            logger.info(f"Reduced learning rate to {online_lr} for online portfolio update (original type: {type(original_lr).__name__})")
             nan_callback = NaNStopCallback()
-            profit_callback = ProfitLoggingCallback() # Enhanced profit logging
+            profit_callback = ProfitLoggingCallback()
+            aux_callback = AuxVolatilityCallback() if CONFIG.get('PPO_AUX_TASK', True) else None
+            callbacks = [nan_callback, profit_callback] + ([aux_callback] if aux_callback else [])
             logger.info(f"Continuing portfolio PPO training for {timesteps} timesteps (incremental)")
             model.learn(
                 total_timesteps=timesteps,
-                callback=[nan_callback, profit_callback],
-                reset_num_timesteps=False # Crucial: continue from previous timesteps
+                callback=callbacks,
+                reset_num_timesteps=False
             )
-            # Restore original learning rate after online fine-tuning
+            # Restore original learning rate (callable schedule or scalar) after online fine-tuning.
+            # This preserves the cosine annealing schedule object if that's what was originally set,
+            # so subsequent train() calls use the correct schedule rather than a flat scalar.
             model.learning_rate = original_lr
-            logger.info(f"Restored learning rate to {original_lr} after online portfolio update")
+            logger.info(f"Restored learning rate schedule after online portfolio update (type: {type(original_lr).__name__})")
             # Update stored references
             self.portfolio_vec_norm = new_vec_env
-            # CRIT-14 FIX: Rebuild/restore portfolio causal manager after online update
-            if self.portfolio_causal_manager is None:
+            # CRIT-14 FIX: Always rebuild portfolio causal manager after online update
+            # so the causal graph reflects the updated model and latest data.
+            # Previously only rebuilt when None — now rebuilds unconditionally when causal RL is enabled.
+            if CONFIG.get('USE_CAUSAL_RL', False):
                 logger.info("Rebuilding portfolio causal manager after online update...")
                 # (same stacked build as in train_portfolio)
                 all_features = []
@@ -644,7 +674,6 @@ class Trainer:
                     full_df['symbol_id'] = symbol_ids
                     self.portfolio_causal_manager = CausalSignalManager(
                         self.portfolio_ppo_model,
-                        full_df,
                         symbol="portfolio",
                         data_ingestion=self.data_ingestion
                     )
@@ -694,12 +723,12 @@ class Trainer:
                         symbol=sym,
                         data=data,
                         full_hist_df=data,
-                        regime_cache=self.regime_cache  # ← NEW: share cache
+                        regime_cache=dict(self.regime_cache)  # M49 FIX: copy for thread safety
                     )
                     self.walk_forward_optimize_thresholds(sym, data)
         else:
             # Legacy per-symbol parallel training
-            max_workers = min(len(symbols), 16)
+            max_workers = min(len(symbols), 4)  # FIX #38: Was 16 — GPU PPO training OOMs with too many parallel workers
             logger.info(f"Starting parallel training for {len(symbols)} symbols (max_workers={max_workers})")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [

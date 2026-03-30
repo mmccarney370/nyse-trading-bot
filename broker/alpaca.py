@@ -13,6 +13,7 @@ import tempfile
 import shutil
 
 from utils.helpers import is_market_open
+from strategy.regime import is_trending
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     LimitOrderRequest,
@@ -61,7 +62,12 @@ class AlpacaBroker:
         self.existing_positions = {}
         self.last_ratchet_time = {}
         self._ratchet_pending = set()  # Symbols with in-flight replace — skip until websocket confirms
+        self._tp_in_progress = set()  # Symbols with TP enforcement in progress — skip ratchet
+        self._sets_lock = threading.Lock()  # Thread safety for _ratchet_pending / _tp_in_progress
         self._positions_lock = threading.Lock()  # Thread safety for sync_existing_positions
+        self._entry_times_lock = threading.Lock()  # FIX #11: Thread safety for last_entry_times access
+        self._symbol_locks = {}  # Per-symbol threading locks to prevent TOCTOU races between monitor and stream
+        self._symbol_locks_lock = threading.Lock()  # Protects lazy creation of per-symbol locks
         # Positions cache with TTL
         self._positions_cache = {}
         self._positions_cache_time = None
@@ -75,6 +81,15 @@ class AlpacaBroker:
             f"{len(self.tracker.get_open_groups())} tracked groups, "
             f"extended_hours={self.use_extended_hours}, fractional={self.use_fractional}"
         )
+
+    def _get_symbol_lock(self, symbol: str) -> threading.Lock:
+        """Lazily create and return a per-symbol threading.Lock to prevent TOCTOU races.
+        FIX #18: Changed from asyncio.Lock to threading.Lock so stream handler (different thread)
+        actually contends with the monitor loop. Critical sections are short so blocking is fine."""
+        with self._symbol_locks_lock:
+            if symbol not in self._symbol_locks:
+                self._symbol_locks[symbol] = threading.Lock()
+            return self._symbol_locks[symbol]
 
     # ====================== PERSISTENT LAST ENTRY TIMES ======================
     def _load_last_entry_times(self):
@@ -94,6 +109,20 @@ class AlpacaBroker:
         return {}
 
     def _save_last_entry_times(self):
+        """HIGH-15 FIX: Snapshot under _entry_times_lock to prevent RuntimeError
+        from concurrent dict modification by another thread."""
+        try:
+            with self._entry_times_lock:
+                data = {sym: ts.isoformat() for sym, ts in self.last_entry_times.items()}
+            fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(LAST_ENTRY_FILE) or '.', suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f, indent=2)
+            shutil.move(tmp_path, LAST_ENTRY_FILE)
+        except Exception as e:
+            logger.warning(f"Failed to save last_entry_times.json: {e}")
+
+    def _save_last_entry_times_unlocked(self):
+        """Save variant for callers that already hold _entry_times_lock (avoids deadlock)."""
         try:
             data = {sym: ts.isoformat() for sym, ts in self.last_entry_times.items()}
             fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(LAST_ENTRY_FILE) or '.', suffix='.tmp')
@@ -112,6 +141,8 @@ class AlpacaBroker:
                 if age < self._positions_cache_ttl:
                     self.existing_positions = self._positions_cache.copy()
                     return
+            # FIX #10: Don't set cache time before API call — if the call fails,
+            # stale cache_time prevents retries. Set it AFTER success only.
         try:
             positions = self.client.get_all_positions()
             new_positions = {
@@ -121,14 +152,16 @@ class AlpacaBroker:
             with self._positions_lock:
                 self.existing_positions = new_positions
                 self._positions_cache = new_positions.copy()
-                self._positions_cache_time = now
-            for sym in list(new_positions.keys()):
-                if sym not in self.last_entry_times:
-                    self.last_entry_times[sym] = now - timedelta(minutes=30)
-            for sym in list(self.last_entry_times.keys()):
-                if sym not in new_positions:
-                    self.last_entry_times.pop(sym, None)
-            self._save_last_entry_times()
+                self._positions_cache_time = datetime.now(tz=_UTC)  # Set AFTER successful fetch
+            with self._entry_times_lock:
+                for sym in list(new_positions.keys()):
+                    if sym not in self.last_entry_times:
+                        self.last_entry_times[sym] = now - timedelta(minutes=30)
+                for sym in list(self.last_entry_times.keys()):
+                    if sym not in new_positions:
+                        self.last_entry_times.pop(sym, None)
+                # HIGH-15: Use unlocked variant since we already hold _entry_times_lock
+                self._save_last_entry_times_unlocked()
         except Exception as e:
             logger.error(f"Failed to sync existing positions: {e}")
             with self._positions_lock:
@@ -161,11 +194,14 @@ class AlpacaBroker:
             logger.error(f"[RECONCILE] Failed to fetch open orders: {e}")
 
         # --- 1. Remove stale tracker groups (no position on Alpaca) ---
-        for sym in list(self.tracker.groups.keys()):
-            group = self.tracker.groups[sym]
+        # CRIT-4 FIX: Acquire tracker lock for each group access to prevent race with concurrent stream handler
+        with self.tracker._lock:
+            groups_snapshot = {sym: self.tracker.groups[sym] for sym in self.tracker.groups}
+        # M24 FIX: Batch stale group removal — single _save() instead of N
+        stale_syms = []
+        for sym, group in groups_snapshot.items():
             if sym not in self.existing_positions:
                 if group.state == GroupState.PENDING_ENTRY:
-                    # Entry never filled — cancel any lingering entry order
                     if group.entry_order_id:
                         try:
                             self.client.cancel_order_by_id(group.entry_order_id)
@@ -173,22 +209,41 @@ class AlpacaBroker:
                         except Exception:
                             pass
                 elif group.state == GroupState.OPEN:
-                    # Position closed while bot was down (stop filled)
                     logger.info(f"[RECONCILE] {sym} was OPEN in tracker but no position — stop likely filled while offline")
-                logger.info(f"[RECONCILE] Removing stale tracker group for {sym}")
-                self.tracker.remove_group(sym)
+                elif group.state == GroupState.PENDING_EXIT:
+                    logger.info(f"[RECONCILE] {sym} was PENDING_EXIT — exit completed while offline")
+                stale_syms.append(sym)
+        if stale_syms:
+            with self.tracker._lock:
+                for sym in stale_syms:
+                    group = self.tracker.groups.pop(sym, None)
+                    if group:
+                        for oid in (group.entry_order_id, group.trailing_stop_id, group.take_profit_id):
+                            if oid:
+                                self.tracker._order_id_index.pop(oid, None)
+                        logger.info(f"[RECONCILE] Removed stale tracker group for {sym}")
+                self.tracker._save()  # Single write for all stale groups
 
         # --- 1b. Cancel orphaned closing orders for symbols with no position ---
+        # Only cancel protective/closing orders (trailing stop, stop, stop_limit).
+        # Preserve pending entry limit orders — they may fill and create a new position.
         for sym, orders in open_orders.items():
             if sym not in self.existing_positions:
                 for order in orders:
-                    order_side = str(getattr(order, 'side', '')).lower().split('.')[-1]
                     order_type = str(getattr(order, 'order_type', '')).lower().split('.')[-1]
-                    # Only cancel closing orders (sells for longs, buys for shorts) — not pending entries
-                    if order_type in ('trailing_stop', 'stop', 'stop_limit') or \
-                       (order_type == 'limit' and order_side == 'sell'):
+                    order_id_str = str(order.id)
+                    # Always cancel stop-type orders (these are closing orders)
+                    is_closing_order = order_type in ('trailing_stop', 'stop', 'stop_limit')
+                    # For limit orders, only cancel if NOT a tracked pending entry
+                    if order_type == 'limit':
+                        tracked_group = self.tracker.lookup_by_order_id(order_id_str)
+                        if tracked_group and order_id_str == tracked_group.entry_order_id:
+                            logger.debug(f"[RECONCILE] Preserving pending entry limit order for {sym}: {order_id_str}")
+                            continue  # Skip — this is a pending entry, not a closing order
+                        is_closing_order = True  # Untracked limit order with no position — orphaned
+                    if is_closing_order:
                         try:
-                            self.client.cancel_order_by_id(str(order.id))
+                            self.client.cancel_order_by_id(order_id_str)
                             logger.info(f"[RECONCILE] Cancelled orphaned {order_type} order for {sym} "
                                         f"(no position exists) — id={order.id}")
                         except Exception as e:
@@ -217,46 +272,49 @@ class AlpacaBroker:
 
             if group and group.state == GroupState.OPEN:
                 # --- 3. Tracked position: verify direction + trailing stop ---
-                if group.direction != direction:
-                    logger.warning(
-                        f"[RECONCILE] {sym} direction mismatch: tracker={group.direction}, "
-                        f"actual={direction} — updating tracker"
-                    )
-                    group.direction = direction
-                    self.tracker._save()
-
-                if has_trailing_stop:
-                    # Update tracker with the actual order ID from Alpaca
-                    if trailing_stop_order_id and group.trailing_stop_id != trailing_stop_order_id:
-                        old_id = group.trailing_stop_id
-                        group.trailing_stop_id = trailing_stop_order_id
-                        self.tracker._order_id_index.pop(old_id, None)
-                        self.tracker._order_id_index[trailing_stop_order_id] = sym
+                with self.tracker._lock:
+                    if group.direction != direction:
+                        logger.warning(
+                            f"[RECONCILE] {sym} direction mismatch: tracker={group.direction}, "
+                            f"actual={direction} — updating tracker"
+                        )
+                        group.direction = direction
                         self.tracker._save()
-                        logger.info(f"[RECONCILE] {sym} updated trailing stop ID: {old_id} → {trailing_stop_order_id}")
-                    logger.info(f"[RECONCILE] {sym} OK — tracked + trailing stop active")
-                else:
-                    # Trailing stop is missing — need to resubmit
-                    logger.warning(f"[RECONCILE] {sym} tracked but trailing stop MISSING — will resubmit")
-                    group.trailing_stop_id = None
-                    self.tracker._save()
+
+                    if has_trailing_stop:
+                        if trailing_stop_order_id and group.trailing_stop_id != trailing_stop_order_id:
+                            old_id = group.trailing_stop_id
+                            group.trailing_stop_id = trailing_stop_order_id
+                            self.tracker._order_id_index.pop(old_id, None)
+                            self.tracker._order_id_index[trailing_stop_order_id] = sym
+                            self.tracker._save()
+                            logger.info(f"[RECONCILE] {sym} updated trailing stop ID: {old_id} → {trailing_stop_order_id}")
+                        logger.info(f"[RECONCILE] {sym} OK — tracked + trailing stop active")
+                    else:
+                        logger.warning(f"[RECONCILE] {sym} tracked but trailing stop MISSING — will resubmit")
+                        group.trailing_stop_id = None
+                        self.tracker._save()
+                if not has_trailing_stop:
                     self._reconcile_submit_trailing_stop(sym, abs_qty, direction, group)
 
             elif group and group.state == GroupState.PENDING_ENTRY:
                 # Entry was pending — check if it actually filled
                 logger.info(f"[RECONCILE] {sym} has position but tracker is PENDING_ENTRY — marking as filled")
                 current_price = self._get_current_price(sym)
+                # FIX #16: Submit trailing stop OUTSIDE lock to avoid blocking tracker
+                # during the Alpaca API call. Update tracker state after.
                 if not has_trailing_stop:
                     self._reconcile_submit_trailing_stop(sym, abs_qty, direction, group)
-                else:
-                    group.trailing_stop_id = trailing_stop_order_id
-                    if trailing_stop_order_id:
-                        self.tracker._order_id_index[trailing_stop_order_id] = sym
-                group.state = GroupState.OPEN
-                group.entry_price = current_price
-                group.filled_qty = abs_qty
-                group.filled_at = datetime.now(tz=_UTC).isoformat()
-                self.tracker._save()
+                with self.tracker._lock:
+                    if has_trailing_stop:
+                        group.trailing_stop_id = trailing_stop_order_id
+                        if trailing_stop_order_id:
+                            self.tracker._order_id_index[trailing_stop_order_id] = sym
+                    group.state = GroupState.OPEN
+                    group.entry_price = current_price
+                    group.filled_qty = abs_qty
+                    group.filled_at = datetime.now(tz=_UTC).isoformat()
+                    self.tracker._save()
 
             else:
                 # --- 4. Orphaned position: no tracker group at all ---
@@ -315,12 +373,23 @@ class AlpacaBroker:
             if whole_qty < 1:
                 logger.warning(f"[RECONCILE] {symbol} qty={qty} is fractional with <1 whole share — "
                                f"trailing stop not possible, relying on software TP in monitor loop")
-                # Still mark entry filled with no trailing stop so monitor loop can manage
-                self.tracker.mark_entry_filled(
-                    symbol=symbol, fill_price=current_price, filled_qty=qty,
-                    trailing_stop_id='', take_profit_id='',
-                    trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
-                )
+                # FIX #19: Update fields directly if group is already OPEN (mark_entry_filled rejects OPEN groups)
+                from broker.order_tracker import GroupState
+                with self.tracker._lock:
+                    grp = self.tracker.groups.get(symbol)
+                    if grp and grp.state == GroupState.OPEN:
+                        grp.trail_percent = trail_pct
+                        grp.tp_price = tp_price
+                        grp.stop_price = stop_est
+                        grp.entry_price = grp.entry_price or current_price
+                        grp.filled_qty = grp.filled_qty or qty
+                        self.tracker._save()
+                    else:
+                        self.tracker.mark_entry_filled(
+                            symbol=symbol, fill_price=current_price, filled_qty=qty,
+                            trailing_stop_id='', take_profit_id='',
+                            trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
+                        )
                 return
             logger.info(f"[RECONCILE] {symbol} rounding qty {qty} → {whole_qty} whole shares for trailing stop")
             qty = whole_qty
@@ -334,11 +403,27 @@ class AlpacaBroker:
             trailing_stop_id = str(resp.id)
             logger.info(f"[RECONCILE] {symbol} trailing stop submitted @ {trail_pct}% | id={trailing_stop_id}")
 
-            self.tracker.mark_entry_filled(
-                symbol=symbol, fill_price=current_price, filled_qty=qty,
-                trailing_stop_id=trailing_stop_id, take_profit_id='',
-                trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
-            )
+            # FIX #19: mark_entry_filled rejects OPEN groups (state guard).
+            # During reconciliation the group may already be OPEN, so update fields directly.
+            from broker.order_tracker import GroupState
+            with self.tracker._lock:
+                grp = self.tracker.groups.get(symbol)
+                if grp and grp.state == GroupState.OPEN:
+                    grp.trailing_stop_id = trailing_stop_id
+                    grp.trail_percent = trail_pct
+                    grp.tp_price = tp_price
+                    grp.stop_price = stop_est
+                    grp.entry_price = grp.entry_price or current_price
+                    grp.filled_qty = grp.filled_qty or qty
+                    self.tracker._order_id_index[trailing_stop_id] = symbol
+                    self.tracker._save()
+                else:
+                    # Group is still PENDING_ENTRY — normal path
+                    self.tracker.mark_entry_filled(
+                        symbol=symbol, fill_price=current_price, filled_qty=qty,
+                        trailing_stop_id=trailing_stop_id, take_profit_id='',
+                        trail_percent=trail_pct, tp_price=tp_price, stop_price=stop_est,
+                    )
         except Exception as e:
             logger.error(f"[RECONCILE] Failed to submit trailing stop for {symbol}: {e}")
 
@@ -351,19 +436,25 @@ class AlpacaBroker:
         return 0.01
 
     def _get_current_price(self, symbol: str) -> float:
-        """Get latest price for a symbol — best effort."""
+        """Get latest price for a symbol — best effort.
+        HIGH-9 FIX: Never return 0.0 — raises ValueError instead to prevent division by zero."""
         if self.data_ingestion:
             data = self.data_ingestion.get_latest_data(symbol)
             if data is not None and len(data) > 0:
-                return float(data['close'].iloc[-1])
-        # Fallback: use Alpaca position cost basis
+                price = float(data['close'].iloc[-1])
+                if price > 0:
+                    return price
+        # Fallback: use Alpaca position cost basis (single symbol fetch, not all positions)
         try:
-            positions = self.client.get_all_positions()
-            for p in positions:
-                if p.symbol == symbol:
-                    return float(p.current_price)
+            pos = self.client.get_open_position(symbol)
+            if pos:
+                price = float(pos.current_price)
+                if price > 0:
+                    return price
         except Exception:
             pass
+        # M23 FIX: Return 0.0 instead of raising — callers in reconciliation don't catch ValueError
+        logger.error(f"[PRICE] Cannot determine current price for {symbol} — no valid data source")
         return 0.0
 
     def _load_regime_cache(self):
@@ -395,7 +486,9 @@ class AlpacaBroker:
 
     def get_positions_dict(self):
         self.sync_existing_positions()
-        return self.existing_positions.copy()
+        # FIX: Return copy inside lock to prevent torn reads from concurrent writes
+        with self._positions_lock:
+            return self.existing_positions.copy()
 
     # ====================== ATR COMPUTATION ======================
     def _compute_current_atr(self, data_window: pd.DataFrame, lookback: int = 50) -> float:
@@ -425,7 +518,7 @@ class AlpacaBroker:
             return regime, persistence
         if data is not None and len(data) >= 20:
             recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
-            regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
+            regime = ('trending_up' if recent_return >= 0 else 'trending_down') if abs(recent_return) > 0.015 else 'mean_reverting'
             return regime, 0.5
         return 'mean_reverting', 0.5
 
@@ -433,7 +526,7 @@ class AlpacaBroker:
         """Compute trailing stop as a percentage of price (for TrailingStopOrderRequest)."""
         trailing_mult = (
             self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
-            if regime == 'trending'
+            if is_trending(regime)
             else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
         )
         trail_distance = atr * trailing_mult
@@ -448,13 +541,19 @@ class AlpacaBroker:
         return TimeInForce.GTC
 
     def _get_tp_price(self, current_price: float, atr: float, regime: str, direction: int) -> float:
-        """Compute take-profit limit price."""
+        """Compute take-profit limit price.
+        HIGH-7 FIX: Clamp TP distance to at most 50% of current price to prevent near-zero
+        short TPs when ATR multiplier is high (e.g. trending regime with 30x ATR)."""
         tp_mult = (
             self.config.get('TAKE_PROFIT_ATR_TRENDING', self.config.get('TAKE_PROFIT_ATR', 30.0) * 1.2)
-            if regime == 'trending'
+            if is_trending(regime)
             else self.config.get('TAKE_PROFIT_ATR_MEAN_REVERTING', self.config.get('TAKE_PROFIT_ATR', 12.0))
         )
-        tp_price = current_price + direction * tp_mult * atr
+        tp_distance = tp_mult * atr
+        # HIGH-7 FIX: Cap TP distance at 50% of price to avoid near-zero short TPs
+        max_tp_distance = current_price * 0.50
+        tp_distance = min(tp_distance, max_tp_distance)
+        tp_price = current_price + direction * tp_distance
         return round(max(tp_price, 0.01), 2)
 
     # ====================== DUPLICATE CHECK ======================
@@ -491,7 +590,7 @@ class AlpacaBroker:
         else:
             size = int(size)
             if size < 1:
-                logger.debug(f"Skipping {symbol} — qty rounds to 0 (size={size:.4f})")
+                logger.debug(f"Skipping {symbol} — qty rounds to 0 (size={size})")  # L17 FIX: size is int
                 return None
             qty = size
 
@@ -548,8 +647,9 @@ class AlpacaBroker:
                     group.entry_price = limit_price
                     self.tracker._save()
 
-            self.last_entry_times[symbol] = datetime.now(tz=_UTC)
-            self._save_last_entry_times()
+            with self._entry_times_lock:
+                self.last_entry_times[symbol] = datetime.now(tz=_UTC)
+                self._save_last_entry_times_unlocked()  # C2 FIX: was _save_last_entry_times() → deadlock (re-acquires same Lock)
             self.sync_existing_positions(force_refresh=True)
 
             logger.info(
@@ -571,6 +671,17 @@ class AlpacaBroker:
     # ====================== EXIT ORDERS (called by stream.py on entry fill) ======================
     async def submit_exit_orders(self, symbol: str, group, fill_price: float, filled_qty: float):
         """Submit trailing stop + limit TP as two independent orders (manual OCO via websocket)."""
+        # Per-symbol lock prevents TOCTOU races with monitor loop
+        # FIX #18: threading.Lock — acquire in thread to avoid blocking event loop
+        lock = self._get_symbol_lock(symbol)
+        await asyncio.to_thread(lock.acquire)
+        try:
+            await self._submit_exit_orders_inner(symbol, group, fill_price, filled_qty)
+        finally:
+            lock.release()
+
+    async def _submit_exit_orders_inner(self, symbol: str, group, fill_price: float, filled_qty: float):
+        """Inner implementation of submit_exit_orders (called under per-symbol lock)."""
         direction = group.direction
         regime = group.regime
 
@@ -629,33 +740,51 @@ class AlpacaBroker:
         # Compute initial stop_price estimate for logging
         stop_price_est = round(fill_price * (1 - direction * trail_pct / 100), 2)
 
-        # Update tracker
-        if trailing_stop_id:
-            self.tracker.mark_entry_filled(
-                symbol=symbol,
-                fill_price=fill_price,
-                filled_qty=filled_qty,
-                trailing_stop_id=trailing_stop_id,
-                take_profit_id=tp_order_id,
-                trail_percent=trail_pct,
-                tp_price=tp_price,
-                stop_price=stop_price_est,
-            )
+        # Update tracker — CRIT-3 FIX: Always mark entry filled even if trailing stop submission
+        # failed, so the group transitions to OPEN and the monitor loop can re-attach exits.
+        # Without this, the group stays PENDING_ENTRY forever and the position is unprotected.
+        self.tracker.mark_entry_filled(
+            symbol=symbol,
+            fill_price=fill_price,
+            filled_qty=filled_qty,
+            trailing_stop_id=trailing_stop_id or '',
+            take_profit_id=tp_order_id,
+            trail_percent=trail_pct,
+            tp_price=tp_price,
+            stop_price=stop_price_est,
+        )
+        if not trailing_stop_id:
+            logger.warning(f"[EXIT] {symbol} entry marked filled but trailing stop MISSING — "
+                           f"monitor loop must re-attach protection")
 
     # ====================== RATCHET VIA PATCH (ReplaceOrderRequest) ======================
     def ratchet_trailing_stop(self, symbol: str, current_price: float, atr: float):
-        """Tighten trailing stop using ReplaceOrderRequest PATCH — no cancel/resubmit needed."""
-        group = self.tracker.groups.get(symbol)
-        if not group or group.state != GroupState.OPEN or not group.trailing_stop_id:
-            return
+        """Tighten trailing stop using ReplaceOrderRequest PATCH — no cancel/resubmit needed.
+        NOTE: The check-then-act on group state + PATCH is not fully atomic. A brief window
+        exists where the group could change between the read and the PATCH. This is acceptable
+        because: (1) _ratchet_pending prevents concurrent PATCHes, (2) Alpaca rejects PATCHes
+        on orders that no longer exist, and (3) the stream handler updates IDs atomically."""
+        # Skip ratchet if TP enforcement is canceling this trailing stop or replace already in-flight
+        with self._sets_lock:
+            if symbol in self._tp_in_progress:
+                return
+            if symbol in self._ratchet_pending:
+                logger.debug(f"[RATCHET] {symbol} skipped — replace PATCH already in-flight")
+                return
+        # Read all group fields under lock to prevent stale reads from concurrent stream handler
+        with self.tracker._lock:
+            group = self.tracker.groups.get(symbol)
+            if not group or group.state != GroupState.OPEN or not group.trailing_stop_id:
+                return
+            regime = group.regime
+            persistence = group.persistence
+            direction = group.direction
+            entry_price = group.entry_price or current_price
+            trailing_stop_id = group.trailing_stop_id
+            old_trail = group.trail_percent or 99.0
         now = datetime.now(tz=_UTC)
         last_ratchet = self.last_ratchet_time.get(symbol, _EPOCH)
         elapsed = (now - last_ratchet).total_seconds()
-
-        regime = group.regime
-        persistence = group.persistence
-        direction = group.direction
-        entry_price = group.entry_price or current_price
 
         # Skip losing positions
         unrealized_pct = (current_price - entry_price) / entry_price * direction if entry_price else 0.0
@@ -663,7 +792,7 @@ class AlpacaBroker:
             return
 
         # Regime-adaptive throttle
-        if regime == 'trending' and persistence >= 0.7:
+        if is_trending(regime) and persistence >= 0.7:
             min_interval = self.config.get('RATCHET_TRENDING_INTERVAL_SEC', 180)
             regime_factor = self.config.get('RATCHET_REGIME_FACTOR_TRENDING', 0.65)
         else:
@@ -686,7 +815,7 @@ class AlpacaBroker:
 
         trailing_mult = (
             self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
-            if regime == 'trending'
+            if is_trending(regime)
             else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
         )
 
@@ -706,25 +835,35 @@ class AlpacaBroker:
         distance = atr * trailing_mult * regime_factor * profit_protection
         new_trail_pct = round(max(trail_floor_pct, min(35.0, (distance / current_price) * 100)), 2)
 
-        # Only tighten (lower trail %), never widen
-        old_trail = group.trail_percent or 99.0
+        # Only tighten (lower trail %), never widen (old_trail read under lock above)
         if new_trail_pct >= old_trail:
             return
 
         try:
+            with self._sets_lock:
+                self._ratchet_pending.add(symbol)
             replace_req = ReplaceOrderRequest(trail=new_trail_pct)
-            old_id = group.trailing_stop_id
+            old_id = trailing_stop_id  # Use local copy read under lock
             new_order = self.client.replace_order_by_id(old_id, replace_req)
             # Update tracker immediately with new order ID (don't wait for websocket)
             new_order_id = str(new_order.id) if new_order and hasattr(new_order, 'id') else None
             if new_order_id and new_order_id != old_id:
                 with self.tracker._lock:
-                    group.trailing_stop_id = new_order_id
-                    self.tracker._order_id_index.pop(old_id, None)
-                    self.tracker._order_id_index[new_order_id] = symbol
-                    self.tracker._save()
+                    fresh_group = self.tracker.groups.get(symbol)
+                    if fresh_group and fresh_group.state == GroupState.OPEN:
+                        fresh_group.trailing_stop_id = new_order_id
+                        # H7 FIX: Persist trail_percent atomically with new order ID
+                        fresh_group.trail_percent = new_trail_pct
+                        self.tracker._order_id_index.pop(old_id, None)
+                        self.tracker._order_id_index[new_order_id] = symbol
+                        self.tracker._save()
+                    else:
+                        logger.warning(f"[RATCHET] {symbol} group changed during PATCH — skipping tracker update")
                 logger.debug(f"[RATCHET] {symbol} trailing stop ID updated: {old_id} → {new_order_id}")
+            with self._sets_lock:
+                self._ratchet_pending.discard(symbol)
             self.last_ratchet_time[symbol] = now
+            # H7 FIX: update_trail is now redundant (persisted above), but keep for non-PATCH paths
             self.tracker.update_trail(symbol, new_trail_pct)
             tier = 'T3-aggressive' if unrealized_pct >= ratchet_tier2 else 'T2-gentle'
             logger.info(
@@ -733,6 +872,255 @@ class AlpacaBroker:
             )
         except Exception as e:
             logger.warning(f"[RATCHET] Failed PATCH for {symbol}: {e} — will retry next cycle")
+            # HIGH-6 FIX: Clear in-flight flag on failure so next cycle can retry
+            with self._sets_lock:
+                self._ratchet_pending.discard(symbol)
+
+    # ====================== PER-SYMBOL MONITOR (called under per-symbol lock) ======================
+    async def _monitor_one_position(self, sym: str, qty: float):
+        """Process a single position under its per-symbol asyncio.Lock (prevents TOCTOU with stream)."""
+        data = self.data_ingestion.get_latest_data(sym)
+        if data is None or len(data) < 50:
+            return
+
+        # FIX #8: Read tracker group ONCE under lock to avoid TOCTOU with stream handler.
+        # Use this local snapshot throughout the method instead of repeated .groups.get(sym).
+        with self.tracker._lock:
+            tracked_group = self.tracker.groups.get(sym)
+        if tracked_group is None:
+            # No tracked group — fall back to position-derived direction for untracked cleanup below
+            pass
+        direction = tracked_group.direction if tracked_group else (1 if qty > 0 else -1)
+        current_price = float(data['close'].iloc[-1])
+        atr = self._compute_current_atr(data)
+
+        # Log position status
+        last_entry = self.last_entry_times.get(sym)
+        # FIX: Use configured trading interval instead of hardcoded 15 min
+        bar_interval_sec = self.config.get('TRADING_INTERVAL', 900)  # default 15 min = 900s
+        bars_held = ((datetime.now(tz=_UTC) - last_entry) / timedelta(seconds=bar_interval_sec)) if last_entry else 9999
+        regime, persistence = self._get_regime(sym, data)
+        min_hold = (
+            self.config.get('MIN_HOLD_BARS_TRENDING', 6)
+            if is_trending(regime)
+            else self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
+        )
+        logger.info(
+            f"  {sym} | {'LONG' if direction > 0 else 'SHORT'} {abs(qty):.2f} | "
+            f"held {int(bars_held)} bars (min {min_hold}) | regime={regime}"
+        )
+
+        # === Recover PENDING_EXIT groups stuck longer than 60s ===
+        group = tracked_group  # FIX #8: use local snapshot
+        if group and group.state == GroupState.PENDING_EXIT:
+            try:
+                # HIGH-8 FIX: Use exit_initiated_at (when exit was submitted) not filled_at (entry fill)
+                exit_ts = getattr(group, 'exit_initiated_at', None) or getattr(group, 'filled_at', None)
+                if exit_ts:
+                    filled_dt = datetime.fromisoformat(str(exit_ts))
+                    if filled_dt.tzinfo is None:
+                        filled_dt = filled_dt.replace(tzinfo=_UTC)
+                    age = (datetime.now(tz=_UTC) - filled_dt).total_seconds()
+                else:
+                    age = 9999
+                if age > 60:
+                    logger.warning(f"[PENDING_EXIT RECOVERY] {sym} stuck in PENDING_EXIT for {age:.0f}s — force-closing")
+                    try:
+                        await asyncio.to_thread(self.client.close_position, sym)
+                        logger.info(f"[PENDING_EXIT RECOVERY] {sym} position closed")
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if 'position does not exist' in err_str or '40410000' in str(e):
+                            logger.info(f"[PENDING_EXIT RECOVERY] {sym} already closed")
+                        else:
+                            logger.error(f"[PENDING_EXIT RECOVERY] Failed to close {sym}: {e}")
+                    self.tracker.mark_closed(sym)
+                    self.tracker.remove_group(sym)
+                    with self._entry_times_lock:
+                        self.last_entry_times.pop(sym, None)
+                        self._save_last_entry_times_unlocked()
+                    return
+            except Exception as e:
+                logger.error(f"[PENDING_EXIT RECOVERY] Error recovering {sym}: {e}")
+
+        # === Software TP check FIRST (before ratchet to avoid mid-replace conflicts) ===
+        group = tracked_group  # FIX #8: use local snapshot
+        if group and group.state == GroupState.OPEN and group.tp_price:
+            # BUG FIX: Use group.direction (from entry) not position-derived direction.
+            # Alpaca paper may report short sells as LONG positions, causing
+            # direction=1 with a below-entry TP → immediate false TP hit.
+            tp_dir = group.direction
+            tp_hit = (tp_dir > 0 and current_price >= group.tp_price) or \
+                     (tp_dir < 0 and current_price <= group.tp_price)
+            if tp_hit:
+                logger.info(f"[TP HIT] {sym} @ {current_price:.2f} {'≥' if tp_dir > 0 else '≤'} TP {group.tp_price:.2f} — closing position")
+                # Block ratchet from issuing PATCH while we cancel trailing stop
+                with self._sets_lock:
+                    self._tp_in_progress.add(sym)
+                # FIX #21: Wrap in try/finally so _tp_in_progress is always cleared
+                try:
+                    # Cancel trailing stop first — retry with fresh order ID if mid-replace
+                    trail_cancelled = False
+                    if group.trailing_stop_id:
+                        for attempt in range(3):
+                            try:
+                                # Re-read order ID in case _handle_replaced updated it
+                                fresh_group = self.tracker.groups.get(sym)
+                                cancel_id = fresh_group.trailing_stop_id if fresh_group else group.trailing_stop_id
+                                await asyncio.to_thread(self.client.cancel_order_by_id, cancel_id)
+                                trail_cancelled = True
+                                logger.info(f"[TP HIT] Cancelled trailing stop for {sym}: {cancel_id}")
+                                break
+                            except Exception as e:
+                                err_str = str(e)
+                                if '42210000' in err_str or 'replaced' in err_str.lower():
+                                    # Order mid-replace — wait for new ID from websocket
+                                    logger.debug(f"[TP HIT] {sym} trailing stop mid-replace, waiting... (attempt {attempt+1})")
+                                    await asyncio.sleep(1.5)
+                                elif '40410000' in err_str or 'not found' in err_str.lower():
+                                    trail_cancelled = True  # Already gone
+                                    break
+                                else:
+                                    logger.warning(f"[TP HIT] Failed to cancel trailing stop for {sym}: {e}")
+                                    break
+                    else:
+                        trail_cancelled = True
+                    # Close position (only if trailing stop is out of the way)
+                    if trail_cancelled:
+                        try:
+                            await asyncio.to_thread(self.client.close_position, sym)
+                            logger.info(f"[TP HIT] {sym} position closed")
+                            self.tracker.mark_closed(sym)
+                            self.tracker.remove_group(sym)
+                            with self._entry_times_lock:
+                                self.last_entry_times.pop(sym, None)
+                                self._save_last_entry_times_unlocked()
+                        except Exception as e:
+                            logger.error(f"[TP HIT] Failed to close {sym}: {e}")
+                            err_str = str(e).lower()
+                            if 'position does not exist' in err_str or '40410000' in str(e):
+                                logger.info(f"[TP HIT] {sym} position already closed — cleaning up tracker")
+                                self.tracker.mark_closed(sym)
+                                self.tracker.remove_group(sym)
+                                with self._entry_times_lock:
+                                    self.last_entry_times.pop(sym, None)
+                                    self._save_last_entry_times_unlocked()
+                    else:
+                        logger.warning(f"[TP HIT] {sym} — could not cancel trailing stop, will retry next cycle")
+                finally:
+                    with self._sets_lock:
+                        self._tp_in_progress.discard(sym)
+                return
+
+        # === Software trailing stop for positions without native trailing stop ===
+        # H5 FIX: Re-read live group from tracker under lock for writes (snapshot may be orphaned)
+        group = tracked_group  # read-only checks use snapshot
+        if group and group.state == GroupState.OPEN and not group.trailing_stop_id:
+            if group.stop_price and group.entry_price and group.trail_percent:
+                sl_dir = group.direction
+                trail_dist = current_price * group.trail_percent / 100
+                new_stop = round(current_price - sl_dir * trail_dist, 2)
+                if sl_dir > 0 and new_stop > group.stop_price:
+                    with self.tracker._lock:
+                        live_group = self.tracker.groups.get(sym)
+                        if live_group and live_group.state == GroupState.OPEN:
+                            live_group.stop_price = new_stop
+                            self.tracker._save()
+                    logger.debug(f"[SOFTWARE TRAIL] {sym} stop trailed up to {new_stop:.2f}")
+                elif sl_dir < 0 and new_stop < group.stop_price:
+                    with self.tracker._lock:
+                        live_group = self.tracker.groups.get(sym)
+                        if live_group and live_group.state == GroupState.OPEN:
+                            live_group.stop_price = new_stop
+                            self.tracker._save()
+                    logger.debug(f"[SOFTWARE TRAIL] {sym} stop trailed down to {new_stop:.2f}")
+
+                sl_hit = (sl_dir > 0 and current_price <= group.stop_price) or \
+                         (sl_dir < 0 and current_price >= group.stop_price)
+                if sl_hit:
+                    logger.info(f"[SOFTWARE SL] {sym} @ {current_price:.2f} hit stop {group.stop_price:.2f} — closing")
+                    try:
+                        await asyncio.to_thread(self.client.close_position, sym)
+                        logger.info(f"[SOFTWARE SL] {sym} position closed")
+                        self.tracker.mark_closed(sym)
+                        self.tracker.remove_group(sym)
+                        with self._entry_times_lock:
+                            self.last_entry_times.pop(sym, None)
+                            self._save_last_entry_times_unlocked()
+                    except Exception as e:
+                        logger.error(f"[SOFTWARE SL] Failed to close {sym}: {e}")
+                    return
+
+        # === Ratchet trailing stop via PATCH (after TP check to avoid mid-replace conflicts) ===
+        if is_market_open():
+            await asyncio.to_thread(self.ratchet_trailing_stop, sym, current_price, atr)
+
+        # === Auto-close tracked fractional orphans (< 1 share, no trailing stop) ===
+        group = tracked_group  # FIX #8: use local snapshot
+        if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) < 1.0:
+            notional = abs(qty) * current_price
+            logger.info(f"[FRAC CLEANUP] {sym} tracked OPEN but only {abs(qty):.4f} shares "
+                        f"(${notional:.2f}) with no trailing stop — closing orphan")
+            try:
+                await asyncio.to_thread(self.client.close_position, sym)
+                logger.info(f"[FRAC CLEANUP] {sym} fractional orphan closed")
+                self.tracker.mark_closed(sym)
+                self.tracker.remove_group(sym)
+                with self._entry_times_lock:
+                    self.last_entry_times.pop(sym, None)
+                    self._save_last_entry_times_unlocked()
+            except Exception as e:
+                err_str = str(e).lower()
+                if 'position does not exist' in err_str or '40410000' in str(e):
+                    logger.info(f"[FRAC CLEANUP] {sym} already gone — cleaning up tracker")
+                    self.tracker.mark_closed(sym)
+                    self.tracker.remove_group(sym)
+                    with self._entry_times_lock:
+                        self.last_entry_times.pop(sym, None)
+                        self._save_last_entry_times_unlocked()
+                else:
+                    logger.error(f"[FRAC CLEANUP] Failed to close {sym}: {e}")
+            return
+
+        # === Re-attach trailing stop for tracked groups that lost it ===
+        group = tracked_group  # FIX #8: use local snapshot
+        if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) >= 1:
+            if is_market_open():
+                logger.info(f"[REATTACH-STOP] {sym} tracked but no trailing stop — resubmitting")
+                trail_pct = group.trail_percent or self._get_trail_percent(current_price, atr, regime)
+                close_side = OrderSide.SELL if group.direction > 0 else OrderSide.BUY
+                trail_qty = int(abs(qty))
+                try:
+                    trail_req = TrailingStopOrderRequest(
+                        symbol=sym, qty=trail_qty, side=close_side,
+                        time_in_force=self._tif_for_qty(trail_qty), trail_percent=trail_pct,
+                    )
+                    resp = await asyncio.to_thread(self.client.submit_order, trail_req)
+                    with self.tracker._lock:
+                        group.trailing_stop_id = str(resp.id)
+                        group.stop_price = round(current_price * (1 - group.direction * trail_pct / 100), 2)
+                        self.tracker._order_id_index[str(resp.id)] = sym
+                        self.tracker._save()
+                    logger.info(f"[REATTACH-STOP] {sym} trailing stop restored @ {trail_pct}% | id={resp.id}")
+                except Exception as e:
+                    logger.error(f"[REATTACH-STOP] Failed to resubmit trailing stop for {sym}: {e}")
+
+        # === Re-attach missing exits for untracked positions ===
+        if not group or group.state == GroupState.CLOSED:
+            # Position exists but no tracker group — check if it's a tiny fractional remainder
+            abs_qty = abs(qty)
+            if abs_qty < 1.0:
+                # Fractional remainder worth < 1 share — close it (negligible value, can't have trailing stop)
+                notional = abs_qty * current_price
+                logger.info(f"[CLEANUP] {sym} fractional remainder {abs_qty:.4f} shares (${notional:.2f}) — closing")
+                try:
+                    await asyncio.to_thread(self.client.close_position, sym)
+                    logger.info(f"[CLEANUP] {sym} fractional remainder closed")
+                except Exception as e:
+                    logger.warning(f"[CLEANUP] Failed to close {sym} fractional remainder: {e}")
+            elif is_market_open() and bars_held >= min_hold:
+                # Re-attach protective orders for full positions
+                await self._reattach_exits(sym, qty, direction, current_price, atr, regime)
 
     # ====================== MONITOR LOOP ======================
     async def monitor_positions(self):
@@ -744,7 +1132,7 @@ class AlpacaBroker:
             pos_count = len(self.existing_positions)
             tracked = len(self.tracker.get_open_groups())
             heartbeat_msg = (
-                f"[{datetime.now().strftime('%H:%M:%S')}] Monitor — "
+                f"[{datetime.now(tz=_UTC).strftime('%H:%M:%S')}] Monitor — "
                 f"{pos_count} positions | {tracked} tracked groups | "
                 f"market {'open' if is_market_open() else 'closed'}"
             )
@@ -752,183 +1140,19 @@ class AlpacaBroker:
             logger.info(heartbeat_msg)
 
             # === Per-position logic ===
+            # FIX #23: Snapshot to avoid mutation during iteration (already using list())
             try:
                 for sym, qty in list(self.existing_positions.items()):
                     if qty == 0 or self.data_ingestion is None:
                         continue
-                    data = self.data_ingestion.get_latest_data(sym)
-                    if data is None or len(data) < 50:
-                        continue
-
-                    # Prefer tracker direction (authoritative) over position qty sign
-                    # Alpaca may report short positions with positive qty in some cases
-                    tracked_group = self.tracker.groups.get(sym)
-                    direction = tracked_group.direction if tracked_group else (1 if qty > 0 else -1)
-                    current_price = float(data['close'].iloc[-1])
-                    atr = self._compute_current_atr(data)
-
-                    # Log position status
-                    last_entry = self.last_entry_times.get(sym)
-                    bars_held = ((datetime.now(tz=_UTC) - last_entry) / timedelta(minutes=15)) if last_entry else 9999
-                    regime, persistence = self._get_regime(sym, data)
-                    min_hold = (
-                        self.config.get('MIN_HOLD_BARS_TRENDING', 6)
-                        if regime == 'trending'
-                        else self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
-                    )
-                    logger.info(
-                        f"  {sym} | {'LONG' if direction > 0 else 'SHORT'} {abs(qty):.2f} | "
-                        f"held {int(bars_held)} bars (min {min_hold}) | regime={regime}"
-                    )
-
-                    # === Software TP check FIRST (before ratchet to avoid mid-replace conflicts) ===
-                    group = self.tracker.groups.get(sym)
-                    if group and group.state == GroupState.OPEN and group.tp_price:
-                        # BUG FIX: Use group.direction (from entry) not position-derived direction.
-                        # Alpaca paper may report short sells as LONG positions, causing
-                        # direction=1 with a below-entry TP → immediate false TP hit.
-                        tp_dir = group.direction
-                        tp_hit = (tp_dir > 0 and current_price >= group.tp_price) or \
-                                 (tp_dir < 0 and current_price <= group.tp_price)
-                        if tp_hit:
-                            logger.info(f"[TP HIT] {sym} @ {current_price:.2f} {'≥' if tp_dir > 0 else '≤'} TP {group.tp_price:.2f} — closing position")
-                            # Cancel trailing stop first — retry with fresh order ID if mid-replace
-                            trail_cancelled = False
-                            if group.trailing_stop_id:
-                                for attempt in range(3):
-                                    try:
-                                        # Re-read order ID in case _handle_replaced updated it
-                                        fresh_group = self.tracker.groups.get(sym)
-                                        cancel_id = fresh_group.trailing_stop_id if fresh_group else group.trailing_stop_id
-                                        await asyncio.to_thread(self.client.cancel_order_by_id, cancel_id)
-                                        trail_cancelled = True
-                                        logger.info(f"[TP HIT] Cancelled trailing stop for {sym}: {cancel_id}")
-                                        break
-                                    except Exception as e:
-                                        err_str = str(e)
-                                        if '42210000' in err_str or 'replaced' in err_str.lower():
-                                            # Order mid-replace — wait for new ID from websocket
-                                            logger.debug(f"[TP HIT] {sym} trailing stop mid-replace, waiting... (attempt {attempt+1})")
-                                            await asyncio.sleep(1.5)
-                                        elif '40410000' in err_str or 'not found' in err_str.lower():
-                                            trail_cancelled = True  # Already gone
-                                            break
-                                        else:
-                                            logger.warning(f"[TP HIT] Failed to cancel trailing stop for {sym}: {e}")
-                                            break
-                            else:
-                                trail_cancelled = True
-                            # Close position (only if trailing stop is out of the way)
-                            if trail_cancelled:
-                                try:
-                                    await asyncio.to_thread(self.client.close_position, sym)
-                                    logger.info(f"[TP HIT] {sym} position closed")
-                                    self.tracker.mark_closed(sym)
-                                    self.tracker.remove_group(sym)
-                                    self.last_entry_times.pop(sym, None)
-                                    self._save_last_entry_times()
-                                except Exception as e:
-                                    logger.error(f"[TP HIT] Failed to close {sym}: {e}")
-                                    err_str = str(e).lower()
-                                    if 'position does not exist' in err_str or '40410000' in str(e):
-                                        logger.info(f"[TP HIT] {sym} position already closed — cleaning up tracker")
-                                        self.tracker.mark_closed(sym)
-                                        self.tracker.remove_group(sym)
-                                        self.last_entry_times.pop(sym, None)
-                                        self._save_last_entry_times()
-                            else:
-                                logger.warning(f"[TP HIT] {sym} — could not cancel trailing stop, will retry next cycle")
-                            continue
-
-                    # === Software stop-loss for positions without native trailing stop ===
-                    group = self.tracker.groups.get(sym)
-                    if group and group.state == GroupState.OPEN and not group.trailing_stop_id:
-                        # No native trailing stop — enforce software stop-loss using stored stop_price
-                        if group.stop_price and group.entry_price:
-                            sl_dir = group.direction
-                            sl_hit = (sl_dir > 0 and current_price <= group.stop_price) or \
-                                     (sl_dir < 0 and current_price >= group.stop_price)
-                            if sl_hit:
-                                logger.info(f"[SOFTWARE SL] {sym} @ {current_price:.2f} hit stop {group.stop_price:.2f} — closing")
-                                try:
-                                    await asyncio.to_thread(self.client.close_position, sym)
-                                    logger.info(f"[SOFTWARE SL] {sym} position closed")
-                                    self.tracker.mark_closed(sym)
-                                    self.tracker.remove_group(sym)
-                                    self.last_entry_times.pop(sym, None)
-                                    self._save_last_entry_times()
-                                except Exception as e:
-                                    logger.error(f"[SOFTWARE SL] Failed to close {sym}: {e}")
-                                continue
-
-                    # === Ratchet trailing stop via PATCH (after TP check to avoid mid-replace conflicts) ===
-                    if is_market_open():
-                        await asyncio.to_thread(self.ratchet_trailing_stop, sym, current_price, atr)
-
-                    # === Auto-close tracked fractional orphans (< 1 share, no trailing stop) ===
-                    group = self.tracker.groups.get(sym)
-                    if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) < 1.0:
-                        notional = abs(qty) * current_price
-                        logger.info(f"[FRAC CLEANUP] {sym} tracked OPEN but only {abs(qty):.4f} shares "
-                                    f"(${notional:.2f}) with no trailing stop — closing orphan")
-                        try:
-                            await asyncio.to_thread(self.client.close_position, sym)
-                            logger.info(f"[FRAC CLEANUP] {sym} fractional orphan closed")
-                            self.tracker.mark_closed(sym)
-                            self.tracker.remove_group(sym)
-                            self.last_entry_times.pop(sym, None)
-                            self._save_last_entry_times()
-                        except Exception as e:
-                            err_str = str(e).lower()
-                            if 'position does not exist' in err_str or '40410000' in str(e):
-                                logger.info(f"[FRAC CLEANUP] {sym} already gone — cleaning up tracker")
-                                self.tracker.mark_closed(sym)
-                                self.tracker.remove_group(sym)
-                                self.last_entry_times.pop(sym, None)
-                                self._save_last_entry_times()
-                            else:
-                                logger.error(f"[FRAC CLEANUP] Failed to close {sym}: {e}")
-                        continue
-
-                    # === Re-attach trailing stop for tracked groups that lost it ===
-                    group = self.tracker.groups.get(sym)
-                    if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) >= 1:
-                        if is_market_open():
-                            logger.info(f"[REATTACH-STOP] {sym} tracked but no trailing stop — resubmitting")
-                            trail_pct = group.trail_percent or self._get_trail_percent(current_price, atr, regime)
-                            close_side = OrderSide.SELL if group.direction > 0 else OrderSide.BUY
-                            trail_qty = int(abs(qty))
-                            try:
-                                trail_req = TrailingStopOrderRequest(
-                                    symbol=sym, qty=trail_qty, side=close_side,
-                                    time_in_force=self._tif_for_qty(trail_qty), trail_percent=trail_pct,
-                                )
-                                resp = await asyncio.to_thread(self.client.submit_order, trail_req)
-                                with self.tracker._lock:
-                                    group.trailing_stop_id = str(resp.id)
-                                    group.stop_price = round(current_price * (1 - group.direction * trail_pct / 100), 2)
-                                    self.tracker._order_id_index[str(resp.id)] = sym
-                                    self.tracker._save()
-                                logger.info(f"[REATTACH-STOP] {sym} trailing stop restored @ {trail_pct}% | id={resp.id}")
-                            except Exception as e:
-                                logger.error(f"[REATTACH-STOP] Failed to resubmit trailing stop for {sym}: {e}")
-
-                    # === Re-attach missing exits for untracked positions ===
-                    if not group or group.state == GroupState.CLOSED:
-                        # Position exists but no tracker group — check if it's a tiny fractional remainder
-                        abs_qty = abs(qty)
-                        if abs_qty < 1.0:
-                            # Fractional remainder worth < 1 share — close it (negligible value, can't have trailing stop)
-                            notional = abs_qty * current_price
-                            logger.info(f"[CLEANUP] {sym} fractional remainder {abs_qty:.4f} shares (${notional:.2f}) — closing")
-                            try:
-                                await asyncio.to_thread(self.client.close_position, sym)
-                                logger.info(f"[CLEANUP] {sym} fractional remainder closed")
-                            except Exception as e:
-                                logger.warning(f"[CLEANUP] Failed to close {sym} fractional remainder: {e}")
-                        elif is_market_open() and bars_held >= min_hold:
-                            # Re-attach protective orders for full positions
-                            await self._reattach_exits(sym, qty, direction, current_price, atr, regime)
+                    # Per-symbol lock prevents TOCTOU races between monitor and stream handler
+                    # FIX #18: threading.Lock — acquire in thread to avoid blocking event loop
+                    lock = self._get_symbol_lock(sym)
+                    await asyncio.to_thread(lock.acquire)
+                    try:
+                        await self._monitor_one_position(sym, qty)
+                    finally:
+                        lock.release()
 
             except Exception as e:
                 logger.error(f"Monitor per-position error: {e}", exc_info=True)
@@ -1016,27 +1240,36 @@ class AlpacaBroker:
         except Exception as e:
             logger.warning(f"Failed to fetch recent orders for slippage adaptation: {e}")
             return
+        # FIX #41: Build set of known entry order IDs from tracker for definitive identification
+        known_entry_ids = set()
+        with self.tracker._lock:
+            for group in self.tracker.groups.values():
+                if group.entry_order_id:
+                    known_entry_ids.add(group.entry_order_id)
         slippage_total = 0.0
         fill_count = 0
         for o in recent_closed:
             if not (o.filled_at and o.filled_avg_price and o.limit_price):
                 continue
-            # ONLY measure slippage on ENTRY limit orders (not trailing stops, not exit sells)
-            order_type = str(getattr(o, 'order_type', '')).lower().split('.')[-1]
-            if order_type != 'limit':
+            order_id = str(o.id) if o.id else ''
+            # Definitively identify entry orders via tracker
+            if order_id and order_id in known_entry_ids:
+                is_entry = True
+            else:
+                # Fallback heuristic for orders not in tracker (e.g., already closed groups)
+                order_type = str(getattr(o, 'order_type', '')).lower().split('.')[-1]
+                if order_type != 'limit':
+                    continue
+                # Only count if slippage is small (< 2%) — larger gaps indicate exit orders
+                slippage_check = abs(float(o.filled_avg_price) - float(o.limit_price)) / float(o.limit_price)
+                if slippage_check > 0.02:
+                    continue
+                is_entry = True
+            if not is_entry:
                 continue
-            # Skip exit orders — only entry orders have position_intent BUY_TO_OPEN/SELL_TO_OPEN
-            # Heuristic: entry buys have limit ABOVE market, entry sells have limit BELOW market
             fill_price = float(o.filled_avg_price)
             limit_price = float(o.limit_price)
-            side = str(getattr(o, 'side', '')).lower().split('.')[-1]
-            # Entry buy: limit >= fill (willing to pay up to limit)
-            # Entry sell (short): limit <= fill (willing to sell down to limit)
-            # Exit sell: limit could be anything (TP target) — skip
-            # Only count if slippage is small (< 5%) — large gaps indicate exit orders
             slippage = abs(fill_price - limit_price) / limit_price
-            if slippage > 0.05:
-                continue  # clearly not an entry order — skip
             filled_at_utc = o.filled_at.astimezone(_UTC) if o.filled_at.tzinfo else o.filled_at.replace(tzinfo=_UTC)
             if (datetime.now(tz=_UTC) - filled_at_utc).total_seconds() < 3600:
                 slippage_total += slippage
@@ -1051,7 +1284,11 @@ class AlpacaBroker:
 
     # ====================== SAFE POSITION CLOSE ======================
     async def close_position_safely(self, symbol: str) -> bool:
-        """Cancel all open orders for symbol, then close position."""
+        """Cancel all open orders for symbol, then close position.
+        H8 FIX: Acquires per-symbol lock to prevent race with monitor and stream."""
+        # H8 FIX: Acquire per-symbol lock to serialize with monitor and stream
+        lock = self._get_symbol_lock(symbol)
+        await asyncio.to_thread(lock.acquire)
         try:
             all_open = await asyncio.to_thread(
                 self.client.get_orders, GetOrdersRequest(status='open', symbols=[symbol]))
@@ -1077,12 +1314,16 @@ class AlpacaBroker:
             await asyncio.to_thread(self.client.close_position, symbol)
             logger.info(f"Closed position in {symbol}")
 
-            # Clean up tracker and entry times
+            # H6 FIX: mark_closed before remove_group (sets state=CLOSED + closed_at)
+            self.tracker.mark_closed(symbol)
             self.tracker.remove_group(symbol)
-            self.last_entry_times.pop(symbol, None)
-            self._save_last_entry_times()
-            self.sync_existing_positions(force_refresh=True)
+            with self._entry_times_lock:
+                self.last_entry_times.pop(symbol, None)
+                self._save_last_entry_times_unlocked()
+            await asyncio.to_thread(self.sync_existing_positions, force_refresh=True)
             return True
         except Exception as e:
             logger.error(f"Failed to close position in {symbol}: {e}")
             return False
+        finally:
+            lock.release()

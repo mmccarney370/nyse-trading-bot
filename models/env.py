@@ -5,16 +5,16 @@ from gymnasium.spaces import Box
 import numpy as np
 import pandas as pd
 from config import CONFIG
-from models.features import generate_features, _precompute_and_cache_tft
+from models.features import generate_features
 import logging
 from strategy.regime import detect_regime
 
 logger = logging.getLogger(__name__)
 
 class TradingEnv(gym.Env):
-    # Class-level cache for TFT features (shared across instances if needed)
-    tft_cache = {} # {symbol: (timestamp, cached_full_df)}
-    _tft_cache_ttl = 3600  # 1 hour TTL for TFT cache entries
+    # H17 FIX: Cache feature dimension at class level so all instances share the same obs space.
+    # Computed once on first instantiation, never changes (generate_features output is deterministic).
+    _cached_feature_dim = None
 
     def __init__(self, data_ingestion, symbol: str, initial_balance: float = 1000.0):
         super().__init__()
@@ -22,33 +22,32 @@ class TradingEnv(gym.Env):
         self.symbol = symbol
         self.initial_balance = initial_balance
         self.current_step = 0
-        self.position = 0.0 # -1 to 1
+        self.position = 0.0 # -1 to 1 (fractional target, used for turnover penalty)
         self.cash = initial_balance
         self.equity = initial_balance
         self.data = pd.DataFrame()
-        self.max_shares = initial_balance / 100
+        self._shares_held = 0.0  # actual shares held (positive=long, negative=short)
         self.returns = []
         self.equity_prev = initial_balance
         self.cummax_equity = initial_balance
-        # UPGRADE #1: Causal wrapper will be injected by Trainer
         self.causal_wrapper = None
-        # P-9 FIX: vol_target now properly stored and passed (teacher-forcing)
         self.vol_target = 0.0
-        # DYNAMIC OBSERVATION SPACE — now includes volatility target (UPGRADE #6)
-        dummy_window = pd.DataFrame({
-            'open': [100.0] * 300,
-            'high': [101.0] * 300,
-            'low': [99.0] * 300,
-            'close': [100.0] * 300,
-            'volume': [1000000] * 300
-        }, index=pd.date_range(end='2026-01-01', periods=300, freq='15min'))
-        dummy_regime = 'mean_reverting'
-        try:
-            dummy_features = generate_features(dummy_window, dummy_regime, symbol="DUMMY", full_hist_df=dummy_window)
-            feature_dim = dummy_features.shape[1] if dummy_features is not None and dummy_features.size > 0 else 52
-        except Exception as e:
-            logger.warning(f"Failed to compute feature dim dynamically ({e}) — falling back to 52")
-            feature_dim = 52
+        # H17 FIX: Compute feature dim once and cache at class level
+        if TradingEnv._cached_feature_dim is None:
+            dummy_window = pd.DataFrame({
+                'open': [100.0] * 300,
+                'high': [101.0] * 300,
+                'low': [99.0] * 300,
+                'close': [100.0] * 300,
+                'volume': [1000000] * 300
+            }, index=pd.date_range(end='2026-01-01', periods=300, freq='15min'))
+            try:
+                dummy_features = generate_features(dummy_window, 'mean_reverting', symbol="DUMMY", full_hist_df=dummy_window)
+                TradingEnv._cached_feature_dim = dummy_features.shape[1] if dummy_features is not None and dummy_features.size > 0 else 53
+            except Exception as e:
+                logger.warning(f"Failed to compute feature dim dynamically ({e}) — falling back to 53")
+                TradingEnv._cached_feature_dim = 53
+        feature_dim = TradingEnv._cached_feature_dim
         self.observation_space = Box(low=-np.inf, high=np.inf, shape=(feature_dim,), dtype=np.float32)
         logger.info(f"Observation space dynamically set to shape=({feature_dim},) for symbol {symbol}")
         self.action_space = Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
@@ -59,6 +58,7 @@ class TradingEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 199
         self.position = 0.0
+        self._shares_held = 0.0
         self.cash = self.initial_balance
         self.equity = self.initial_balance
         self.cummax_equity = self.initial_balance
@@ -81,24 +81,8 @@ class TradingEnv(gym.Env):
                 data_ingestion=self.data_ingestion,
                 lookback=CONFIG.get('LOOKBACK', 900)
             )
-        # TFT CACHING
-        if CONFIG.get('USE_TFT_ENCODER', False):
-            import time as _time
-            cached = TradingEnv.tft_cache.get(self.symbol)
-            cache_stale = (cached is None or
-                           len(cached[1]) < len(self.data) or
-                           (_time.time() - cached[0]) > TradingEnv._tft_cache_ttl)
-            if cache_stale:
-                logger.info(f"Updating TFT cache for {self.symbol} ({len(self.data)} bars)")
-                TradingEnv.tft_cache[self.symbol] = (_time.time(), _precompute_and_cache_tft(self.symbol, self.data))
-                # Evict symbols no longer in universe to prevent memory bloat
-                active_symbols = set(CONFIG.get('SYMBOLS', []))
-                stale_keys = [k for k in TradingEnv.tft_cache if k not in active_symbols]
-                for k in stale_keys:
-                    del TradingEnv.tft_cache[k]
-                    logger.debug(f"TFT cache evicted stale symbol: {k}")
-            else:
-                logger.debug(f"TFT cache already up-to-date for {self.symbol}")
+        # TFT features are cached on-disk by _precompute_and_cache_tft (called lazily from
+        # generate_features when USE_TFT_ENCODER is True). No separate in-memory cache needed.
         return self._get_observation(), {}
 
     def step(self, action):
@@ -117,13 +101,22 @@ class TradingEnv(gym.Env):
             )
         target_pos = np.clip(float(action[0]), -1.0, 1.0)
         current_price = self.data['close'].iloc[self.current_step]
+        # C1 FIX: Track shares directly instead of circular max_shares formula.
+        # target_pos in [-1, 1] maps to fraction of current equity deployed.
+        # desired_value = target_pos * equity, desired_shares = desired_value / price.
+        if current_price > 0 and self.equity > 0:
+            desired_shares = (target_pos * self.equity) / current_price
+        else:
+            desired_shares = 0.0
+        trade_shares = desired_shares - self._shares_held
         trade_pos = target_pos - self.position
-        trade_shares = trade_pos * self.max_shares
-        turnover_cost = abs(trade_shares) * current_price * (CONFIG.get('SLIPPAGE', 0.0005) + CONFIG.get('COMMISSION_PER_SHARE', 0.0005) / current_price)
+        turnover_cost = abs(trade_shares * current_price) * (CONFIG.get('SLIPPAGE', 0.0005) + CONFIG.get('COMMISSION_PER_SHARE', 0.0005) / max(current_price, 0.01))
+        self._shares_held = desired_shares
         self.position = target_pos
-        self.cash -= trade_shares * current_price  # pay for (or receive from) the shares
+        self.cash -= trade_shares * current_price
         self.cash -= turnover_cost
-        self.equity = self.cash + self.position * current_price * self.max_shares
+        # Equity = cash + market value of held shares (price moves between steps create P&L)
+        self.equity = self.cash + self._shares_held * current_price
         ret = (self.equity - self.equity_prev) / self.equity_prev if self.equity_prev > 0 else 0
         self.returns.append(ret)
         self.equity_prev = self.equity
@@ -144,6 +137,8 @@ class TradingEnv(gym.Env):
                 downside_std = max(downside_std, 1e-8)
                 mean_return = np.mean(recent_returns)
                 sortino = mean_return / downside_std
+                # FIX #44: Clip sortino to prevent reward explosion when downside_std is tiny
+                sortino = np.clip(sortino, -5.0, 5.0)
                 # Scale to per-step magnitude (no annualization — keeps reward scale consistent)
                 reward += sortino * CONFIG.get('SORTINO_WEIGHT', 0.25)
             else:
@@ -153,7 +148,8 @@ class TradingEnv(gym.Env):
         annual_vol = 0.0
         if len(self.returns) > 50:
             recent_vol = np.std(self.returns[-100:])
-            annual_vol = recent_vol * np.sqrt(252 * 96)
+            # FIX #41: Use CONFIG key for annualization factor (252 trading days * 26 fifteen-min bars/day)
+            annual_vol = recent_vol * np.sqrt(CONFIG.get('ANNUALIZATION_FACTOR', 252 * 26))
             reward -= annual_vol * CONFIG.get('VOL_PENALTY_COEF', 0.02)
 
         # ─── Drawdown penalty: proportional to current drawdown depth ───
@@ -161,6 +157,10 @@ class TradingEnv(gym.Env):
         reward -= CONFIG.get('DD_PENALTY_COEF', 2.0) * max(-drawdown, 0.0)
 
         # ─── Causal penalty: counterfactual reward adjustment ───
+        # Features are computed for causal penalty but NOT cached for _get_observation(),
+        # because current_step will be incremented before _get_observation() runs,
+        # making pre-increment features 1 bar stale.
+        self._step_cached_features = None
         if self.causal_wrapper is not None:
             features = generate_features(
                 data=window,
@@ -173,21 +173,21 @@ class TradingEnv(gym.Env):
                 latest_features.reshape(1, -1),
                 float(action[0])
             )
-            # factor > 1.0 = strong causal signal → amplify reward direction
-            # factor < 1.0 = weak causal signal → dampen reward
-            # factor = 1.0 = no effect
             reward *= penalty_factor
             logger.debug(f"[CAUSAL REWARD] {self.symbol} | regime={regime} | action={action[0]:.3f} | factor={penalty_factor:.4f}")
 
-        # ─── Persistence bonus: reward holding in strong regimes ───
-        persistence_bonus = (persistence - 0.5) * CONFIG.get('PERSISTENCE_BONUS_SCALE', 0.15)
+        # ─── Persistence bonus: reward holding (low turnover) in strong regimes ───
+        # Scale by (1 - |trade_pos|) so the bonus rewards staying in position, not changing.
+        # A constant bonus regardless of action just shifts the baseline without teaching anything.
+        hold_factor = 1.0 - min(abs(trade_pos), 1.0)  # 1.0 when holding, 0.0 when fully flipping
+        persistence_bonus = (persistence - 0.5) * CONFIG.get('PERSISTENCE_BONUS_SCALE', 0.15) * hold_factor
         reward += persistence_bonus
-        logger.debug(f"[PERSISTENCE REWARD] {self.symbol} | regime={regime} | persistence={persistence:.3f} | bonus={persistence_bonus:.4f}")
+        logger.debug(f"[PERSISTENCE REWARD] {self.symbol} | regime={regime} | persistence={persistence:.3f} | hold={hold_factor:.2f} | bonus={persistence_bonus:.4f}")
         # ─────────────────────────────────────────────────────────────────────
         # UPGRADE #6: Volatility-target is now part of the observation (teacher-forcing)
         # annual_vol is computed here and passed through generate_features as the last column
         # ─────────────────────────────────────────────────────────────────────
-        vol_target = annual_vol if 'annual_vol' in locals() else 0.0
+        vol_target = annual_vol  # L28 FIX: always in scope (initialized at line 148)
         # P-9 FIX: Store vol_target so _get_observation() can append it
         self.vol_target = vol_target
         # Clip reward
@@ -213,12 +213,18 @@ class TradingEnv(gym.Env):
                 data_ingestion=self.data_ingestion,
                 lookback=CONFIG.get('LOOKBACK', 900)
             )
-        features = generate_features(
-            data=window,
-            regime=regime,
-            symbol=self.symbol,
-            full_hist_df=self.data
-        )
+        # FIX #43: Reuse features cached by step() if available (avoids duplicate generate_features call)
+        cached_feats = getattr(self, '_step_cached_features', None)
+        if cached_feats is not None:
+            features = cached_feats
+            self._step_cached_features = None  # Consume cache (one-time use)
+        else:
+            features = generate_features(
+                data=window,
+                regime=regime,
+                symbol=self.symbol,
+                full_hist_df=self.data
+            )
         if features is None or features.shape[0] == 0:
             return np.zeros(self.observation_space.shape[0], dtype=np.float32)
 
@@ -231,6 +237,11 @@ class TradingEnv(gym.Env):
             latest = features[-1].astype(np.float32)
 
         # Recompute recent window if near end (existing logic)
+        # NOTE (FIX #40): When step_idx is near len(features)-20, we switch from using the
+        # pre-computed feature matrix to a fresh 200-bar window. This can cause a small
+        # observation discontinuity because the fresh window uses different lookback context.
+        # Known limitation — accepted because the alternative (recomputing features for all
+        # steps) is too expensive, and the PPO policy learns to handle minor input shifts.
         if step_idx >= len(features) - 20:
             timestamp = window.index[-1]  # use actual last timestamp
             recent_window = self.data.loc[:timestamp].tail(200)

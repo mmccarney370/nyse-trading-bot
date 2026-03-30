@@ -45,6 +45,7 @@ class OrderGroup:
     closed_at: Optional[str] = None
     slippage: Optional[float] = None       # Entry slippage measured on fill
     extended_hours: bool = False
+    exit_initiated_at: Optional[str] = None  # When exit was submitted (PENDING_EXIT timestamp)
 
     def __post_init__(self):
         if self.created_at is None:
@@ -60,6 +61,11 @@ class OrderGroup:
     @classmethod
     def from_dict(cls, d: dict) -> 'OrderGroup':
         import dataclasses
+        # M26 FIX: Validate required fields before constructing
+        required = {'symbol', 'direction', 'entry_order_id'}
+        missing = required - set(d.keys())
+        if missing:
+            raise ValueError(f"OrderGroup.from_dict missing required fields: {missing}")
         valid_keys = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in d.items() if k in valid_keys}
         return cls(**filtered)
@@ -81,11 +87,17 @@ class OrderTracker:
         try:
             with open(self.filepath, 'r') as f:
                 data = json.load(f)
+            # H9 FIX: Per-entry error handling — one corrupt entry no longer destroys all groups
+            loaded = 0
             for sym, gd in data.items():
-                group = OrderGroup.from_dict(gd)
-                self.groups[sym] = group
-                self._index_group(group)
-            logger.info(f"OrderTracker loaded {len(self.groups)} groups from {self.filepath}")
+                try:
+                    group = OrderGroup.from_dict(gd)
+                    self.groups[sym] = group
+                    self._index_group(group)
+                    loaded += 1
+                except Exception as entry_e:
+                    logger.warning(f"OrderTracker: skipping corrupt entry for {sym}: {entry_e}")
+            logger.info(f"OrderTracker loaded {loaded}/{len(data)} groups from {self.filepath}")
         except Exception as e:
             logger.warning(f"Failed to load order tracker: {e}")
 
@@ -114,6 +126,13 @@ class OrderTracker:
                      regime: str = "mean_reverting", persistence: float = 0.5,
                      extended_hours: bool = False) -> OrderGroup:
         with self._lock:
+            # FIX #17: Clean up old group's order IDs from index before overwriting
+            old_group = self.groups.get(symbol)
+            if old_group is not None:
+                for old_id in [old_group.entry_order_id, old_group.trailing_stop_id, old_group.take_profit_id]:
+                    if old_id:
+                        self._order_id_index.pop(old_id, None)
+                logger.warning(f"[TRACKER] Overwriting existing group for {symbol} (old state={old_group.state.value})")
             group = OrderGroup(
                 symbol=symbol,
                 direction=direction,
@@ -136,6 +155,13 @@ class OrderTracker:
             if not group:
                 logger.warning(f"[TRACKER] mark_entry_filled: no group for {symbol}")
                 return
+            # Guard: only transition from PENDING_ENTRY to avoid overwriting exit order IDs on duplicate fills
+            if group.state != GroupState.PENDING_ENTRY:
+                logger.warning(
+                    f"[TRACKER] mark_entry_filled: {symbol} already in state {group.state.value} "
+                    f"— ignoring duplicate fill (trail={group.trailing_stop_id}, tp={group.take_profit_id})"
+                )
+                return
             group.state = GroupState.OPEN
             group.entry_price = fill_price
             group.filled_qty = filled_qty
@@ -156,18 +182,23 @@ class OrderTracker:
             )
 
     def mark_exit_fill(self, symbol: str, exit_order_id: str, fill_price: float) -> Optional[str]:
-        """Mark one exit leg as filled. Returns the OTHER order_id to cancel (manual OCO)."""
+        """Mark one exit leg as filled. Returns the OTHER order_id to cancel (manual OCO).
+        NOTE: Transitions to PENDING_EXIT only. The caller (stream.py _handle_fill) is
+        responsible for calling mark_closed() + remove_group() after OCO cancellation."""
         with self._lock:
             group = self.groups.get(symbol)
             if not group:
                 return None
             cancel_id = None
+            # M25 FIX: Removed redundant imports (already at module level)
             if exit_order_id == group.trailing_stop_id:
                 group.state = GroupState.PENDING_EXIT
+                group.exit_initiated_at = datetime.now(tz=tz.gettz('UTC')).isoformat()
                 cancel_id = group.take_profit_id
                 logger.info(f"[TRACKER] {symbol} stop filled @ {fill_price:.2f} → cancel TP {cancel_id}")
             elif exit_order_id == group.take_profit_id:
                 group.state = GroupState.PENDING_EXIT
+                group.exit_initiated_at = datetime.now(tz=tz.gettz('UTC')).isoformat()
                 cancel_id = group.trailing_stop_id
                 logger.info(f"[TRACKER] {symbol} TP filled @ {fill_price:.2f} → cancel trail {cancel_id}")
             else:
@@ -194,9 +225,11 @@ class OrderTracker:
         with self._lock:
             group = self.groups.pop(symbol, None)
             if group:
-                for oid in (group.entry_order_id, group.trailing_stop_id, group.take_profit_id):
-                    if oid:
-                        self._order_id_index.pop(oid, None)
+                # M27 FIX: Only clean index if not already done by mark_closed
+                if group.state != GroupState.CLOSED:
+                    for oid in (group.entry_order_id, group.trailing_stop_id, group.take_profit_id):
+                        if oid:
+                            self._order_id_index.pop(oid, None)
                 self._save()
 
     def get_open_groups(self) -> Dict[str, OrderGroup]:

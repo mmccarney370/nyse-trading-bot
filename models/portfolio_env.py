@@ -34,20 +34,20 @@ class PortfolioEnv(gym.Env):
         data_dict: dict[str, pd.DataFrame],
         symbols: list[str],
         initial_balance: float = 100_000.0,
-        max_leverage: float = 3.0,
+        max_leverage: float = CONFIG.get('MAX_LEVERAGE', 2.0),
     ):
         super().__init__()
         self.symbols = symbols
         self.n_symbols = len(symbols)
         self.data_dict = {sym: df.copy() for sym, df in data_dict.items()}
         self.initial_balance = initial_balance
-        self.max_leverage = CONFIG.get('MAX_LEVERAGE', max_leverage)
+        self.max_leverage = max_leverage
         self.max_episode_steps = CONFIG.get('MAX_EPISODE_STEPS', 2048)
         self.action_space = Box(low=-2.0, high=2.0, shape=(self.n_symbols,), dtype=np.float32)
   
         feature_dims = []
         for sym in self.symbols:
-            window = self.data_dict[sym].iloc[:min(200, len(self.data_dict[sym]))]
+            window = self.data_dict[sym].iloc[:min(500, len(self.data_dict[sym]))]
             if len(window) < 50:
                 continue
             dummy_features = generate_features(
@@ -59,6 +59,9 @@ class PortfolioEnv(gym.Env):
             if dummy_features is not None and dummy_features.shape[1] > 0:
                 feature_dims.append(dummy_features.shape[1])
         self.feature_dim = max(feature_dims) if feature_dims else 60
+        # FIX #55: Feature dim mismatch is zero-padded below (lines ~165-169). This is acceptable
+        # and common in multi-asset envs where symbols have different feature counts due to
+        # varying data availability or indicator applicability.
         self.portfolio_extra_dim = 4 + self.n_symbols
         total_dim = self.n_symbols * self.feature_dim + self.portfolio_extra_dim
         self.observation_space = Box(low=-20.0, high=20.0, shape=(total_dim,), dtype=np.float32)
@@ -73,32 +76,41 @@ class PortfolioEnv(gym.Env):
             n_bars = len(full_data)
       
             regimes = []
-            cached_regime = None
-            if sym in self.regime_cache:
-                value = self.regime_cache[sym]
-                if isinstance(value, list):
-                    cached_regime = value[0]
-                else:
-                    cached_regime = value
-            else:
-                cached_regime = 'trending'
-      
+            close_vals = full_data['close'].values if 'close' in full_data.columns else None
+            # Regime heuristic: simple 50-bar return threshold, recomputed every 100 bars.
+            # DESIGN NOTE: This is intentionally a fast heuristic, NOT the full HMM ensemble
+            # (detect_regime). Calling the HMM ensemble per symbol during env __init__ would
+            # be prohibitively slow (multiple HMM fits per symbol). The heuristic provides a
+            # rough regime signal sufficient for training-time feature generation.
+            current_regime = 'trending_up'  # default until enough data
             for i in range(n_bars):
-                regimes.append(cached_regime)
-      
+                if i >= 50 and i % 100 == 0 and close_vals is not None:
+                    lookback_close = close_vals[i - 50]
+                    if lookback_close > 0:
+                        ret_50 = (close_vals[i] - lookback_close) / lookback_close
+                        if abs(ret_50) > 0.015:
+                            current_regime = 'trending_up' if ret_50 > 0 else 'trending_down'
+                        else:
+                            current_regime = 'mean_reverting'
+                regimes.append(current_regime)
+
             self.precomputed_regimes[sym] = np.array(regimes)
       
-            last_regime_tuple = regimes[-1] if regimes else cached_regime or 'trending'
-            last_regime = last_regime_tuple[0] if isinstance(last_regime_tuple, tuple) else last_regime_tuple
+            # Generate features once on the full data. The regime flag is just one column
+            # in the 53-feature vector; chunking by regime created small chunks that failed
+            # the 100-bar minimum in generate_features(). Use dominant regime instead.
+            regime_arr = self.precomputed_regimes[sym]
+            unique, counts = np.unique(regime_arr, return_counts=True)
+            dominant_regime = unique[counts.argmax()]
             features = generate_features(
-                data=full_data,
-                regime=last_regime,
-                symbol=sym,
-                full_hist_df=full_data
+                data=full_data, regime=dominant_regime,
+                symbol=sym, full_hist_df=full_data
             )
-            if features is None or features.shape[0] == 0:
+            if features is None or (hasattr(features, 'shape') and features.shape[0] == 0):
                 features = np.zeros((n_bars, self.feature_dim))
             else:
+                if features.shape[0] > n_bars:
+                    features = features[-n_bars:]
                 if features.shape[0] < n_bars:
                     pad_rows = n_bars - features.shape[0]
                     pad = np.zeros((pad_rows, features.shape[1]))
@@ -112,12 +124,35 @@ class PortfolioEnv(gym.Env):
             min_valid_steps = min(min_valid_steps, n_bars)
   
         self.timeline = self.timeline[-min_valid_steps:]
+        # Slice precomputed features to match truncated timeline
+        for sym in self.symbols:
+            feats = self.precomputed_features[sym]
+            if feats.shape[0] > min_valid_steps:
+                self.precomputed_features[sym] = feats[-min_valid_steps:]
         self.current_step = 0
         self.episode_start = 0
         logger.info(f"Precomputation complete — valid steps: {len(self.timeline)} | max_episode_steps: {self.max_episode_steps}")
   
+        # Precompute per-symbol returns aligned to the common timeline to avoid
+        # O(n_symbols * lookback) get_indexer calls per step.
+        # Shape: [len(timeline), n_symbols] — returns[t, i] is the return of symbol i at bar t.
+        self._precomputed_returns = np.zeros((len(self.timeline), self.n_symbols), dtype=np.float32)
+        for i, sym in enumerate(self.symbols):
+            close_series = self.data_dict[sym]['close']
+            # Align close prices to the common timeline using forward-fill
+            aligned_close = close_series.reindex(self.timeline, method='pad')
+            # NOTE #18: Bars before a symbol's first data point get NaN→0 via fillna(0.0).
+            # This is correct: no data = no return. Zero returns mean the portfolio simply
+            # has no exposure to that symbol for those bars.
+            n_leading_nan = aligned_close.isna().sum()
+            if n_leading_nan > 0:
+                logger.debug(f"[PRECOMPUTE] {sym}: {n_leading_nan}/{len(self.timeline)} leading NaN bars "
+                             f"(data starts later than timeline) — treated as zero return")
+            sym_returns = aligned_close.pct_change().fillna(0.0).values
+            self._precomputed_returns[:, i] = sym_returns.astype(np.float32)
+
         self.last_weights = np.zeros(self.n_symbols, dtype=np.float32)
-        self.weight_history = deque(maxlen=100)
+        self.weight_history = deque(maxlen=max(200, self.max_episode_steps))
         self.reset()
 
     def _load_regime_cache(self):
@@ -149,7 +184,7 @@ class PortfolioEnv(gym.Env):
         self.equity = self.initial_balance
         self.weights = np.zeros(self.n_symbols, dtype=np.float32)
         self.last_weights = np.zeros(self.n_symbols, dtype=np.float32)
-        self.weight_history = deque(maxlen=100)
+        self.weight_history = deque(maxlen=max(200, self.max_episode_steps))
         self.weight_history.append(self.weights.copy())
         # Randomize start position so the agent sees different data each episode
         max_start = max(0, len(self.timeline) - self.max_episode_steps - 1)
@@ -169,16 +204,8 @@ class PortfolioEnv(gym.Env):
             raw_targets = raw_targets / abs_sum * self.max_leverage
         target_weights = raw_targets.astype(np.float32)
 
-        timestamp = self.timeline[self.current_step]
-        returns = np.zeros(self.n_symbols)
-        for i, sym in enumerate(self.symbols):
-            if timestamp in self.data_dict[sym].index:
-                close_series = self.data_dict[sym]['close']
-                prev_close = close_series.asof(timestamp - pd.Timedelta(minutes=15))
-                curr_close = close_series.asof(timestamp)
-                # Guard against NaN from asof() on index gaps
-                if pd.notna(prev_close) and pd.notna(curr_close) and prev_close > 0:
-                    returns[i] = (curr_close - prev_close) / prev_close
+        # Use precomputed returns array (O(1) lookup instead of O(n_symbols) get_indexer calls)
+        returns = self._precomputed_returns[self.current_step]
 
         # =====================================================================
         # BUG-01 FIX: Reward must be computed using the weights that were
@@ -208,8 +235,8 @@ class PortfolioEnv(gym.Env):
             past_ret = self._compute_portfolio_return_at_step(past_step)
             recent_rets.append(past_ret)
 
-        # FIX: Use 252 trading days * 96 fifteen-min bars per day (not 365*24*4 which assumes 24/7 trading)
-        annual_vol = np.std(recent_rets) * np.sqrt(252 * 96) if len(recent_rets) > 10 else 0.0
+        # FIX: 6.5h trading day = 26 fifteen-min bars, not 96
+        annual_vol = np.std(recent_rets) * np.sqrt(252 * 26) if len(recent_rets) > 10 else 0.0
 
         # ─── Base reward: portfolio return ───
         reward = portfolio_return
@@ -225,6 +252,8 @@ class PortfolioEnv(gym.Env):
             if len(downside) > 1:
                 ds_std = max(np.std(downside), 1e-8)
                 sortino = np.mean(recent_arr) / ds_std
+                # FIX #20: Clamp Sortino before adding to reward — tiny downside std can produce millions
+                sortino = np.clip(sortino, -5.0, 5.0)
                 reward += sortino * CONFIG.get('SORTINO_WEIGHT', 0.25)
             else:
                 reward += CONFIG.get('SORTINO_ZERO_DD_BONUS', 0.02)
@@ -243,8 +272,10 @@ class PortfolioEnv(gym.Env):
         truncated = steps_in_episode >= self.max_episode_steps
         done = at_data_end or self.equity <= 0 or truncated
 
+        # Normalize annual_vol to [0,1] for aux Sigmoid head. Raw annual_vol can be 0.05–2.0+.
+        vol_target = min(1.0, annual_vol / 1.0)  # 100% annual vol maps to 1.0, capped at 1.0
         info = {
-            'volatility_target': annual_vol,
+            'volatility_target': vol_target,
             'portfolio_return': portfolio_return,
             'drawdown': drawdown,
         }
@@ -253,22 +284,15 @@ class PortfolioEnv(gym.Env):
         return self._get_observation(), reward, terminal, truncated, info
 
     def _compute_portfolio_return_at_step(self, step_idx):
-        timestamp = self.timeline[step_idx]
-        returns = np.zeros(self.n_symbols)
-        for i, sym in enumerate(self.symbols):
-            if timestamp in self.data_dict[sym].index:
-                close_series = self.data_dict[sym]['close']
-                prev_close = close_series.asof(timestamp - pd.Timedelta(minutes=15))
-                curr_close = close_series.asof(timestamp)
-                if pd.notna(prev_close) and pd.notna(curr_close) and prev_close > 0:
-                    returns[i] = (curr_close - prev_close) / prev_close
+        # Use precomputed returns array (O(1) lookup instead of O(n_symbols) get_indexer)
+        returns = self._precomputed_returns[step_idx]
 
         # Deque-safe index: clamp to valid range within the deque
         history_idx = len(self.weight_history) - 1 - (self.current_step - step_idx)
         if 0 <= history_idx < len(self.weight_history):
             past_weights = self.weight_history[history_idx]
         else:
-            past_weights = self.last_weights
+            past_weights = np.zeros(self.n_symbols, dtype=np.float32)  # No position data = neutral (not current weights)
         return np.dot(past_weights, returns)
 
     def _get_observation(self):
@@ -284,24 +308,9 @@ class PortfolioEnv(gym.Env):
             else:
                 latest = feats[-1]
 
-            if step_idx >= len(feats) - 20:
-                timestamp = self.timeline[step_idx]
-                window = self.data_dict[sym].loc[:timestamp].tail(200)
-                if len(window) >= 50:
-                    if sym in self.regime_cache:
-                        value = self.regime_cache[sym]
-                        regime = value[0] if isinstance(value, list) else value
-                    else:
-                        recent_return = (window['close'].iloc[-1] - window['close'].iloc[-20]) / window['close'].iloc[-20]
-                        regime = 'trending' if abs(recent_return) > 0.015 else 'mean_reverting'
-                    fresh_feats = generate_features(
-                        data=window,
-                        regime=regime,
-                        symbol=sym,
-                        full_hist_df=self.data_dict[sym]
-                    )
-                    if fresh_feats is not None and fresh_feats.shape[0] > 0:
-                        latest = fresh_feats[-1]
+            # Feature regeneration removed — precomputed features are sufficient for training.
+            # Calling generate_features() during PPO training caused yfinance API calls,
+            # severe slowdown, and blocking I/O.
 
             if len(latest) < self.feature_dim:
                 latest = np.pad(latest, (0, self.feature_dim - len(latest)))
@@ -311,7 +320,8 @@ class PortfolioEnv(gym.Env):
 
         per_symbol_obs = np.concatenate(all_features)
 
-        equity_norm = np.log(self.equity / self.initial_balance + 1e-8)
+        # FIX #56: Use max(self.equity, 1e-8) to prevent NaN from log of negative values
+        equity_norm = np.log(max(self.equity, 1e-8) / self.initial_balance + 1e-8)
         drawdown = (self.equity - self.peak_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         gross_exposure = np.sum(np.abs(self.weights))
         concentration = np.std(self.weights)

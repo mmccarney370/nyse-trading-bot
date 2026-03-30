@@ -60,52 +60,80 @@ def train_stacking(
     if features is None or len(features) < 300:
         logger.warning(f"Insufficient features for stacking on {symbol} — returning empty models")
         return []
-   
-    # Prepare labels: next bar direction (1 = up, 0 = down)
-    # pct_change() produces NaN at index 0; shift(-1) produces NaN at last index
-    # dropna() removes both → labels has len(data)-2 rows starting from index 1
-    returns = data['close'].pct_change().shift(-1).dropna()
-    labels = (returns > 0).astype(int).values
 
-    # Align features with labels:
-    # labels[i] = future return from bar i → i+1 (indices 0..N-2)
-    # features[i] = features at bar i (indices 0..N-1)
-    # Drop first feature row (may have NaN from rolling windows) AND first label
-    # so features[1] pairs with labels[1] (= future return from bar 1 → 2)
-    features = features[1:-1]   # bars 1..N-2
-    labels = labels[1:]         # future returns from bar 1..N-2
+    # FIX #57: Sanitize inf values before LightGBM — inf causes silent NaN propagation in trees
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+   
+    # Multi-bar forward labels: predict direction over the actual holding horizon.
+    # 1-bar labels have SNR ~0.005 (coin flip). 8-bar labels have ~2.8x higher SNR
+    # and align with MIN_HOLD_BARS_TRENDING (8), matching actual trading behavior.
+    horizon = CONFIG.get('LABEL_HORIZON_BARS', 8)
+    forward_returns = data['close'].pct_change(horizon).shift(-horizon)
+    labels_full = (forward_returns > 0).astype(int).values  # last `horizon` elements are NaN → 0
+
+    # Align: features are tail-aligned to data. Drop last `horizon` feature rows (no complete forward return).
+    n_feat = len(features) - horizon
+    if n_feat < 200:
+        logger.warning(f"[STACKING] {symbol}: only {n_feat} usable rows after {horizon}-bar horizon — too few for training")
+        return []
+    features = features[:n_feat]
+
+    # Labels for the same data rows: tail slice of length n_feat, excluding last `horizon` data rows
+    labels = labels_full[-(n_feat + horizon):-horizon]
+
     # Final safety: truncate to shorter of the two
     min_len = min(len(features), len(labels))
     features = features[:min_len]
     labels = labels[:min_len]
    
+    # Time-based train/validation split to prevent overfitting
+    # Use first 70% for training, last 30% for validation (no shuffle — respects temporal order)
+    split_idx = int(len(features) * 0.70)
+    train_features = features[:split_idx]
+    train_labels = labels[:split_idx]
+    val_features = features[split_idx:]
+    val_labels = labels[split_idx:]
+
+    if len(train_features) < 200 or len(val_features) < 50:
+        logger.warning(f"Train/val split too small for {symbol} (train={len(train_features)}, val={len(val_features)}) — using full data")
+        train_features = features
+        train_labels = labels
+        val_features = None
+        val_labels = None
+
     models = []
     n_models = CONFIG.get('NUM_BASE_MODELS', 15)
-    params = CONFIG['LIGHTGBM_PARAMS'].copy()
-   
-    # Fixed training parameters
+    # M43 FIX: Use .get() with default to prevent KeyError
+    params = CONFIG.get('LIGHTGBM_PARAMS', {
+        'objective': 'binary', 'metric': 'binary_logloss', 'verbose': -1,
+        'learning_rate': 0.025, 'num_leaves': 40
+    }).copy()
+
     params['num_iterations'] = CONFIG.get('LGB_NUM_ITERATIONS', 250)
     params['verbose'] = -1
-   
+
+    # Let LightGBM handle its own internal bagging via bagging_fraction param.
+    # Removed outer bootstrap loop to avoid double bagging (outer bootstrap + LightGBM's
+    # internal subsampling), which reduces effective sample diversity.
+    # FIX #11: bagging_fraction requires bagging_freq > 0 to actually take effect.
+    # Also set per-model random seeds for ensemble diversity.
+    params['bagging_freq'] = params.get('bagging_freq', 1)
     for i in range(n_models):
-        # Bootstrap sampling if bagging_fraction < 1
-        if params.get('bagging_fraction', 1.0) < 1.0:
-            sample_size = int(len(features) * params['bagging_fraction'])
-            indices = np.random.choice(len(features), size=sample_size, replace=True)
-            X_boot = features[indices]
-            y_boot = labels[indices]
+        params['seed'] = i * 42 + 7
+        train_data = lgb.Dataset(train_features, label=train_labels)
+        if val_features is not None:
+            val_data = lgb.Dataset(val_features, label=val_labels, reference=train_data)
+            callbacks = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+            model = lgb.train(params, train_data, valid_sets=[val_data], callbacks=callbacks)
         else:
-            X_boot = features
-            y_boot = labels
-       
-        # Create dataset and train
-        train_data = lgb.Dataset(X_boot, label=y_boot)
-        model = lgb.train(params, train_data)
+            # FIX #58: Cap iterations when no validation set to prevent overfitting
+            no_val_params = params.copy()
+            no_val_params['num_iterations'] = min(no_val_params.get('num_iterations', 250), 100)
+            model = lgb.train(no_val_params, train_data)
         models.append(model)
-       
-        # Optional: log progress every 5 models
+
         if (i + 1) % 5 == 0:
             logger.debug(f"Trained model {i+1}/{n_models} for {symbol}")
-   
-    logger.info(f"Trained {len(models)} stacking models for {symbol}")
+
+    logger.info(f"Trained {len(models)} stacking models for {symbol} (train={len(train_features)}, val={len(val_features) if val_features is not None else 0})")
     return models

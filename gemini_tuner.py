@@ -9,7 +9,7 @@ import os
 import json
 import logging
 import glob
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google.genai import Client
 from tensorboard.backend.event_processing import event_accumulator
@@ -28,19 +28,35 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')  # Still load it globally, but don'
 
 logger = logging.getLogger(__name__)
 
-TB_LOG_DIR = "./ppo_tensorboard/portfolio"
-DYNAMIC_CONFIG_PATH = "dynamic_config.json"
-TUNING_HISTORY_PATH = "tuning_history.json"  # NEW: stores last few tuning changes for temporal context
+# FIX #24: Use absolute paths based on project root to avoid CWD-relative fragility
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+TB_LOG_DIR = os.path.join(_PROJECT_ROOT, "ppo_tensorboard", "portfolio")
+DYNAMIC_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "dynamic_config.json")
+TUNING_HISTORY_PATH = os.path.join(_PROJECT_ROOT, "tuning_history.json")  # stores last few tuning changes for temporal context
 
 def load_dynamic_config():
     if os.path.exists(DYNAMIC_CONFIG_PATH):
         try:
             with open(DYNAMIC_CONFIG_PATH, 'r') as f:
                 dynamic = json.load(f)
+            # FIX #33: Validate BEFORE applying to CONFIG. On validation failure,
+            # revert to pre-update state so invalid values don't persist.
+            from config import TradingBotConfig
+            pre_update_snapshot = dict(CONFIG)
             CONFIG.update(dynamic)
             if 'SYMBOLS' in dynamic:
                 CONFIG['SYMBOLS'] = dynamic['SYMBOLS']
                 logger.info(f"[GEMINI TUNER] Restored persisted universe: {CONFIG['SYMBOLS']}")
+            try:
+                validated = TradingBotConfig.model_validate(CONFIG)
+                CONFIG.update(validated.model_dump())
+                logger.debug("[GEMINI TUNER] Dynamic config passed Pydantic validation")
+            except Exception as val_err:
+                # M10 FIX: Atomic revert — update keys individually instead of clear()+update()
+                # which created a brief window where CONFIG was empty.
+                logger.warning(f"[GEMINI TUNER] Dynamic config failed Pydantic validation: {val_err} — reverting to previous config")
+                CONFIG.update(pre_update_snapshot)
+                return
             logger.info(f"[GEMINI TUNER] Loaded {len(dynamic)} persisted settings")
         except Exception as e:
             logger.warning(f"Failed to load dynamic config: {e}")
@@ -58,7 +74,7 @@ def save_dynamic_config(changes: dict):
         path_config = DYNAMIC_CONFIG_PATH
         dir_name = os.path.dirname(path_config) or '.'
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
-            json.dump(current, tmp, indent=2)
+            json.dump(current, tmp, indent=2, default=str)
             tmp.flush()
             os.fsync(tmp.fileno())
         shutil.move(tmp.name, path_config)
@@ -66,7 +82,7 @@ def save_dynamic_config(changes: dict):
 
         # Atomic write for tuning_history.json (append + keep last 5)
         history_entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "changes": changes,
             "pnl_summary": "N/A"  # can be populated later if needed
         }
@@ -81,7 +97,7 @@ def save_dynamic_config(changes: dict):
         path_history = TUNING_HISTORY_PATH
         dir_name = os.path.dirname(path_history) or '.'
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
-            json.dump(history, tmp, indent=2)
+            json.dump(history, tmp, indent=2, default=str)
             tmp.flush()
             os.fsync(tmp.fileno())
         shutil.move(tmp.name, path_history)
@@ -99,7 +115,9 @@ def get_recent_ppo_scalars(log_dir: str = TB_LOG_DIR, max_points: int = 50) -> d
     event_files.sort(key=os.path.getmtime, reverse=True)
     latest_file = event_files[0]
     try:
-        ea = event_accumulator.EventAccumulator(latest_file)
+        # H4 FIX: EventAccumulator needs the directory containing the event file, not the file path.
+        # Passing a file path may silently return empty tags in some tensorboard versions.
+        ea = event_accumulator.EventAccumulator(os.path.dirname(latest_file))
         ea.Reload()
     except Exception:
         return {}
@@ -123,7 +141,7 @@ def log_structured_gemini_change(param: str, old_value: Any, new_value: Any, pnl
     """
     entry = {
         "event": "gemini_change",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "param": param,
         "old": old_value,
         "new": new_value,
@@ -156,10 +174,10 @@ def query_gemini_for_tuning(context_data: dict, current_config: dict, symbol_per
             logger.warning(f"Failed to load tuning history: {e}")
     # NEW: Entropy-gated tuning focus
     entropy = ppo_scalars.get('entropy_loss', -1.0)
-    if entropy > -0.05:  # Policy is becoming "flat" or random
-        tuning_focus = "EXPLORATION: Focus on PPO_ENTROPY_COEFF, PPO_LEARNING_RATE, PPO_GAE_LAMBDA, PPO_CLIP_RANGE to stabilize learning."
-    else:
+    if entropy > -0.05:  # entropy_loss near 0 = LOW entropy = policy is peaked/over-exploiting
         tuning_focus = "EXPLOITATION: Focus on Risk, Sizing, ATR bounds, ratcheting thresholds, min-hold bars to capitalize on the learned policy."
+    else:  # entropy_loss very negative = HIGH entropy = policy is flat/exploring
+        tuning_focus = "EXPLORATION: Focus on PPO_ENTROPY_COEFF, PPO_LEARNING_RATE, PPO_GAE_LAMBDA, PPO_CLIP_RANGE to stabilize learning."
     context_data['tuning_focus'] = tuning_focus
     client = Client(api_key=GEMINI_API_KEY)
     # ISSUE #2 PATCH: No more TUNABLE_PARAMS — use CONFIG values directly
@@ -259,6 +277,7 @@ GROUP 4: Signal Generation & Confidence
   EMA_ALPHA          [0.003 – 0.015] current: {current_config.get('EMA_ALPHA')}
   MIN_HOLD_BARS_TRENDING      [3 – 12]  current: {current_config.get('MIN_HOLD_BARS_TRENDING')}
   MIN_HOLD_BARS_MEAN_REVERTING [2 – 8]  current: {current_config.get('MIN_HOLD_BARS_MEAN_REVERTING')}
+  REGIME_OVERRIDE_PERSISTENCE  [0.65 – 0.95] current: {current_config.get('REGIME_OVERRIDE_PERSISTENCE')}
 
 GROUP 5: PPO / RL Hyperparameters (max ±15% — RL is sensitive)
   PPO_LEARNING_RATE    [1e-4 – 5e-4]  current: {current_config.get('PPO_LEARNING_RATE')}
@@ -266,7 +285,7 @@ GROUP 5: PPO / RL Hyperparameters (max ±15% — RL is sensitive)
   PPO_GAMMA            [0.93 – 0.98]  current: {current_config.get('PPO_GAMMA')}
   PPO_GAE_LAMBDA       [0.90 – 0.97]  current: {current_config.get('PPO_GAE_LAMBDA')}
   PPO_CLIP_RANGE       [0.10 – 0.25]  current: {current_config.get('PPO_CLIP_RANGE')}
-  vf_coef              [0.3 – 1.5]    current: {current_config.get('vf_coef')}
+  vf_coef              [0.3 – 1.5]    current: {current_config.get('VF_COEF')}
   PPO_AUX_LOSS_WEIGHT  [0.10 – 0.40]  current: {current_config.get('PPO_AUX_LOSS_WEIGHT')}
 
 GROUP 6: Reward Shaping (max ±25%)
@@ -308,7 +327,11 @@ GROUP 7: Regime Detection
   }}
 }}"""
     try:
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        # M11 FIX: Add timeout to prevent indefinite blocking if Gemini API hangs
+        response = client.models.generate_content(
+            model="gemini-2.5-flash", contents=prompt,
+            config={"timeout": 120}
+        )
         content = response.text.strip()
         # FIX: Use regex for robust fence stripping (was fragile with trailing whitespace)
         import re as _re
@@ -340,7 +363,12 @@ GROUP 7: Regime Detection
             if len(proposed_set) >= max(max_size - 1, 4):
                 # Performance check: rotate only if poor (win rate < 55% or drawdown > 5%)
                 try:
-                    recent_win_rate = float(context_data.get('win_rate', '50')) / 100
+                    # FIX #41: Normalize win_rate — handle both decimal (0.55) and percentage (55) inputs
+                    raw_wr = float(context_data.get('win_rate', '50'))
+                    # M9 FIX: Explicit percentage detection — values > 1.0 are always percentages.
+                    # A win rate ratio above 1.0 is impossible (max=1.0=100%), so any value > 1.0
+                    # must be a percentage that needs /100 conversion.
+                    recent_win_rate = raw_wr if raw_wr <= 1.0 else raw_wr / 100
                 except (ValueError, TypeError):
                     recent_win_rate = 0.5
                 # Use max_drawdown_pct directly (the pnl_summary parsing was broken)
@@ -360,13 +388,14 @@ GROUP 7: Regime Detection
                         new_value=list(proposed_set),
                         pnl_context=pnl_context
                     )
-                    current_config['SYMBOLS'] = list(proposed_set)
                     logger.info(f"[GEMINI TUNER] Intra-week rotation triggered — win rate {recent_win_rate:.1%}, drawdown {drawdown:.1%}")
                 elif proposed_set != current_symbols:
                     logger.debug(f"[GEMINI TUNER] Proposed universe different but performance ok — no rotation")
                 else:
                     logger.debug(f"[GEMINI TUNER] Proposed universe matches current — no rotation needed")
-        # Normal parameter updates + structured logging
+        # FIX #29: Collect all changes into staging dict first, apply atomically at end.
+        # This prevents CONFIG from being half-modified if parsing fails midway.
+        staged_changes = {}  # key -> clamped_value
         for key, value in tweaks.get("parameters", {}).items():
             if value is None or key not in current_config:
                 continue
@@ -386,7 +415,7 @@ GROUP 7: Regime Detection
                                  'SORTINO_WEIGHT', 'PERSISTENCE_BONUS_SCALE', 'CAUSAL_PENALTY_WEIGHT',
                                  'CAUSAL_REWARD_FACTOR'}
                 ppo_params = {'PPO_LEARNING_RATE', 'PPO_ENTROPY_COEFF', 'PPO_GAMMA', 'PPO_GAE_LAMBDA',
-                              'PPO_CLIP_RANGE', 'vf_coef', 'PPO_AUX_LOSS_WEIGHT'}
+                              'PPO_CLIP_RANGE', 'VF_COEF', 'PPO_AUX_LOSS_WEIGHT'}
                 if key in risk_params:
                     pct_bound = 0.20
                 elif key in hold_params:
@@ -411,22 +440,79 @@ GROUP 7: Regime Detection
                     max_allowed = current_val * (1 + pct_bound)
                     min_allowed = current_val * (1 - pct_bound)
                 clamped = max(min_allowed, min(max_allowed, value))
+                # FIX #34: Absolute parameter bounds to prevent multi-cycle drift.
+                # These match the HARD BOUNDS in the Gemini prompt.
+                ABSOLUTE_BOUNDS = {
+                    'RISK_PER_TRADE_TRENDING': (0.010, 0.040),
+                    'RISK_PER_TRADE_MEAN_REVERTING': (0.002, 0.015),
+                    'KELLY_FRACTION': (0.25, 0.65),
+                    'RISK_BUDGET_MULTIPLIER': (1.2, 2.5),
+                    'MAX_LEVERAGE': (1.5, 2.5),
+                    'MAX_POSITIONS': (4, 8),
+                    'MAX_POSITION_VALUE_FRACTION': (0.15, 0.30),
+                    'CONVICTION_THRESHOLD': (0.20, 0.40),
+                    'TRAILING_STOP_ATR_TRENDING': (1.5, 3.5),
+                    'TRAILING_STOP_ATR_MEAN_REVERTING': (2.0, 5.0),
+                    'TAKE_PROFIT_ATR_TRENDING': (15.0, 40.0),
+                    'TAKE_PROFIT_ATR_MEAN_REVERTING': (5.0, 15.0),
+                    'RATCHET_TRENDING_INTERVAL_SEC': (60, 360),
+                    'RATCHET_MEAN_REVERTING_INTERVAL_SEC': (180, 900),
+                    'RATCHET_REGIME_FACTOR_TRENDING': (0.3, 0.8),
+                    'RATCHET_REGIME_FACTOR_MEAN_REVERTING': (0.8, 1.8),
+                    'RATCHET_PROFIT_PROTECTION_SLOPE': (0.8, 2.0),
+                    'RATCHET_PROFIT_PROTECTION_MIN': (0.20, 0.50),
+                    'MIN_CONFIDENCE': (0.75, 0.92),
+                    'DEAD_ZONE_LOW': (0.42, 0.52),
+                    'DEAD_ZONE_HIGH': (0.58, 0.70),
+                    'SENTIMENT_WEIGHT': (0.10, 0.40),
+                    'PORTFOLIO_SENTIMENT_WEIGHT': (0.15, 0.50),
+                    'EMA_ALPHA': (0.003, 0.015),
+                    'MIN_HOLD_BARS_TRENDING': (3, 12),
+                    'MIN_HOLD_BARS_MEAN_REVERTING': (2, 8),
+                    'REGIME_OVERRIDE_PERSISTENCE': (0.65, 0.95),
+                    'PPO_LEARNING_RATE': (1e-4, 5e-4),
+                    'PPO_ENTROPY_COEFF': (0.01, 0.08),
+                    'PPO_GAMMA': (0.93, 0.98),
+                    'PPO_GAE_LAMBDA': (0.90, 0.97),
+                    'PPO_CLIP_RANGE': (0.10, 0.25),
+                    'VF_COEF': (0.3, 1.5),
+                    'PPO_AUX_LOSS_WEIGHT': (0.10, 0.40),
+                    'DD_PENALTY_COEF': (0.5, 3.0),
+                    'VOL_PENALTY_COEF': (0.005, 0.03),
+                    'TURNOVER_COST_MULT': (0.1, 0.5),
+                    'SORTINO_WEIGHT': (0.10, 0.35),
+                    'PERSISTENCE_BONUS_SCALE': (0.1, 0.8),
+                    'CAUSAL_PENALTY_WEIGHT': (0.20, 0.50),
+                    'CAUSAL_REWARD_FACTOR': (0.3, 1.0),
+                    'REGIME_SHORT_LOOKBACK': (48, 192),
+                    'REGIME_SHORT_WEIGHT': (0.3, 0.8),
+                    'REGIME_CONFIDENCE_MIN_SIZE_PCT': (0.25, 0.70),
+                    'HURST_TREND_THRESHOLD': (0.35, 0.55),
+                    'VIX_THRESHOLD': (22, 35),
+                    'BREAKOUT_BOOST_FACTOR': (1.0, 1.5),
+                }
+                if key in ABSOLUTE_BOUNDS:
+                    abs_min, abs_max = ABSOLUTE_BOUNDS[key]
+                    clamped = max(abs_min, min(abs_max, clamped))
                 # FIX: Preserve integer type for integer params
                 if isinstance(current_val, int):
                     clamped = int(round(clamped))
                 if clamped != current_val:
-                    old = current_config[key]
-                    current_config[key] = clamped
-                    applied[key] = {'old': old, 'new': clamped}
-                    # Structured log for each parameter change
-                    log_structured_gemini_change(
-                        param=key,
-                        old_value=old,
-                        new_value=clamped,
-                        pnl_context=pnl_context
-                    )
+                    staged_changes[key] = clamped
+        # FIX #29: Apply all changes atomically — CONFIG is only modified if ALL parsing succeeded
+        for key, clamped in staged_changes.items():
+            old = current_config[key]
+            current_config[key] = clamped
+            applied[key] = {'old': old, 'new': clamped}
+            log_structured_gemini_change(param=key, old_value=old, new_value=clamped, pnl_context=pnl_context)
+        # Also apply SYMBOLS change atomically (collected in applied dict above)
+        if 'SYMBOLS' in applied and isinstance(applied['SYMBOLS'], list):
+            current_config['SYMBOLS'] = applied['SYMBOLS']
         if applied:
-            save_dynamic_config({k: current_config[k] for k in applied if k in current_config})
+            # FIX #75: Filter out non-config metadata keys (rotate_now, proposed_universe)
+            # before saving — only persist actual config parameters
+            metadata_keys = {'rotate_now', 'proposed_universe'}
+            save_dynamic_config({k: current_config[k] for k in applied if k in current_config and k not in metadata_keys})
             logger.info(f"[GEMINI TUNER] Applied {len(applied)} changes")
         return applied
     except Exception as e:

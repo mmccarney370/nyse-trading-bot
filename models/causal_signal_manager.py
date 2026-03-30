@@ -17,6 +17,7 @@ import hashlib
 from datetime import datetime
 import torch
 import random # ← ADDED: Required for random.sample() in ReplayBuffer.sample()
+import threading
 import tempfile # ← Priority 1: for atomic writes
 import shutil # ← Priority 1: for atomic rename
 from config import CONFIG
@@ -37,15 +38,36 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
 
     def push(self, obs, action, reward):
-        self.buffer.append((obs.copy(), float(action), float(reward)))
+        # FIX #62: np.atleast_1d handles scalar obs gracefully (obs.copy() fails on scalar)
+        self.buffer.append((np.atleast_1d(obs).copy(), float(action), float(reward)))
 
     def sample(self, batch_size=200):
         if len(self.buffer) < batch_size:
             return None
-        batch = random.sample(self.buffer, batch_size)
-        obs_batch = np.vstack([x[0] for x in batch])
-        action_batch = np.array([x[1] for x in batch])
-        reward_batch = np.array([x[2] for x in batch])
+        # Filter out zero-reward placeholder transitions (added at signal entry time
+        # before the real return is known — they dilute correlation/ATE estimates)
+        real_transitions = [(obs, act, rew) for obs, act, rew in self.buffer if abs(rew) > 1e-10]
+        if len(real_transitions) < batch_size:
+            # Fall back to full buffer if not enough real-reward transitions
+            real_transitions = list(self.buffer)
+        batch = random.sample(real_transitions, min(batch_size, len(real_transitions)))
+        # Filter out obs with mismatched dimensions (can happen after model retrain
+        # changes feature count while old obs remain in the buffer).
+        # Use the most common shape as reference (not the random first element)
+        from collections import Counter
+        shape_counts = Counter(obs.shape for obs, _, _ in batch)
+        ref_shape = shape_counts.most_common(1)[0][0]
+        filtered = [(obs, act, rew) for obs, act, rew in batch if obs.shape == ref_shape]
+        if len(filtered) < max(batch_size // 2, 10):
+            logger.warning(f"[ReplayBuffer] Too many shape-mismatched obs ({len(batch) - len(filtered)}/{len(batch)}) — returning None")
+            return None
+        try:
+            obs_batch = np.vstack([x[0] for x in filtered])
+        except ValueError as e:
+            logger.warning(f"[ReplayBuffer] np.vstack failed on filtered obs: {e} — returning None")
+            return None
+        action_batch = np.array([x[1] for x in filtered])
+        reward_batch = np.array([x[2] for x in filtered])
         df = pd.DataFrame(obs_batch, columns=[f'feat_{i}' for i in range(obs_batch.shape[1])])
         df['action'] = action_batch
         df['reward'] = reward_batch
@@ -57,7 +79,7 @@ class CausalSignalManager:
     Handles full multi-symbol GES + DoWhy + statistical refutation + ReplayBuffer.
     Keeps 100% of original features (no reduction, no PCA).
     """
-    def __init__(self, base_model, features_df: pd.DataFrame = None, symbol: str = None, data_ingestion=None):
+    def __init__(self, base_model, symbol: str = None, data_ingestion=None):
         self.base_model = base_model
         self.causal_model = None
         self.causal_graph = None
@@ -65,6 +87,8 @@ class CausalSignalManager:
         self.symbol = symbol or "portfolio"
         self.data_ingestion = data_ingestion
         self.replay_buffer = ReplayBuffer(capacity=5000) # NEW: Real historical data for counterfactuals
+        self._dowhy_lock = threading.Lock()  # Protects causal_model/identified_estimand/dowhy_ate writes from background thread
+        self._graph_attrs_lock = threading.Lock()  # Protects _action_reward_corr, _has_action_reward_path, _reward_parent_count
         self.cache_path = f"causal_cache_{self.symbol}.pkl"
         # P-18 / Critical #11 FIX: Compute current model version hash for cache invalidation after retrain
         self.model_version_hash = self._get_model_version_hash()
@@ -121,57 +145,80 @@ class CausalSignalManager:
             return hashlib.sha256(stable_str.encode()).hexdigest()[:16]
 
     def _ensure_graph_exists(self):
-        """C-3 FIX: Lazy graph build — call this before any graph-dependent operation.
-        Builds only if buffer has ≥100 real transitions and graph is None."""
+        """Lazy graph build — call this before any graph-dependent operation.
+        H20 FIX: Never blocks — if graph needs building, spawns a background thread.
+        Returns immediately so predict/compute_penalty_factor use neutral fallback until ready."""
         if self.causal_graph is not None:
             return  # already built
-        # Cooldown after failed build attempts (5 minutes)
+        # Don't double-spawn if a build is already in progress
+        if getattr(self, '_build_in_progress', False):
+            return
         last_fail = getattr(self, '_last_build_fail', 0)
         if time.time() - last_fail < 300:
-            return  # too soon after last failure
+            return
         if len(self.replay_buffer.buffer) < 100:
             logger.debug(f"[CAUSAL LAZY] {self.symbol} — buffer only {len(self.replay_buffer.buffer)} samples — "
                          f"deferring graph build until ≥100 real transitions")
             return
-        logger.info(f"[CAUSAL LAZY BUILD] {self.symbol} — buffer now has {len(self.replay_buffer.buffer)} samples — building graph")
-        
-        # SPECIAL CASE for "portfolio": aggregate features from all real symbols
-        if self.symbol == "portfolio":
-            if self.data_ingestion is None:
-                logger.warning("[CAUSAL LAZY] Portfolio — no data_ingestion reference — cannot build graph")
-                return
-            all_features = []
-            symbol_list = CONFIG.get('SYMBOLS', [])
-            logger.debug(f"[CAUSAL PORTFOLIO] Aggregating features from {len(symbol_list)} symbols")
-            for real_sym in symbol_list:
-                data = self.data_ingestion.get_latest_data(real_sym, timeframe='15Min')
-                if len(data) >= 200:
-                    features = generate_features(data, 'trending', real_sym, data)
-                    if features is not None and features.shape[0] > 0:
-                        all_features.append(features)
-                        logger.debug(f"[CAUSAL PORTFOLIO] {real_sym} contributed {features.shape[0]} rows")
-            if not all_features:
-                logger.warning("[CAUSAL LAZY] Portfolio — no valid symbol data for aggregation — deferring graph build")
-                return
-            full_matrix = np.vstack(all_features)
-            features_df = pd.DataFrame(full_matrix, columns=[f'feat_{i}' for i in range(full_matrix.shape[1])])
-            logger.info(f"[CAUSAL PORTFOLIO] Aggregated features from {len(all_features)} symbols → shape {features_df.shape}")
-        else:
-            # Normal single-symbol case
-            if self.data_ingestion is None:
-                logger.warning(f"[CAUSAL LAZY] {self.symbol} — no data_ingestion reference — cannot build graph")
-                return
-            data = self.data_ingestion.get_latest_data(self.symbol, timeframe='15Min')
-            if len(data) < 200:
-                logger.warning(f"[CAUSAL LAZY] {self.symbol} — insufficient data ({len(data)} bars) — deferring")
-                return
-            features = generate_features(data, 'trending', self.symbol, data)
-            if features is None or features.shape[0] == 0:
-                logger.warning(f"[CAUSAL LAZY] {self.symbol} — feature generation failed — deferring")
-                return
-            features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
-        
-        self.build_causal_graph(features_df)
+        # H20 FIX: Spawn build in background thread to avoid blocking the event loop
+        self._build_in_progress = True
+        logger.info(f"[CAUSAL LAZY BUILD] {self.symbol} — spawning background graph build ({len(self.replay_buffer.buffer)} samples)")
+        build_thread = threading.Thread(target=self._background_graph_build, daemon=True)
+        build_thread.start()
+
+    def _background_graph_build(self):
+        """Runs the expensive graph build in a background thread (H20 FIX)."""
+        try:
+            _regime_cache = {}
+            try:
+                import json
+                _regime_cache_file = "regime_cache.json"
+                if os.path.exists(_regime_cache_file):
+                    with open(_regime_cache_file, 'r') as f:
+                        _regime_cache = json.load(f)
+            except Exception:
+                pass
+
+            if self.symbol == "portfolio":
+                if self.data_ingestion is None:
+                    logger.warning("[CAUSAL LAZY] Portfolio — no data_ingestion reference — cannot build graph")
+                    return
+                all_features = []
+                symbol_list = CONFIG.get('SYMBOLS', [])
+                for real_sym in symbol_list:
+                    data = self.data_ingestion.get_latest_data(real_sym, timeframe='15Min')
+                    if len(data) >= 200:
+                        sym_regime = _regime_cache.get(real_sym, 'mean_reverting')
+                        if isinstance(sym_regime, list):
+                            sym_regime = sym_regime[0]
+                        features = generate_features(data, sym_regime, real_sym, data)
+                        if features is not None and features.shape[0] > 0:
+                            all_features.append(features)
+                if not all_features:
+                    logger.warning("[CAUSAL LAZY] Portfolio — no valid symbol data — deferring")
+                    return
+                full_matrix = np.vstack(all_features)
+                features_df = pd.DataFrame(full_matrix, columns=[f'feat_{i}' for i in range(full_matrix.shape[1])])
+            else:
+                if self.data_ingestion is None:
+                    return
+                data = self.data_ingestion.get_latest_data(self.symbol, timeframe='15Min')
+                if len(data) < 200:
+                    return
+                sym_regime = _regime_cache.get(self.symbol, 'mean_reverting')
+                if isinstance(sym_regime, list):
+                    sym_regime = sym_regime[0]
+                features = generate_features(data, sym_regime, self.symbol, data)
+                if features is None or features.shape[0] == 0:
+                    return
+                features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
+
+            self.build_causal_graph(features_df)
+        except Exception as e:
+            logger.warning(f"[CAUSAL BG BUILD] Failed for {self.symbol}: {e}")
+            self._last_build_fail = time.time()
+        finally:
+            self._build_in_progress = False
 
     def build_causal_graph(self, features_df: pd.DataFrame):
         """Robust causal graph build with downsampling to max 8000 rows + disk caching.
@@ -255,29 +302,40 @@ class CausalSignalManager:
             has_direct_edge = self.causal_graph.has_edge('action', 'reward')
             try:
                 has_path = nx.has_path(self.causal_graph, 'action', 'reward')
-                path_length = nx.shortest_path_length(self.causal_graph, 'action', 'reward') if has_path else 0
+                # FIX #59: GES returns a PDAG (partially directed graph) — some edges are undirected.
+                # Also check undirected connectivity as fallback for PDAG edges.
+                if not has_path:
+                    has_path = nx.has_path(self.causal_graph.to_undirected(), 'action', 'reward')
+                path_length = nx.shortest_path_length(self.causal_graph, 'action', 'reward') if nx.has_path(self.causal_graph, 'action', 'reward') else 0
+                if path_length == 0 and has_path:
+                    path_length = nx.shortest_path_length(self.causal_graph.to_undirected(), 'action', 'reward')
             except (nx.NetworkXError, nx.NodeNotFound):
                 has_path = False
                 path_length = 0
             # Compute direct action→reward correlation from replay buffer (fast: plain numpy)
             if 'action' in data.columns and 'reward' in data.columns:
                 corr = data['action'].corr(data['reward'])
-                self._action_reward_corr = corr if not np.isnan(corr) else 0.0
+                _corr = corr if not np.isnan(corr) else 0.0
             else:
-                self._action_reward_corr = 0.0
+                _corr = 0.0
             # Count causal parents of 'reward' in the GES graph (features that influence reward)
             reward_parents = list(self.causal_graph.predecessors('reward')) if 'reward' in self.causal_graph.nodes else []
-            self._reward_parent_count = len(reward_parents)
-            self._has_action_reward_path = has_path
+            # Atomic update of all graph-derived attributes under lock
+            with self._graph_attrs_lock:
+                self._action_reward_corr = _corr
+                self._reward_parent_count = len(reward_parents)
+                self._has_action_reward_path = has_path
             logger.info(f"[CAUSAL GES] action→reward: direct_edge={has_direct_edge}, path={has_path} (len={path_length}), "
                         f"corr={self._action_reward_corr:.4f}, reward_parents={len(reward_parents)}")
             # No DoWhy model needed for fast path — set to None so predict/compute use graph-based penalty
-            self.causal_model = None
-            self.identified_estimand = None
+            # FIX #60: Wrap causal_model=None assignment under _dowhy_lock for thread safety
+            with self._dowhy_lock:
+                self.causal_model = None
+                self.identified_estimand = None
             build_time = time.time() - start_time
             initial_edges = len(self.causal_graph.edges)
             logger.info(f"✅ [CAUSAL BUILD SUCCESS] GES discovered {initial_edges} edges in {build_time:.1f}s (fast path, no DoWhy)")
-            # Save to disk cache
+            # Save to disk cache — HIGH-28 FIX: Use atomic write to prevent corruption from background thread
             try:
                 cache_data = {
                     'graph': self.causal_graph,
@@ -288,14 +346,22 @@ class CausalSignalManager:
                     'has_action_reward_path': self._has_action_reward_path,
                     'reward_parent_count': self._reward_parent_count,
                 }
-                with open(self.cache_path, 'wb') as f:
-                    pickle.dump(cache_data, f)
+                dir_name = os.path.dirname(self.cache_path) or '.'
+                with tempfile.NamedTemporaryFile(mode='wb', delete=False, dir=dir_name) as tmp:
+                    pickle.dump(cache_data, tmp)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                shutil.move(tmp.name, self.cache_path)
                 logger.debug(f"[CAUSAL CACHE SAVED] Saved graph for {self.symbol} with hash {self.model_version_hash}")
             except Exception as e:
                 logger.debug(f"Failed to save causal cache: {e}")
             # === BACKGROUND: Spawn DoWhy deep analysis in a thread (non-blocking) ===
+            # FIX #18: Pass explicit args instead of capturing `self` via closure.
+            # The manager_ref weakref prevents stale writes if the manager is replaced during rotation.
             import threading
-            def _background_dowhy_build(data_copy, graph_copy, symbol, cache_path, model_hash):
+            import weakref
+            def _background_dowhy_build(data_copy, graph_copy, symbol, cache_path, model_hash,
+                                        manager_ref, dowhy_lock, action_reward_corr, has_action_reward_path, reward_parent_count):
                 try:
                     logger.info(f"[DOWHY BACKGROUND] Starting deep causal analysis for {symbol}...")
                     # Clean all non-serializable attributes for GML serialization
@@ -313,28 +379,40 @@ class CausalSignalManager:
                     cm = CausalModel(data=data_copy, treatment='action', outcome='reward', graph=graph_gml)
                     estimand = cm.identify_effect(proceed_when_unidentifiable=True)
                     estimate = cm.estimate_effect(estimand, method_name="backdoor.linear_regression", target_units="ate")
-                    # Swap in results (thread-safe assignment)
-                    self.causal_model = cm
-                    self.identified_estimand = estimand
-                    self._dowhy_ate = estimate.value if hasattr(estimate, 'value') else 0.0
-                    # Update cache with full DoWhy results
+                    ate_val = estimate.value if hasattr(estimate, 'value') else 0.0
+                    # FIX #18: Only write back if the manager hasn't been replaced
+                    mgr = manager_ref()
+                    if mgr is None:
+                        logger.info(f"[DOWHY BACKGROUND] Manager for {symbol} was replaced — discarding results")
+                        return
+                    # Swap in results under lock (thread-safe)
+                    with dowhy_lock:
+                        mgr.causal_model = cm
+                        mgr.identified_estimand = estimand
+                        mgr._dowhy_ate = ate_val
+                    # Update cache with full DoWhy results — HIGH-28 FIX: atomic write
                     try:
-                        with open(cache_path, 'wb') as f:
+                        dir_name = os.path.dirname(cache_path) or '.'
+                        with tempfile.NamedTemporaryFile(mode='wb', delete=False, dir=dir_name) as tmp:
                             pickle.dump({
                                 'graph': graph_copy, 'model': cm, 'model_version_hash': model_hash,
                                 'identified_estimand': estimand,
-                                'action_reward_corr': self._action_reward_corr,
-                                'has_action_reward_path': self._has_action_reward_path,
-                                'reward_parent_count': self._reward_parent_count,
-                            }, f)
+                                'action_reward_corr': action_reward_corr,
+                                'has_action_reward_path': has_action_reward_path,
+                                'reward_parent_count': reward_parent_count,
+                            }, tmp)
+                            tmp.flush()
+                            os.fsync(tmp.fileno())
+                        shutil.move(tmp.name, cache_path)
                     except Exception:
                         pass
-                    logger.info(f"✅ [DOWHY BACKGROUND] Deep analysis complete for {symbol} — ATE={self._dowhy_ate:.6f}")
+                    logger.info(f"[DOWHY BACKGROUND] Deep analysis complete for {symbol} — ATE={ate_val:.6f}")
                 except Exception as e:
                     logger.warning(f"[DOWHY BACKGROUND] Failed for {symbol}: {e} — graph-based penalty still active")
             bg_thread = threading.Thread(
                 target=_background_dowhy_build,
-                args=(data.copy(), self.causal_graph.copy(), self.symbol, self.cache_path, self.model_version_hash),
+                args=(data.copy(), self.causal_graph.copy(), self.symbol, self.cache_path, self.model_version_hash,
+                      weakref.ref(self), self._dowhy_lock, self._action_reward_corr, self._has_action_reward_path, self._reward_parent_count),
                 daemon=True
             )
             bg_thread.start()
@@ -365,8 +443,10 @@ class CausalSignalManager:
         """Safer predict with defensive state handling and fallback."""
         # C-3 FIX: Ensure graph exists before using causal logic
         self._ensure_graph_exists()
-        if not CONFIG.get('USE_CAUSAL_RL', False) or self.causal_model is None:
-            logger.debug(f"[CAUSAL FALLBACK] {self.symbol} — no causal model yet — using base PPO predict")
+        # CRIT-9 FIX: Check causal_graph (not causal_model) — GES fast path sets causal_model=None
+        # but causal_graph is valid. Old check bypassed _compute_fast_penalty() entirely.
+        if not CONFIG.get('USE_CAUSAL_RL', False) or self.causal_graph is None:
+            logger.debug(f"[CAUSAL FALLBACK] {self.symbol} — no causal graph yet — using base PPO predict")
             if state is not None and hasattr(self.base_model, 'predict'):
                 return self.base_model.predict(obs, state=state, episode_start=episode_start, deterministic=deterministic)
             return self.base_model.predict(obs, deterministic=deterministic)
@@ -379,13 +459,14 @@ class CausalSignalManager:
             logger.debug(f"Base model predict failed, falling back: {e}")
             action, new_state = self.base_model.predict(obs, deterministic=deterministic)
         # B-10 PATCH: Causal penalty now guaranteed to be applied and logged in live trading
-        original_action = action.copy() if hasattr(action, 'copy') else float(action)
+        original_action = action.copy() if hasattr(action, 'copy') else action
         penalty_factor = self._compute_fast_penalty()
         action = action * penalty_factor
-        action = np.clip(action, -1.0, 1.0)
-        # B-10: Always log the penalty so we can confirm it's being applied live
+        action = np.clip(action, -2.0, 2.0)  # Portfolio actions range [-2, 2], not [-1, 1]
         if penalty_factor != 1.0:
-            logger.info(f"✅ [CAUSAL PENALTY APPLIED] {self.symbol} | raw={float(original_action):.4f} → adjusted={float(action):.4f} (factor={penalty_factor:.4f})")
+            orig_str = f"{np.mean(np.abs(original_action)):.4f}" if hasattr(original_action, '__len__') else f"{original_action:.4f}"
+            adj_str = f"{np.mean(np.abs(action)):.4f}" if hasattr(action, '__len__') else f"{action:.4f}"
+            logger.info(f"✅ [CAUSAL PENALTY APPLIED] {self.symbol} | mean_abs_raw={orig_str} → adjusted={adj_str} (factor={penalty_factor:.4f})")
         else:
             logger.debug(f"[CAUSAL PENALTY] {self.symbol} — no violation detected (factor=1.0)")
         if state is not None:
@@ -393,46 +474,75 @@ class CausalSignalManager:
         return action, None
 
     def _compute_fast_penalty(self) -> float:
-        """Fast graph-based causal penalty using GES structure + replay buffer correlation.
-        Falls back to full DoWhy estimate if background thread has completed."""
+        """Fast graph-based causal scaling factor using GES structure + replay buffer correlation.
+        HIGH-29 FIX: Corrected semantics — factor < 1.0 dampens (penalizes), > 1.0 boosts.
+        Positive correlation between action and reward means actions are causally effective → boost.
+        Negative or no correlation → dampen. Returns 1.0 when neutral."""
         if not CONFIG.get('USE_CAUSAL_RL', False) or self.causal_graph is None:
             return 1.0
         try:
             # If DoWhy background thread completed, use the full ATE estimate
-            if self.causal_model is not None and self.identified_estimand is not None:
-                available = len(self.replay_buffer.buffer)
-                if available >= 50:
-                    data_df = self.replay_buffer.sample(batch_size=min(1500, available))
-                    if data_df is not None:
-                        effect = self.causal_model.estimate_effect(
-                            self.identified_estimand,
-                            method_name="backdoor.linear_regression",
-                            target_units="ate",
-                            data=data_df
-                        )
-                        violation = abs(effect.value)
-                        penalty = min(2.0, 1.0 + (violation * CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.40)))
-                        logger.debug(f"[CAUSAL DOWHY] {self.symbol} full ATE penalty={penalty:.4f}")
-                        return penalty
+            with self._dowhy_lock:
+                cm = self.causal_model
+                estimand = self.identified_estimand
+            if cm is not None and estimand is not None:
+                cached_ate = getattr(self, '_dowhy_ate', None)
+                if cached_ate is not None:
+                    # Positive ATE means actions causally help → boost
+                    # Negative ATE means actions causally hurt → dampen
+                    weight = CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.40)
+                    factor = 1.0 + (cached_ate * weight)
+                    # FIX #61: Cap boost at 1.2x for safety (was 1.5x)
+                    factor = max(0.5, min(1.2, factor))
+                    logger.debug(f"[CAUSAL DOWHY] {self.symbol} cached ATE={cached_ate:.4f} → factor={factor:.4f}")
+                    return factor
             # Fast path: use pre-computed GES graph correlation
-            corr = getattr(self, '_action_reward_corr', 0.0)
-            has_path = getattr(self, '_has_action_reward_path', False)
+            with self._graph_attrs_lock:
+                corr = getattr(self, '_action_reward_corr', 0.0)
+                has_path = getattr(self, '_has_action_reward_path', False)
             if not has_path:
                 return 1.0  # No causal path from action to reward — neutral
-            # Scale: abs(corr) from 0→1 maps to penalty_factor 1.0→2.0
-            # Stronger correlation = stronger causal signal = more confidence boost
-            penalty = min(2.0, 1.0 + (abs(corr) * CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.40)))
-            logger.debug(f"[CAUSAL GES FAST] {self.symbol} corr={corr:.4f}, path={has_path} → factor={penalty:.4f}")
-            return penalty
+            # Signed correlation: positive = actions help, negative = actions hurt
+            weight = CONFIG.get('CAUSAL_PENALTY_WEIGHT', 0.40)
+            factor = 1.0 + (corr * weight)
+            # FIX #61: Cap boost at 1.2x for safety (was 1.5x)
+            factor = max(0.5, min(1.2, factor))
+            logger.debug(f"[CAUSAL GES FAST] {self.symbol} corr={corr:.4f}, path={has_path} → factor={factor:.4f}")
+            return factor
         except Exception as e:
             logger.debug(f"[CAUSAL] Penalty failed: {e} — neutral")
             return 1.0
 
-    # P-3 FIX: Real public method for causal penalty (used by explain_signal_breakdown and generate_signal)
     def compute_penalty_factor(self, obs, action) -> float:
-        """Public method for logging/debug breakdowns. Returns the penalty factor (1.0 = no penalty)."""
+        """Public method for causal penalty. Uses obs and action to discriminate.
+        M41 FIX: Now considers action DIRECTION relative to causal evidence.
+        - Positive corr + same-direction action → boost (aligned with what works)
+        - Positive corr + opposite action → dampen (going against what works)
+        - Negative corr + same-direction action → dampen (following what hurts)
+        - Negative corr + opposite action → boost (contrarian to what hurts)"""
         self._ensure_graph_exists()
-        return self._compute_fast_penalty()
+        base_factor = self._compute_fast_penalty()
+        if base_factor == 1.0:
+            return 1.0
+        action_val = float(action) if np.isscalar(action) else float(np.mean(action))
+        action_magnitude = min(abs(action_val), 1.0)
+        with self._graph_attrs_lock:
+            corr = getattr(self, '_action_reward_corr', 0.0)
+        if abs(corr) < 1e-8 or abs(action_val) < 1e-8:
+            # Neutral — scale by magnitude only
+            return 1.0 + (base_factor - 1.0) * action_magnitude
+        # action_corr_product > 0 means action aligns with correlation direction
+        # action_corr_product < 0 means action opposes correlation direction
+        action_corr_product = np.sign(action_val) * np.sign(corr)
+        if action_corr_product > 0:
+            # Action aligns with causal direction: boost if corr positive, dampen if corr negative
+            return 1.0 + (base_factor - 1.0) * action_magnitude
+        else:
+            # Action opposes causal direction: invert the effect
+            # If base_factor > 1 (corr says "go with it"), opposing → dampen
+            # If base_factor < 1 (corr says "actions hurt"), opposing → boost (contrarian is good)
+            inverted_factor = 1.0 - (base_factor - 1.0) * action_magnitude
+            return max(0.5, min(1.2, inverted_factor))
 
     def warmup_from_history(self, history_entries: list):
         """Replay closed trades from live_signal_history into ReplayBuffer on startup.
@@ -479,9 +589,17 @@ class CausalSignalManager:
             logger.error(f"[BUFFER SAVE FAILED] for {self.symbol}: {e}")
 
     def load_buffer(self, path: str = None):
-        """Load replay buffer from disk on startup."""
+        """Load replay buffer from disk on startup.
+        HIGH FIX: Guard against duplicate loads — if buffer already has data (e.g., from
+        __init__ which calls load_buffer()), skip to prevent duplicate transitions.
+        CausalSignalManager.__init__() calls load_buffer(), and bot_initializer.py was
+        calling it again, causing every persisted transition to appear twice."""
         if path is None:
             path = f"replay_buffer_{self.symbol}.pkl"
+        if len(self.replay_buffer.buffer) > 0:
+            logger.debug(f"[BUFFER LOAD SKIP] {self.symbol} — buffer already has "
+                         f"{len(self.replay_buffer.buffer)} transitions — skipping duplicate load")
+            return
         if os.path.exists(path):
             try:
                 with open(path, 'rb') as f:

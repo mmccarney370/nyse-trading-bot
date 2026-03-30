@@ -39,7 +39,7 @@ if GROQ_AVAILABLE:
         GROQ_AVAILABLE = False
 from config import CONFIG
 from models.features import generate_features
-from strategy.regime import detect_regime, get_regime_with_window # ← ADDED: rolling window helper
+from strategy.regime import detect_regime, is_trending, is_bullish, is_bearish
 from models.portfolio_env import PortfolioEnv
 from stable_baselines3.common.vec_env.vec_normalize import VecNormalize
 import torch # ← Required for torch.no_grad()
@@ -53,6 +53,7 @@ try:
 except ImportError as _causal_import_err:
     _CAUSAL_IMPORTS_OK = False
     logger.warning(f"Causal RL imports failed ({_causal_import_err}) — causal features will be disabled")
+import threading # FIX #24: For sync wrapper lock
 import time # ← REQUIRED for timing the causal graph build
 import pickle # ← For causal graph disk caching
 import hashlib # ← P-18 / Critical #11 FIX: for model hash
@@ -107,18 +108,141 @@ class LLMAgentDebate:
         logger.info(f"LLM debate final sentiment: {final:.3f} (from {len(opinions)} agents)")
         return final
 
+class _AdaptiveMemory:
+    """Real-time trade memory that makes the signal generator learn from its own mistakes.
+    Three interconnected systems:
+
+    1. ANTI-CHURN: Exponential confidence decay after stop-outs. Each consecutive
+       stop on the same symbol in the same direction multiplies confidence by 0.5^n.
+       Decays back to neutral after a cooldown period. Prevents the TSLA-style
+       "stop → re-enter → stop → re-enter" death spiral.
+
+    2. CROSS-ASSET PANIC DETECTOR: Tracks stop-outs across ALL symbols in a rolling
+       window. When >= 3 symbols stop out within 20 bars, the system enters "defensive
+       mode" — all new entries are suppressed for a cooldown period. Recognizes that
+       correlated stop-outs = systemic event, not individual signal failure.
+
+    3. ADAPTIVE SIGNAL WEIGHTING: Tracks per-component accuracy (ensemble, PPO,
+       sentiment) over a sliding window of recent closed trades. Components that
+       have been wrong recently get downweighted; accurate ones get upweighted.
+       This is online Bayesian updating of the signal blend.
+    """
+    def __init__(self):
+        self.stop_history = {}       # {symbol: [(timestamp, direction, price), ...]}
+        self.trade_outcomes = []     # [(timestamp, symbol, direction, pnl, meta_prob, ppo_prob, sentiment)]
+        self.global_stops = []       # [(timestamp, symbol)] — all stops across all symbols
+        self.defensive_until = None  # timestamp when defensive mode expires
+        self._component_accuracy = {
+            'ensemble': {'correct': 0, 'total': 0},
+            'ppo': {'correct': 0, 'total': 0},
+            'sentiment': {'correct': 0, 'total': 0},
+        }
+
+    def record_stop_out(self, symbol: str, direction: int, price: float, timestamp=None):
+        """Call when a trailing stop is hit."""
+        ts = timestamp or datetime.now(tz=tz.gettz('UTC'))
+        if symbol not in self.stop_history:
+            self.stop_history[symbol] = []
+        self.stop_history[symbol].append((ts, direction, price))
+        # Keep last 20 per symbol
+        self.stop_history[symbol] = self.stop_history[symbol][-20:]
+        # Global tracker
+        self.global_stops.append((ts, symbol))
+        self.global_stops = self.global_stops[-100:]
+        # Check for cross-asset panic
+        self._check_panic(ts)
+
+    def _check_panic(self, now):
+        """If >= 3 symbols stopped out within last 20 bars (~5 min), enter defensive mode."""
+        cutoff = now - timedelta(minutes=5)
+        recent = [s for ts, s in self.global_stops if ts >= cutoff]
+        unique_symbols = len(set(recent))
+        if unique_symbols >= 3:
+            cooldown_bars = 12  # ~3 hours of 15-min bars
+            self.defensive_until = now + timedelta(minutes=15 * cooldown_bars)
+            logger.warning(f"[PANIC DETECT] {unique_symbols} symbols stopped in 5min — "
+                          f"DEFENSIVE MODE until {self.defensive_until.strftime('%H:%M')}")
+
+    def is_defensive(self, timestamp=None) -> bool:
+        """True if the system is in defensive mode (suppress all new entries)."""
+        if self.defensive_until is None:
+            return False
+        now = timestamp or datetime.now(tz=tz.gettz('UTC'))
+        if now >= self.defensive_until:
+            self.defensive_until = None
+            return False
+        return True
+
+    def get_churn_penalty(self, symbol: str, direction: int, timestamp=None) -> float:
+        """Returns confidence multiplier (0.0-1.0) based on recent stop-out history.
+        Each recent stop in the same direction halves the multiplier.
+        Stops older than cooldown_minutes are ignored."""
+        cooldown_minutes = 60  # 4 bars of 15min
+        now = timestamp or datetime.now(tz=tz.gettz('UTC'))
+        cutoff = now - timedelta(minutes=cooldown_minutes)
+        history = self.stop_history.get(symbol, [])
+        # Count recent stops in the SAME direction
+        same_dir_stops = sum(1 for ts, d, _ in history if ts >= cutoff and d == direction)
+        if same_dir_stops == 0:
+            return 1.0
+        # Exponential decay: 0.5^n (1 stop = 0.5, 2 stops = 0.25, 3 stops = 0.125)
+        penalty = 0.5 ** same_dir_stops
+        logger.info(f"[CHURN] {symbol}: {same_dir_stops} recent stops in dir={direction} — "
+                    f"confidence *= {penalty:.3f}")
+        return penalty
+
+    def record_trade_outcome(self, symbol: str, direction: int, pnl: float,
+                             meta_prob: float, ppo_prob: float, sentiment: float,
+                             timestamp=None):
+        """Call when a trade closes (stop or TP). Updates component accuracy tracking."""
+        ts = timestamp or datetime.now(tz=tz.gettz('UTC'))
+        won = pnl > 0
+        self.trade_outcomes.append((ts, symbol, direction, pnl, meta_prob, ppo_prob, sentiment))
+        # Keep last 50 outcomes
+        self.trade_outcomes = self.trade_outcomes[-50:]
+        # Update per-component accuracy
+        # Ensemble was "right" if meta_prob > 0.5 and trade won (long), or < 0.5 and trade won (short)
+        ensemble_agreed = (meta_prob > 0.5 and direction == 1) or (meta_prob < 0.5 and direction == -1)
+        ppo_agreed = (ppo_prob > 0.5 and direction == 1) or (ppo_prob < 0.5 and direction == -1)
+        sent_agreed = (sentiment > 0 and direction == 1) or (sentiment < 0 and direction == -1)
+        for component, agreed in [('ensemble', ensemble_agreed), ('ppo', ppo_agreed), ('sentiment', sent_agreed)]:
+            self._component_accuracy[component]['total'] += 1
+            if (agreed and won) or (not agreed and not won):
+                self._component_accuracy[component]['correct'] += 1
+
+    def get_adaptive_weights(self) -> dict:
+        """Returns dynamically adjusted blend weights based on recent component accuracy.
+        Components that have been more accurate get higher weight.
+        Requires >= 10 trades to activate; before that, returns default weights."""
+        total_trades = self._component_accuracy['ensemble']['total']
+        if total_trades < 10:
+            return None  # Use default weights
+        accuracies = {}
+        for comp in ['ensemble', 'ppo', 'sentiment']:
+            stats = self._component_accuracy[comp]
+            # Laplace smoothing: (correct + 1) / (total + 2) prevents 0% or 100%
+            accuracies[comp] = (stats['correct'] + 1) / (stats['total'] + 2)
+        # Normalize to sum to 1.0
+        total = sum(accuracies.values())
+        weights = {k: v / total for k, v in accuracies.items()}
+        logger.debug(f"[ADAPTIVE] Component accuracies: {accuracies} → weights: {weights}")
+        return weights
+
+
 class SignalGenerator:
     def __init__(self, config, data_ingestion, trainer, regime_cache=None): # BUG #4 FIX: now accepts shared cache from bot.py
         self.config = config
         self.data_ingestion = data_ingestion
         self.trainer = trainer
-        self.news_api = NewsApiClient(api_key=config['NEWS_API_KEY'])
+        _news_key = config.get('NEWS_API_KEY')
+        self.news_api = NewsApiClient(api_key=_news_key) if _news_key else None
         self.prev_signals = {}
         self.last_entry_time = {}
         self.meta_ema = {}
         self.sentiment_cache = {}
         self.lstm_states = {}
         self.last_portfolio_state = None
+        self._meta_prob_history = {}  # FIX #17: Initialize here so reset_backtest_state() can clear it
         self.is_recurrent = config.get('PPO_RECURRENT', True)
         # BUG #4 FIX: Shared regime cache with bot.py (4AM precompute + _get_all_regimes now syncs live to signal generation)
         self.regime_cache = regime_cache if regime_cache is not None else {}
@@ -126,21 +250,9 @@ class SignalGenerator:
         self.live_signal_history = {}
         # NEW: Initialize latest_prices cache (used by OOS monitoring)
         self.latest_prices = {}
-        try:
-            from transformers import pipeline
-            self.finbert_pipeline = pipeline(
-                "sentiment-analysis",
-                model="ProsusAI/finbert",
-                tokenizer="ProsusAI/finbert",
-                truncation=True,
-                max_length=512
-            )
-            logger.info("finBERT sentiment analyzer loaded successfully")
-        except Exception as e:
-            logger.warning(f"finBERT not available ({e}) — falling back to VADER")
-            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-            self.finbert_pipeline = None
-            self.vader_analyzer = SentimentIntensityAnalyzer()
+        # === ADAPTIVE MEMORY: Real-time learning from trade outcomes ===
+        self.memory = _AdaptiveMemory()
+        # Sentiment is handled exclusively by LLM debate (Ollama) — finBERT/VADER removed (dead code, wasted ~440MB RAM)
         self.llm_debate = (
             LocalLLMDebate()
             if self.config.get('USE_LOCAL_LLM', True)
@@ -154,17 +266,21 @@ class SignalGenerator:
         if CONFIG.get('USE_CAUSAL_RL', False):
             logger.info("🔥 CAUSAL RL PATCH APPLIED — full stacked feature matrix ACTIVE. Logs will follow...")
             logger.info("Initializing causal managers for PPO models")
+            # Cache data fetches to avoid double fetch per symbol
+            _symbol_data_cache = {}
+            _symbol_features_cache = {}
             for symbol in config.get('SYMBOLS', []):
                 data = self.data_ingestion.get_latest_data(symbol)
+                _symbol_data_cache[symbol] = data
                 if len(data) >= 200:
                     regime_tuple = self.trainer.get_cached_regime(symbol, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
                     regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
                     features = generate_features(data, regime, symbol, data)
-                    features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
+                    _symbol_features_cache[symbol] = features
+                    # FIX #28: Removed dead features_df computation (not passed to CausalSignalManager)
                     if symbol in self.trainer.ppo_models and self.trainer.ppo_models[symbol]:
                         self.causal_manager[symbol] = CausalSignalManager(
                             base_model=self.trainer.ppo_models[symbol],
-                            features_df=features_df,
                             symbol=symbol,
                             data_ingestion=self.data_ingestion
                         )
@@ -174,10 +290,14 @@ class SignalGenerator:
                 symbol_ids = []
                 total_rows = 0
                 for sym in config.get('SYMBOLS', []):
-                    data = self.data_ingestion.get_latest_data(sym)
-                    regime_tuple = self.trainer.get_cached_regime(sym, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
-                    regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
-                    features = generate_features(data, regime, sym, data)
+                    # Reuse cached data and features instead of re-fetching
+                    if sym in _symbol_features_cache and _symbol_features_cache[sym] is not None:
+                        features = _symbol_features_cache[sym]
+                    else:
+                        data = _symbol_data_cache.get(sym) or self.data_ingestion.get_latest_data(sym)
+                        regime_tuple = self.trainer.get_cached_regime(sym, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
+                        regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
+                        features = generate_features(data, regime, sym, data)
                     if features is not None and features.shape[0] > 0:
                         rows = features.shape[0]
                         total_rows += rows
@@ -192,10 +312,12 @@ class SignalGenerator:
                     full_df['symbol_id'] = pd.Categorical(full_df['symbol_id']).codes
                     self.portfolio_causal_manager = CausalSignalManager(
                         base_model=self.trainer.portfolio_ppo_model,
-                        features_df=full_df,
                         symbol="portfolio",
                         data_ingestion=self.data_ingestion
                     )
+                    # H14 FIX: Seed the causal graph with the expensive full_df we just built
+                    # (was discarded — the entire multi-symbol feature matrix computation was wasted)
+                    self.portfolio_causal_manager.build_causal_graph(full_df)
                     logger.info(f"Portfolio causal matrix built with {full_matrix.shape[0]} total rows and {full_matrix.shape[1]} features + symbol_id")
                 else:
                     self.portfolio_causal_manager = None
@@ -205,6 +327,19 @@ class SignalGenerator:
         if CONFIG.get('USE_CAUSAL_RL', False) and self.trainer.portfolio_ppo_model is not None and self.portfolio_causal_manager is None:
             logger.info("Portfolio model already loaded at init time — building causal manager immediately using cache")
             self.rebuild_causal_wrappers_without_deleting_cache()
+
+    def reset_backtest_state(self):
+        """FIX #17: Clear per-symbol state that accumulates across backtest runs.
+        Call at the start of each backtest run to prevent stale history from leaking."""
+        self._meta_prob_history = {}
+        self._last_regime_per_symbol = {}  # FIX #30: Reset regime tracking for meta_prob clearing
+        self.prev_signals = {}
+        self.meta_ema = {}
+        self.sentiment_cache = {}
+        self.lstm_states = {}
+        self.last_portfolio_state = None
+        self.memory = _AdaptiveMemory()
+        logger.debug("[SIGNAL GEN] Backtest state reset — cleared _meta_prob_history, adaptive memory, and related caches")
 
     # ISSUE #5 FIX: warmup_causal_buffers now accepts live_signal_history as parameter (passed from bot_initializer)
     # Removed self.bot reference — prevents AttributeError at startup and enables proper warmup
@@ -224,10 +359,19 @@ class SignalGenerator:
                 if entry.get('realized_return') is None:
                     continue # skip open trades
                 obs = entry.get('obs')
-                if obs is None or not isinstance(obs, list) or len(obs) == 0:
+                if obs is None or not isinstance(obs, (list, np.ndarray)) or len(obs) == 0:
                     continue
                 try:
                     obs_array = np.array(obs, dtype=np.float32).reshape(1, -1)
+                    # FIX #15: Validate obs dimension matches model's expected input
+                    # Skip obs with wrong dimension to avoid corrupting causal buffer
+                    if hasattr(manager, 'model') and manager.model is not None:
+                        expected_dim = None
+                        if hasattr(manager.model, 'observation_space'):
+                            expected_dim = manager.model.observation_space.shape[-1]
+                        if expected_dim is not None and obs_array.shape[-1] != expected_dim:
+                            logger.debug(f"[CAUSAL WARMUP] {sym}: obs dim {obs_array.shape[-1]} != expected {expected_dim} — skipping")
+                            continue
                     action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                     reward = entry.get('realized_return', 0.0)
                     manager.replay_buffer.push(obs_array, action, reward)
@@ -245,10 +389,18 @@ class SignalGenerator:
             all_closed = [e for hist in live_signal_history.values() for e in hist if e.get('realized_return') is not None]
             for entry in all_closed:
                 obs = entry.get('obs')
-                if obs is None or not isinstance(obs, list) or len(obs) == 0:
+                if obs is None or not isinstance(obs, (list, np.ndarray)) or len(obs) == 0:
                     continue
                 try:
                     obs_array = np.array(obs, dtype=np.float32).reshape(1, -1)
+                    # FIX #15: Validate obs dimension for portfolio buffer too
+                    if hasattr(self.portfolio_causal_manager, 'model') and self.portfolio_causal_manager.model is not None:
+                        expected_dim = None
+                        if hasattr(self.portfolio_causal_manager.model, 'observation_space'):
+                            expected_dim = self.portfolio_causal_manager.model.observation_space.shape[-1]
+                        if expected_dim is not None and obs_array.shape[-1] != expected_dim:
+                            logger.debug(f"[CAUSAL WARMUP] portfolio: obs dim {obs_array.shape[-1]} != expected {expected_dim} — skipping")
+                            continue
                     action = entry.get('direction', 0) * entry.get('confidence', 1.0)
                     reward = entry.get('realized_return', 0.0)
                     self.portfolio_causal_manager.replay_buffer.push(obs_array, action, reward)
@@ -268,7 +420,7 @@ class SignalGenerator:
     # ===================================================================
     # NEW: Full transparent signal blending breakdown
     # ===================================================================
-    async def explain_signal_breakdown(self, symbol: str, timestamp: pd.Timestamp, data: pd.DataFrame = None, precomputed: dict = None, live_mode: bool = True) -> dict:
+    async def explain_signal_breakdown(self, symbol: str, timestamp: pd.Timestamp, data: pd.DataFrame = None, precomputed: dict = None, live_mode: bool = True, full_hist_df: pd.DataFrame = None) -> dict:
         """Returns a clean dict showing exactly how the final confidence score was built.
         Call this anytime (bot, REPL, notebook) to verify the blend.
         P-16 / Critical #8 FIX: Accepts precomputed dict to avoid double inference when DEBUG_SIGNAL_BLEND=True.
@@ -277,15 +429,29 @@ class SignalGenerator:
             data = self.data_ingestion.get_latest_data(symbol)
         if len(data) < 200:
             return {"error": "insufficient data"}
-        regime, persistence = get_regime_with_window( # ← CHANGED: use rolling window
-            symbol=symbol,
-            data_ingestion=self.data_ingestion,
-            lookback_short=CONFIG.get('REGIME_SHORT_LOOKBACK', 96),
-            weight_short=CONFIG.get('REGIME_SHORT_WEIGHT', 0.6),
-            cache=self.regime_cache
-        )
-        # FIX 1: Initialize action before the if/else so it's always defined
+        # FIX #23: Use cached regime instead of running full HMM per signal call.
+        # The regime_cache is populated by bot._get_all_regimes() each cycle.
+        cached = self.regime_cache.get(symbol)
+        if cached and isinstance(cached, (list, tuple)) and len(cached) == 2:
+            regime, persistence = cached
+        elif cached and isinstance(cached, str):
+            regime, persistence = cached, 0.5
+        else:
+            # Cache miss — fall back to detect_regime (lightweight single call)
+            regime, persistence = detect_regime(data, symbol=symbol, data_ingestion=self.data_ingestion)
+        # FIX #30: Clear _meta_prob_history for this symbol on regime change.
+        # Stale percentile ranks from a different regime distort the meta-prob rescaling.
+        if not hasattr(self, '_last_regime_per_symbol'):
+            self._last_regime_per_symbol = {}
+        prev_regime = self._last_regime_per_symbol.get(symbol)
+        if prev_regime is not None and prev_regime != regime:
+            if symbol in self._meta_prob_history:
+                self._meta_prob_history[symbol] = []
+                logger.info(f"[META PROB] {symbol} regime changed {prev_regime} → {regime} — cleared _meta_prob_history")
+        self._last_regime_per_symbol[symbol] = regime
+        # FIX 1: Initialize action and obs before the if/else so they're always defined
         action = None
+        obs = None
         # P-16 / Critical #8 FIX: Reuse precomputed values if provided (zero extra cost)
         if precomputed is not None:
             features = precomputed.get('features')
@@ -297,7 +463,7 @@ class SignalGenerator:
             causal_factor = precomputed.get('causal_factor', 1.0) # ISSUE P10 FIX: renamed for clarity
         else:
             # Fallback: compute everything (old behavior)
-            features = generate_features(data, regime, symbol, data)
+            features = generate_features(data, regime, symbol, full_hist_df if full_hist_df is not None else data)
             ppo_prob = 0.5
             ppo_strength = 0.5
             meta_prob = 0.5
@@ -333,25 +499,55 @@ class SignalGenerator:
         # Stacking meta-prob
         if precomputed is None:
             stacking_probs = []
-            for stacking_model in self.trainer.stacking_models.get(symbol, []):
+            stacking_models_list = self.trainer.stacking_models.get(symbol, [])
+            # FIX #23: Validate feature count before prediction to avoid crash on mismatch
+            if stacking_models_list:
+                expected_ncols = stacking_models_list[0].num_feature()
+                actual_ncols = latest_features.shape[1] if latest_features.ndim == 2 else latest_features.shape[0]
+                if actual_ncols != expected_ncols:
+                    logger.warning(f"[STACKING] {symbol}: feature count mismatch (got {actual_ncols}, "
+                                   f"model expects {expected_ncols}) — using 0.5 fallback")
+                    stacking_models_list = []
+            for stacking_model in stacking_models_list:
                 if hasattr(stacking_model, 'predict_proba'):
-                    prob = stacking_model.predict_proba(latest_features)[0]
-                    stacking_probs.append(float(prob[1] if prob.shape[0] > 1 else prob[0]))
+                    prob = stacking_model.predict_proba(latest_features)
+                    # FIX #29: Check ndim and shape[1] (columns=classes), not shape[0] (rows=samples)
+                    if prob.ndim > 1 and prob.shape[1] > 1:
+                        stacking_probs.append(float(prob[0, 1]))
+                    else:
+                        stacking_probs.append(float(prob.flat[0]))
                 else:
                     prob = stacking_model.predict(latest_features)[0]
                     stacking_probs.append(float(prob))
             meta_prob = np.mean(stacking_probs) if stacking_probs else 0.5
+            # Rescale to percentile rank against recent predictions (matches walk-forward training)
+            # This prevents narrow LightGBM prediction spreads from making thresholds useless
+            if not hasattr(self, '_meta_prob_history'):
+                self._meta_prob_history = {}
+            hist = self._meta_prob_history.setdefault(symbol, [])
+            hist.append(meta_prob)
+            if len(hist) > 500:
+                hist[:] = hist[-500:]
+            if len(hist) >= 20:
+                std_val = np.std(hist)
+                # FIX #26: Smooth blending between raw and percentile-ranked values
+                # instead of abrupt activation at std < 0.05. Uses sigmoid-style blend
+                # that's 0% percentile at std=0.10, ~50% at std=0.05, ~100% at std=0.01.
+                if std_val < 0.10:
+                    rank = sum(1 for h in hist if h <= meta_prob) / len(hist)
+                    # Blend weight: 1.0 when std→0, 0.0 when std→0.10
+                    blend = np.clip(1.0 - (std_val - 0.01) / 0.09, 0.0, 1.0)
+                    meta_prob = blend * rank + (1.0 - blend) * meta_prob
         # Causal factor (renamed for clarity)
         if precomputed is None:
             causal_factor = 1.0
             causal_manager = self.causal_manager.get(symbol)
-            if causal_manager and action is not None:
+            if causal_manager and action is not None and obs is not None:
                 try:
                     # C-3 FIX: Ensure graph exists + safe fallback
                     causal_manager._ensure_graph_exists()
                     if causal_manager.causal_graph is not None:
                         penalty_factor = causal_manager.compute_penalty_factor(obs, action)
-                        penalized_action = action * penalty_factor
                         causal_factor = penalty_factor # ISSUE P10 FIX: direct multiplier (boost if >1.0, suppress if <1.0)
                         logger.debug(f"[CAUSAL] {symbol} penalty factor applied: {penalty_factor:.4f}")
                     else:
@@ -361,23 +557,95 @@ class SignalGenerator:
         # Sentiment (always compute if not precomputed, but can be passed)
         if precomputed is None:
             sentiment_score = await self.get_sentiment_score(symbol, timestamp, live_mode=live_mode)
-        # Rescale sentiment from [-1,1] to [0,1] to match meta_prob's range
-        sentiment_01 = (sentiment_score + 1.0) / 2.0
-        combined_meta = (1 - self.config.get('SENTIMENT_WEIGHT', 0.2)) * meta_prob + self.config.get('SENTIMENT_WEIGHT', 0.2) * sentiment_01
-        long_thresh, short_thresh = self.trainer.get_current_thresholds(symbol, timestamp)
-        logger.debug(f"{symbol}: thresholds (long>{long_thresh:.3f}, short<{short_thresh:.3f})")
-        if self.config.get('DEAD_ZONE_LOW', 0.48) < combined_meta < self.config.get('DEAD_ZONE_HIGH', 0.64):
-            confidence = 0.0
-            direction = 0
+        # === BLEND: PPO + Ensemble + Sentiment into combined_meta ===
+        # Adaptive weighting: if enough trade history exists, adjust weights
+        # based on which components have been most accurate recently.
+        adaptive_w = self.memory.get_adaptive_weights()
+        if adaptive_w is not None:
+            # Adaptive weights from recent trade accuracy (Bayesian updating)
+            ens_w = adaptive_w['ensemble']
+            ppo_w = adaptive_w['ppo']
+            sent_w = adaptive_w['sentiment']
+            # Normalize ensemble + PPO to fill non-sentiment portion
+            signal_portion = 1.0 - sent_w
+            ens_norm = ens_w / (ens_w + ppo_w) * signal_portion
+            ppo_norm = ppo_w / (ens_w + ppo_w) * signal_portion
+            blended_meta = ens_norm * meta_prob + ppo_norm * ppo_prob
+            if abs(sentiment_score) < 1e-6:
+                combined_meta = blended_meta
+            else:
+                sentiment_01 = (sentiment_score + 1.0) / 2.0
+                combined_meta = (1 - sent_w) * blended_meta + sent_w * sentiment_01
+            logger.debug(f"[ADAPTIVE BLEND] {symbol}: ens={ens_norm:.2f} ppo={ppo_norm:.2f} sent={sent_w:.2f}")
         else:
-            direction = 0
-            confidence = 0.0
-            if combined_meta > long_thresh:
-                direction = 1
-                confidence = (combined_meta - long_thresh) / (1.0 - long_thresh)
-            elif combined_meta < short_thresh:
-                direction = -1
-                confidence = (short_thresh - combined_meta) / short_thresh
+            # Default static weights until enough trade history accumulates
+            ppo_weight = self.config.get('PPO_SIGNAL_WEIGHT', 0.20)
+            ensemble_weight = 1.0 - ppo_weight
+            blended_meta = ensemble_weight * meta_prob + ppo_weight * ppo_prob
+            if abs(sentiment_score) < 1e-6:
+                combined_meta = blended_meta
+            else:
+                sentiment_01 = (sentiment_score + 1.0) / 2.0
+                sent_w = self.config.get('SENTIMENT_WEIGHT', 0.2)
+                combined_meta = (1 - sent_w) * blended_meta + sent_w * sentiment_01
+        long_thresh, short_thresh = self.trainer.get_current_thresholds(symbol, timestamp)
+        logger.debug(f"{symbol}: thresholds (long>{long_thresh:.3f}, short<{short_thresh:.3f}) | "
+                     f"ensemble={meta_prob:.3f} ppo={ppo_prob:.3f} blended={blended_meta:.3f}")
+        direction = 0
+        confidence = 0.0
+        if combined_meta > long_thresh:
+            direction = 1
+            confidence = (combined_meta - long_thresh) / (1.0 - long_thresh)
+        elif combined_meta < short_thresh:
+            direction = -1
+            confidence = (short_thresh - combined_meta) / short_thresh
+        # === DIRECTION-AWARE REGIME GATING ===
+        # Suppress signals that fight the trend direction. In a bearish trend,
+        # long entries need much higher confidence; in a bullish trend, short entries do.
+        if direction != 0 and is_trending(regime):
+            if is_bearish(regime) and direction == 1:
+                # Going long in a downtrend — require 2x confidence or suppress
+                confidence *= 0.4
+                logger.info(f"[REGIME GATE] {symbol}: LONG suppressed in trending_down (conf * 0.4)")
+            elif is_bullish(regime) and direction == -1:
+                # Going short in an uptrend — require 2x confidence or suppress
+                confidence *= 0.4
+                logger.info(f"[REGIME GATE] {symbol}: SHORT suppressed in trending_up (conf * 0.4)")
+        # === VIX-BASED CONFIDENCE SCALING ===
+        # High VIX (>28) = elevated fear. Reduce long confidence, boost short confidence.
+        from models.features import _fetch_macro_features
+        try:
+            macro = _fetch_macro_features()
+            vix = macro.get('vix_close', 20)
+            if vix > 28 and direction == 1:
+                vix_scale = max(0.3, 1.0 - (vix - 28) / 20)  # VIX 28→1.0, 38→0.5, 48→0.3
+                confidence *= vix_scale
+                logger.info(f"[VIX GATE] {symbol}: LONG confidence scaled by {vix_scale:.2f} (VIX={vix:.1f})")
+            elif vix > 28 and direction == -1:
+                vix_boost = min(1.5, 1.0 + (vix - 28) / 40)  # VIX 28→1.0, 48→1.5
+                confidence = min(1.0, confidence * vix_boost)
+                logger.info(f"[VIX GATE] {symbol}: SHORT confidence boosted by {vix_boost:.2f} (VIX={vix:.1f})")
+            # === SPX BREADTH GATE ===
+            # Don't go long on individual stocks when SPX is below 200-SMA (bear market)
+            if direction == 1 and macro.get('spx_below_200sma', False):
+                confidence *= 0.3
+                logger.info(f"[SPX GATE] {symbol}: SPX below 200-SMA — LONG confidence *= 0.3")
+        except Exception:
+            pass  # macro fetch failure is non-fatal
+        # === 1H TREND CONFIRMATION GATE ===
+        # Halve confidence when 15min signal opposes the 1H trend (price vs 20-bar SMA on 1H).
+        if direction != 0:
+            try:
+                hourly_data = self.data_ingestion.get_latest_data(symbol, timeframe='1H')
+                if hourly_data is not None and len(hourly_data) >= 20:
+                    sma_20h = hourly_data['close'].rolling(20).mean().iloc[-1]
+                    current_1h = hourly_data['close'].iloc[-1]
+                    hourly_trend = 1 if current_1h > sma_20h else -1
+                    if direction != hourly_trend:
+                        confidence *= 0.5
+                        logger.info(f"[1H GATE] {symbol}: 15m dir={direction} vs 1H trend={hourly_trend} — confidence halved")
+            except Exception as e:
+                logger.debug(f"[1H GATE] {symbol}: 1H data unavailable ({e}) — skipping")
         if direction != 0:
             conviction_boost = 0.7 + 0.4 * persistence
             confidence = min(1.0, confidence * conviction_boost)
@@ -388,29 +656,38 @@ class SignalGenerator:
             prev_low = data['low'].iloc[-roll-1:-1].min()
             current_price = data['close'].iloc[-1]
             if (current_price > prev_high and direction == 1) or (current_price < prev_low and direction == -1):
-                confidence = min(1.0, confidence * 1.4)
+                confidence = min(1.0, confidence * self.config.get('BREAKOUT_BOOST_FACTOR', 1.2))
         # ==================== BUG #3 FIX ====================
         # causal_factor (previously misnamed penalty) is now applied directly as a multiplier.
         # Strong causal evidence boosts confidence; weak/no evidence leaves it neutral or slightly suppresses.
-        if 'causal_factor' in locals() and causal_factor != 1.0:
+        if causal_factor != 1.0:
             confidence = min(1.0, confidence * causal_factor)
             logger.debug(f"{symbol} causal factor applied: multiplier={causal_factor:.4f} → final confidence={confidence:.4f}")
         # ==================== END BUG #3 FIX ====================
         prev_direction = self.prev_signals.get(symbol, 0)
         if symbol in self.last_entry_time and prev_direction != 0:
-            bars_since = (timestamp - self.last_entry_time[symbol]) / pd.Timedelta(minutes=15)
+            # FIX #31: Ensure both timestamps are tz-aware before subtraction to avoid TypeError
+            entry_ts = self.last_entry_time[symbol]
+            ts = timestamp
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is None and hasattr(entry_ts, 'tzinfo') and entry_ts.tzinfo is not None:
+                ts = ts.tz_localize(entry_ts.tzinfo)
+            elif hasattr(entry_ts, 'tzinfo') and entry_ts.tzinfo is None and hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                entry_ts = entry_ts.tz_localize(ts.tzinfo)
+            bars_since = (ts - entry_ts) / pd.Timedelta(minutes=15)
             # P-13 / Critical #5 FIX: Safe default if config key missing (prevents TypeError crash)
-            if regime == 'trending':
+            if is_trending(regime):
                 min_hold = self.config.get('MIN_HOLD_BARS_TRENDING', 6)
             else:
                 min_hold = self.config.get('MIN_HOLD_BARS_MEAN_REVERTING', 3)
             if bars_since < min_hold:
                 if direction == 0 or direction == -prev_direction:
                     direction = prev_direction
-                    confidence = max(confidence, 0.6)
+                    # FIX #35: Don't inflate confidence during min-hold. Keep original confidence
+                    # but force direction to match existing position. Inflating to 0.6 gave false
+                    # conviction on deteriorating trades.
                     logger.debug(f"{symbol} min-hold enforced ({regime}): bars_held={int(bars_since)} < {min_hold} → keeping previous direction")
-        if direction != 0 and prev_direction == 0:
-            self.last_entry_time[symbol] = timestamp
+        # FIX #34: Removed last_entry_time mutation — explain_signal_breakdown should be pure.
+        # The caller (generate_signal / backtest loop) is responsible for updating last_entry_time.
         # ==================== NEW TRANSPARENT BLEND LOG ====================
         # P-16 / Critical #8 FIX: Pass precomputed values to avoid double inference when DEBUG_SIGNAL_BLEND=True
         # B-01 FIX: Added "and precomputed is None" guard to prevent infinite recursion
@@ -473,31 +750,68 @@ class SignalGenerator:
         """Generate a trading signal for a single symbol.
         Returns (direction, confidence, ppo_strength, action_raw) tuple.
         Delegates to explain_signal_breakdown and updates prev_signals state."""
-        result = await self.explain_signal_breakdown(symbol, timestamp, data=data, live_mode=live_mode)
+        result = await self.explain_signal_breakdown(symbol, timestamp, data=data, live_mode=live_mode, full_hist_df=full_hist_df)
         if 'error' in result:
             return 0, 0.0, 0.0, None
         direction = result['direction']
         confidence = result['confidence']
         ppo_strength = result.get('ppo_strength', 0.5)
+        # === ADAPTIVE MEMORY GATES (real-time learning) ===
+        ts = timestamp or datetime.now(tz=tz.gettz('UTC'))
+        # 1. Defensive mode: suppress ALL new entries if cross-asset panic detected
+        if direction != 0 and self.memory.is_defensive(ts):
+            logger.warning(f"[DEFENSIVE] {symbol}: suppressed (cross-asset panic active until "
+                          f"{self.memory.defensive_until.strftime('%H:%M') if self.memory.defensive_until else '?'})")
+            direction = 0
+            confidence = 0.0
+        # 2. Anti-churn: exponential decay after stop-outs in same direction
+        if direction != 0:
+            churn_penalty = self.memory.get_churn_penalty(symbol, direction, ts)
+            if churn_penalty < 1.0:
+                confidence *= churn_penalty
+        # 3. Enforce MIN_CONFIDENCE — reject weak signals before they reach execution
+        min_conf = self.config.get('MIN_CONFIDENCE', 0.72)
+        if direction != 0 and confidence < min_conf:
+            logger.info(f"[CONF GATE] {symbol}: confidence {confidence:.3f} < MIN_CONFIDENCE {min_conf} — suppressing")
+            direction = 0
+            confidence = 0.0
         # Update prev_signals state (explain_signal_breakdown is pure — state update happens here)
+        prev_direction = self.prev_signals.get(symbol, 0)
+        if direction != 0 and prev_direction == 0:
+            self.last_entry_time[symbol] = timestamp if timestamp is not None else datetime.now(tz=tz.gettz('UTC'))
         self.prev_signals[symbol] = direction
         return direction, confidence, ppo_strength, None
 
+    # HIGH-16 FIX: Shared executor for sync wrapper — prevents creating thousands of threads
+    _sync_executor = None
+    _sync_lock = threading.Lock()  # FIX #24: Serialize backtest calls to prevent shared mutable state races
+
     def generate_signal_sync(self, symbol: str, data: pd.DataFrame = None, timestamp: pd.Timestamp = None,
                              live_mode: bool = False, full_hist_df: pd.DataFrame = None, **kwargs) -> tuple:
-        """Synchronous wrapper for backtest compatibility."""
+        """Synchronous wrapper for backtest compatibility.
+        HIGH-16 FIX: Reuse a single ThreadPoolExecutor instead of creating one per call.
+        FIX #24: threading.Lock serializes calls to prevent shared state races."""
         import asyncio
+        import concurrent.futures
+        if SignalGenerator._sync_executor is None:
+            # FIX #33: Lock serializes all calls anyway, so >1 worker just wastes a thread
+            SignalGenerator._sync_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # FIX #20: Lock MUST cover both submission and result — shared state
+        # (prev_signals, meta_ema, sentiment_cache) is mutated inside generate_signal.
+        # Use timeout to prevent deadlock in case the signal call hangs.
+        lock_timeout = self.config.get('SIGNAL_SYNC_LOCK_TIMEOUT', 120)
+        acquired = SignalGenerator._sync_lock.acquire(timeout=lock_timeout)
+        if not acquired:
+            logger.warning(f"[SIGNAL] generate_signal_sync lock timeout ({lock_timeout}s) for {symbol} — returning neutral")
+            return 0, 0.0, 0.5, None
         try:
-            loop = asyncio.get_running_loop()
-            # If already in async context, create a new event loop in thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, self.generate_signal(
-                    symbol=symbol, data=data, timestamp=timestamp, live_mode=live_mode))
-                return future.result()
-        except RuntimeError:
-            return asyncio.run(self.generate_signal(
+            # M35 FIX: Removed dead inner try/except (loop check had no side effects)
+            # Dispatch to executor thread with fresh loop
+            future = SignalGenerator._sync_executor.submit(asyncio.run, self.generate_signal(
                 symbol=symbol, data=data, timestamp=timestamp, live_mode=live_mode))
+            return future.result(timeout=lock_timeout)
+        finally:
+            SignalGenerator._sync_lock.release()
 
     # ==================== MISSING METHOD ADDED HERE (fixes the crash) ====================
     async def get_sentiment_score(self, symbol: str, timestamp: pd.Timestamp = None, live_mode: bool = True) -> float:
@@ -506,7 +820,7 @@ class SignalGenerator:
         if timestamp is None:
             timestamp = datetime.now(tz=tz.gettz('UTC'))
         # BUG-13 FIX: Use hour-level cache key (refreshes ~every hour during trading session)
-        cache_key = f"{symbol}_{timestamp.date()}_{timestamp.hour}"
+        cache_key = f"{symbol}|{timestamp.date()}|{timestamp.hour}"
         if cache_key in self.sentiment_cache:
             logger.debug(f"[SENTIMENT CACHE HIT] {symbol} for {cache_key}")
             return self.sentiment_cache[cache_key]
@@ -531,8 +845,14 @@ class SignalGenerator:
   
             # Cache result (now per hour)
             if len(self.sentiment_cache) > 5000:
-                # Evict oldest entries by date/hour, not alphabetically by symbol
-                keys = sorted(self.sentiment_cache.keys(), key=lambda k: '_'.join(k.split('_')[1:]))
+                # Evict oldest entries by date/hour — extract last two segments (date_hour) as sort key
+                # Cache keys are "SYMBOL|YYYY-MM-DD|HH" — sort by date+hour portion (hour as int for correct numeric ordering)
+                def _cache_sort_key(k):
+                    parts = k.split('|')
+                    if len(parts) >= 3:
+                        return (parts[1], int(parts[2]) if parts[2].isdigit() else 0)
+                    return ('0000-00-00', 0)
+                keys = sorted(self.sentiment_cache.keys(), key=_cache_sort_key)
                 for k in keys[:len(keys) - 2500]:
                     del self.sentiment_cache[k]
             self.sentiment_cache[cache_key] = score
@@ -541,14 +861,14 @@ class SignalGenerator:
   
         except Exception as e:
             logger.debug(f"Sentiment score failed for {symbol}: {e}")
-            score = 0.0
-            self.sentiment_cache[cache_key] = score
-            return score
+            # FIX #27: Don't cache failed sentiment — 0.0 would be cached for an hour,
+            # masking real sentiment. Return 0.0 without caching so next call retries.
+            return 0.0
 
     async def generate_portfolio_actions(self, symbols: list, data_dict: dict, current_equity: float, precomputed_env=None, timestamp: pd.Timestamp = None) -> dict:
         if not symbols:
             logger.warning("No symbols provided for portfolio actions")
-            return {sym: 0.0 for sym in symbols}
+            return {}  # L25 FIX: symbols is empty, comprehension was redundant
         if self.trainer.portfolio_ppo_model is None:
             logger.warning("Portfolio PPO model not loaded — returning flat weights")
             return {sym: 0.0 for sym in symbols}
@@ -572,7 +892,7 @@ class SignalGenerator:
                     data_dict=data_dict,
                     symbols=symbols,
                     initial_balance=current_equity,
-                    max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
+                    max_leverage=self.config.get('MAX_LEVERAGE', 2.0)
                 )
                 obs, _ = temp_env.reset()
             obs = obs.reshape(1, -1).astype(np.float32)
@@ -603,7 +923,7 @@ class SignalGenerator:
                 logger.warning(f"[CAUSAL FALLBACK] Portfolio causal predict failed ({fallback_err}) — using base PPO")
                 action, _ = self.trainer.portfolio_ppo_model.predict(obs, deterministic=True)
             action = action.flatten()
-            max_leverage = self.config.get('MAX_LEVERAGE', 3.0)
+            max_leverage = self.config.get('MAX_LEVERAGE', 2.0)
             abs_sum = np.sum(np.abs(action))
             if abs_sum > max_leverage:
                 action = action / abs_sum * max_leverage
@@ -613,7 +933,15 @@ class SignalGenerator:
             if sentiment_blend_weight > 0:
                 # Parallelize sentiment calls — cuts cycle time from ~4 min to ~25s
                 async def _get_sentiment(sym):
-                    ts = timestamp if timestamp is not None else data_dict[sym].index[-1]
+                    # FIX #32: Guard against empty DataFrame — .index[-1] raises IndexError on empty
+                    if timestamp is not None:
+                        ts = timestamp
+                    else:
+                        df = data_dict.get(sym)
+                        if df is not None and not df.empty:
+                            ts = df.index[-1]
+                        else:
+                            ts = pd.Timestamp.now(tz='UTC')
                     return sym, await self.get_sentiment_score(sym, ts, live_mode=True)
                 sentiment_results = await asyncio.gather(*[_get_sentiment(sym) for sym in symbols])
                 for sym, sentiment in sentiment_results:
@@ -657,6 +985,13 @@ class SignalGenerator:
             except Exception as e:
                 logger.error(f"[BUFFER PRESERVE FAILED] {e}")
         # ==================== END PRESERVE ====================
+        # HIGH-17 FIX: Save per-symbol buffers before clearing (were being lost on nightly refresh)
+        for sym, mgr in self.causal_manager.items():
+            try:
+                mgr.save_buffer()
+                logger.debug(f"[BUFFER PRESERVE] Saved per-symbol buffer for {sym}")
+            except Exception as e:
+                logger.warning(f"[BUFFER PRESERVE] Failed to save buffer for {sym}: {e}")
         self.causal_manager = {}
         self.portfolio_causal_manager = None
         # Rebuild per-symbol managers
@@ -666,11 +1001,14 @@ class SignalGenerator:
                 regime_tuple = self.trainer.get_cached_regime(symbol, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
                 regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
                 features = generate_features(data, regime, symbol, data)
-                features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
+                # HIGH-18 FIX: Check for None features before creating DataFrame
+                if features is None or features.shape[0] == 0:
+                    logger.warning(f"[CAUSAL REFRESH] {symbol} — feature generation returned None/empty — skipping")
+                    continue
+                # FIX #28: Removed dead features_df computation (not passed to CausalSignalManager)
                 if symbol in self.trainer.ppo_models and self.trainer.ppo_models[symbol]:
                     self.causal_manager[symbol] = CausalSignalManager(
                         base_model=self.trainer.ppo_models[symbol],
-                        features_df=features_df,
                         symbol=symbol,
                         data_ingestion=self.data_ingestion
                     )
@@ -698,7 +1036,6 @@ class SignalGenerator:
                 full_df['symbol_id'] = pd.Categorical(full_df['symbol_id']).codes
                 self.portfolio_causal_manager = CausalSignalManager(
                     base_model=self.trainer.portfolio_ppo_model,
-                    features_df=full_df,
                     symbol="portfolio",
                     data_ingestion=self.data_ingestion
                 )
@@ -727,11 +1064,13 @@ class SignalGenerator:
                 regime_tuple = self.trainer.get_cached_regime(symbol, data) if hasattr(self.trainer, 'get_cached_regime') else ('trending', 0.5)
                 regime = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
                 features = generate_features(data, regime, symbol, data)
-                features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
+                if features is None or features.shape[0] == 0:
+                    logger.warning(f"[CAUSAL REBUILD] Skipping {symbol} — features generation returned None/empty")
+                    continue
+                # FIX #28: Removed dead features_df computation (not passed to CausalSignalManager)
                 if symbol in self.trainer.ppo_models and self.trainer.ppo_models[symbol]:
                     self.causal_manager[symbol] = CausalSignalManager(
                         base_model=self.trainer.ppo_models[symbol],
-                        features_df=features_df,
                         symbol=symbol,
                         data_ingestion=self.data_ingestion
                     )
@@ -753,7 +1092,6 @@ class SignalGenerator:
                 full_df['symbol_id'] = pd.Categorical(symbol_ids).codes
                 self.portfolio_causal_manager = CausalSignalManager(
                     base_model=self.trainer.portfolio_ppo_model,
-                    features_df=full_df,
                     symbol="portfolio",
                     data_ingestion=self.data_ingestion
                 )
@@ -800,22 +1138,51 @@ class SignalGenerator:
                 if len(closed) >= 5:
                     recent_rets = [e['realized_return'] for e in closed[-10:]]
                     win_rate = sum(r > 0 for r in recent_rets) / len(recent_rets)
-                    if symbol in self.trainer.confidence_thresholds:
-                        thresholds = self.trainer.confidence_thresholds[symbol]
-                        if thresholds:
-                            latest = thresholds[-1]
-                            if win_rate < 0.4:
-                                # Tighten thresholds — but use absolute target, not cumulative increment
-                                target_long = min(0.65 + (0.4 - win_rate) * 0.5, 0.85)
-                                target_short = max(0.35 - (0.4 - win_rate) * 0.5, 0.15)
-                                latest['long'] = max(latest.get('long', 0.6), target_long)
-                                latest['short'] = min(latest.get('short', 0.4), target_short)
-                                logger.warning(f"{symbol} OOS degradation: win rate {win_rate:.1%} — thresholds tightened to L={latest['long']:.2f}/S={latest['short']:.2f}")
-                            elif win_rate > 0.55:
-                                # Recovery: relax thresholds back toward default
-                                latest['long'] = max(latest.get('long', 0.6) - 0.02, 0.55)
-                                latest['short'] = min(latest.get('short', 0.4) + 0.02, 0.45)
-                                logger.info(f"{symbol} OOS recovery: win rate {win_rate:.1%} — thresholds relaxed to L={latest['long']:.2f}/S={latest['short']:.2f}")
+                    # FIX #42: Lock threshold modifications to prevent race with generate_signal reads
+                    if not hasattr(self.trainer, '_lock'):
+                        logger.debug(f"[OOS MONITOR] trainer._lock not available — skipping threshold update for {symbol}")
+                        continue
+                    with self.trainer._lock:
+                        if symbol in self.trainer.confidence_thresholds:
+                            thresholds = self.trainer.confidence_thresholds[symbol]
+                            if thresholds:
+                                latest = thresholds[-1]
+                                # HIGH FIX: Track last closed trade count per symbol.
+                                # If no new trades in N checks, relax thresholds toward defaults
+                                # regardless of win_rate (prevents permanent lockout).
+                                oos_no_trade_key = f'_oos_last_closed_count_{symbol}'
+                                oos_stale_checks_key = f'_oos_stale_checks_{symbol}'
+                                prev_closed_count = getattr(self, oos_no_trade_key, 0)
+                                current_closed_count = len(closed)
+                                stale_checks = getattr(self, oos_stale_checks_key, 0)
+                                if current_closed_count == prev_closed_count:
+                                    stale_checks += 1
+                                else:
+                                    stale_checks = 0
+                                setattr(self, oos_no_trade_key, current_closed_count)
+                                setattr(self, oos_stale_checks_key, stale_checks)
+                                max_stale = self.config.get('OOS_MAX_STALE_CHECKS', 10)
+                                if stale_checks >= max_stale:
+                                    # No new trades for too long — force relax toward defaults
+                                    latest['long'] = max(latest.get('long', 0.6) - 0.03, 0.55)
+                                    latest['short'] = min(latest.get('short', 0.4) + 0.03, 0.45)
+                                    setattr(self, oos_stale_checks_key, 0)  # reset counter
+                                    logger.warning(
+                                        f"{symbol} OOS stale ({stale_checks} checks with no new trades) — "
+                                        f"force-relaxing thresholds to L={latest['long']:.2f}/S={latest['short']:.2f}"
+                                    )
+                                elif win_rate < 0.4:
+                                    # Tighten thresholds — but use absolute target, not cumulative increment
+                                    target_long = min(0.65 + (0.4 - win_rate) * 0.5, 0.85)
+                                    target_short = max(0.35 - (0.4 - win_rate) * 0.5, 0.15)
+                                    latest['long'] = max(latest.get('long', 0.6), target_long)
+                                    latest['short'] = min(latest.get('short', 0.4), target_short)
+                                    logger.warning(f"{symbol} OOS degradation: win rate {win_rate:.1%} — thresholds tightened to L={latest['long']:.2f}/S={latest['short']:.2f}")
+                                elif win_rate > 0.55:
+                                    # Recovery: relax thresholds back toward default
+                                    latest['long'] = max(latest.get('long', 0.6) - 0.02, 0.55)
+                                    latest['short'] = min(latest.get('short', 0.4) + 0.02, 0.45)
+                                    logger.info(f"{symbol} OOS recovery: win rate {win_rate:.1%} — thresholds relaxed to L={latest['long']:.2f}/S={latest['short']:.2f}")
                 # B-25 FIX: Runtime prune old realized entries to prevent memory bloat (keep last 2000 per symbol)
                 if len(history) > 2000:
                     history[:] = history[-2000:]
