@@ -232,6 +232,35 @@ class TradeStreamHandler:
                     getattr(group, 'regime', 'mean_reverting'),
                     exit_reason, getattr(group, 'filled_at', None)
                 )
+                # ALPHA-ATTR: emit per-trade attribution with realized outcome + MFE/MAE
+                if hasattr(self.broker, 'alpha_attribution') and self.broker.alpha_attribution:
+                    try:
+                        realized_return = pnl / (abs(group.entry_price) * abs(group.filled_qty) + 1e-9) if group.entry_price else 0.0
+                        # Compute held bars: 1 bar = 15 min
+                        held_bars = None
+                        try:
+                            if group.filled_at:
+                                from datetime import datetime as _dt
+                                filled_dt = _dt.fromisoformat(group.filled_at) if isinstance(group.filled_at, str) else group.filled_at
+                                now_dt = _dt.now(tz=_UTC)
+                                elapsed_min = (now_dt - filled_dt).total_seconds() / 60
+                                held_bars = int(elapsed_min / 15)
+                        except Exception:
+                            pass
+                        self.broker.alpha_attribution.emit_on_close(
+                            symbol=symbol,
+                            realized_return=float(realized_return),
+                            entry_price=float(group.entry_price) if group.entry_price else None,
+                            exit_price=float(fill_price),
+                            mfe=float(getattr(group, 'max_favorable_pct', 0.0)),
+                            mae=float(getattr(group, 'max_adverse_pct', 0.0)),
+                            exit_reason=exit_reason,
+                            regime_at_open=getattr(group, 'regime', 'mean_reverting'),
+                            regime_at_close=getattr(group, 'regime', 'mean_reverting'),
+                            held_bars=held_bars,
+                        )
+                    except Exception as e:
+                        logger.debug(f"[ALPHA-ATTR] emit_on_close failed for {symbol}: {e}")
 
                 # HIGH-13 FIX: Perform all close operations under single lock acquisition
                 # to prevent monitor seeing intermediate states.

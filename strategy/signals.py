@@ -964,6 +964,12 @@ class SignalGenerator:
                 action = action / abs_sum * max_leverage
             action = np.clip(action, -2.0, 2.0)
             target_weights = {sym: float(weight) for sym, weight in zip(symbols, action)}
+            # ALPHA-ATTR: snapshot baseline weights (post-PPO-post-causal) BEFORE any
+            # downstream layers. We record the transformation chain after each layer
+            # so we can attribute the final weight back to each multiplier.
+            baseline_weights = dict(target_weights)
+            # accumulated layer multipliers: {sym: {layer_name: mult}}
+            _attr_layers: Dict[str, Dict[str, float]] = {s: {} for s in target_weights}
             # === STACKING ENSEMBLE OVERLAY (per-symbol meta_prob) ===
             # The stacking ensemble (LightGBM) is trained nightly but was otherwise
             # unused in portfolio mode. Apply it as a per-symbol multiplier:
@@ -1456,6 +1462,38 @@ class SignalGenerator:
                     self.execution_scorecard.record_cycle(regime_snapshot)
                 except Exception:
                     pass
+            # ALPHA-ATTR: record per-symbol attribution for entry-side trades that
+            # passed through the full pipeline. Only record for symbols where the
+            # final weight is non-zero (i.e., we're actually trading this symbol).
+            if getattr(self, 'alpha_attribution', None):
+                try:
+                    for sym, final_w in target_weights.items():
+                        if abs(final_w) < 1e-6:
+                            continue
+                        base_w = baseline_weights.get(sym, final_w)
+                        # Reconstruct aggregate multiplier = final / baseline
+                        if abs(base_w) > 1e-9:
+                            agg_mult = final_w / base_w
+                        else:
+                            agg_mult = 1.0
+                        direction = 1 if final_w > 0 else -1
+                        context = {
+                            "regime": regime_snapshot.get(sym, ('mean_reverting', 0.5))[0] if 'regime_snapshot' in locals() else 'unknown',
+                            "aggregate_multiplier": float(agg_mult),
+                        }
+                        # layers dict is a rough summary — detailed per-layer tracking
+                        # would require capturing at each gate. For now, record the
+                        # aggregate transformation.
+                        self.alpha_attribution.record_attribution(
+                            symbol=sym,
+                            baseline_weight=float(base_w),
+                            final_weight=float(final_w),
+                            direction=direction,
+                            layers={"aggregate_transform": float(agg_mult)},
+                            context=context,
+                        )
+                except Exception as e:
+                    logger.debug(f"[ALPHA-ATTR] record failed: {e}")
             logger.debug("========== PORTFOLIO PPO DEBUG END ==========")
             return target_weights
         except Exception as e:

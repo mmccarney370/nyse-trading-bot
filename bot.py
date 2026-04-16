@@ -176,6 +176,11 @@ class TradingBot:
         self.execution_scorecard = ExecutionScorecard()
         self.signal_gen.execution_scorecard = self.execution_scorecard
         self.broker.execution_scorecard = self.execution_scorecard
+        # ALPHA-ATTR: Per-closed-trade attribution logger
+        from strategy.alpha_attribution import AlphaAttribution
+        self.alpha_attribution = AlphaAttribution()
+        self.signal_gen.alpha_attribution = self.alpha_attribution
+        self.broker.alpha_attribution = self.alpha_attribution
     def _load_regime_cache(self):
         # FIX (Apr 16 gap #3): Regime detection code now uses S2 ensemble (slope +
         # ADX + autocorr + range + HMM). Old cache entries were produced by the
