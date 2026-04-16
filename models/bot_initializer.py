@@ -235,4 +235,32 @@ class BotInitializer:
             except Exception as e:
                 logger.warning(f"[B-21] Failed to load LAST_ENTRY_FILE: {e}")
         # ====================== BUG #7 FIX END ======================
+        # BPS: Fit Bayesian sizer from closed-trade history at startup
+        if CONFIG.get('BAYESIAN_SIZING_ENABLED', True) and hasattr(self.bot, 'bayesian_sizer'):
+            try:
+                summary = self.bot.bayesian_sizer.fit_from_history(self.bot.live_signal_history)
+                # Log top-5 and bottom-5 by p_win for operator visibility
+                ranked = sorted(summary.items(), key=lambda x: x[1]['p_win'], reverse=True)
+                parts = [f"{s}: p={v['p_win']:.2f}/n={v['n']}" for s, v in ranked]
+                logger.info(f"[BAYESIAN-SIZE] Posterior ranking — {' | '.join(parts)}")
+            except Exception as e:
+                logger.warning(f"[BAYESIAN-SIZE] Startup fit failed: {e}")
+        # B5: Refresh earnings calendar at startup so blackouts are immediately active
+        if CONFIG.get('EARNINGS_FILTER_ENABLED', True) and hasattr(self.bot, 'earnings_calendar'):
+            try:
+                logger.info("[EARNINGS] Refreshing earnings calendar at startup...")
+                self.bot.earnings_calendar.refresh(self.bot.config['SYMBOLS'])
+            except Exception as e:
+                logger.warning(f"[EARNINGS] Startup refresh failed: {e}")
+        # S1: Fit meta-labeler from startup history if enabled
+        if CONFIG.get('META_FILTER_ENABLED', True) and hasattr(self.bot, 'meta_labeler'):
+            try:
+                stats = self.bot.meta_labeler.fit_from_history(
+                    self.bot.live_signal_history,
+                    min_train_samples=CONFIG.get('META_FILTER_MIN_TRAIN', 30),
+                    equity_estimate=starting_equity or 30000.0,
+                )
+                logger.info(f"[META-FILTER] Startup fit: {stats}")
+            except Exception as e:
+                logger.warning(f"[META-FILTER] Startup fit failed: {e}")
         logger.info("✅ Full bot initialization completed successfully")

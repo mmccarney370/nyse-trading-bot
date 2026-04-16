@@ -88,6 +88,10 @@ class TradingBotConfig(BaseModel):
     # ==================== Signal Generation ====================
     MIN_CONFIDENCE: float = 0.72                       # Was 0.78 — take more trades with improved signal pipeline
     PORTFOLIO_SENTIMENT_WEIGHT: float = 0.25           # Was 0.35 — sentiment is noisy, reduce influence
+    # Portfolio-mode weight for the nightly-trained LightGBM stacking ensemble.
+    # Applied as a multiplicative per-symbol factor (agreement with PPO → boost,
+    # disagreement → dampen) inside generate_portfolio_actions. Set 0.0 to disable.
+    PORTFOLIO_META_WEIGHT: float = 0.2
     SENTIMENT_WEIGHT: float = 0.18                     # Was 0.25 — let PPO/stacking dominate more
     PPO_SIGNAL_WEIGHT: float = 0.20                    # PPO's direct contribution to combined signal (rest is LightGBM ensemble)
     USE_LLM_DEBATE: bool = True
@@ -231,6 +235,120 @@ class TradingBotConfig(BaseModel):
     CAUSAL_LLM_REFINEMENT: bool = True
     CAUSAL_PENALTY_WEIGHT: float = 0.40                # Was 0.34 — stronger causal influence
     CAUSAL_REWARD_FACTOR: float = 0.7                  # NEW — was hardcoded 0.5 in env.py
+    # Seed the portfolio replay buffer by replaying recent historical bars through the
+    # persistent PortfolioEnv at startup. Without this, the portfolio causal graph stays
+    # in fallback mode until ≥100 live trades accumulate (takes weeks at typical cadence).
+    # Set to 0 to disable bootstrap entirely.
+    CAUSAL_BOOTSTRAP_STEPS: int = 1500
+    # Gaussian std injected into bootstrap actions for causal discovery. Converged PPO
+    # is near-deterministic (std ~0.08) so GES finds 0 edges; this provides the
+    # treatment variance GES needs to identify action→reward structure.
+    CAUSAL_BOOTSTRAP_NOISE_SIGMA: float = 0.4
+    # Cap GES input width. Portfolio observations are 460-dim so raw buffer samples hit
+    # 462 cols → GES runs for hours (O(p^3·n)). Cap selects the top-variance features +
+    # always keeps action/reward. Per-symbol buffers are already below this so unaffected.
+    CAUSAL_MAX_FEATURES: int = 58
+    # ==================== Intraday Risk Pacing ====================
+    # Graduated multiplier on the CVaR risk budget based on today's state. Tier1 fires
+    # at small drawdowns (scale 0.5×), Tier2 at larger ones (0.2×). Consecutive-loss
+    # floor kicks in after N losing closes today. All cumulative with the existing
+    # hard daily-loss halt (DAILY_LOSS_THRESHOLD).
+    RISK_PACING_ENABLED: bool = True
+    RISK_PACING_TIER1_LOSS: float = -0.005   # -0.5% intraday → scale 0.5×
+    RISK_PACING_TIER1_SCALE: float = 0.5
+    RISK_PACING_TIER2_LOSS: float = -0.015   # -1.5% intraday → scale 0.2×
+    RISK_PACING_TIER2_SCALE: float = 0.2
+    RISK_PACING_CONSECUTIVE_LOSSES: int = 3  # after N in a row today
+    RISK_PACING_CONSECUTIVE_LOSS_SCALE: float = 0.3
+    # ==================== S1: Meta-Labeling Filter ====================
+    # Lopez-de-Prado-style secondary gate. Nightly-trained LightGBM classifier
+    # answers "given PPO says go <dir> on <sym>, is this likely a winner?" Any
+    # candidate weight whose P(win) < MIN_PROB is zeroed (default) or scaled
+    # (set MODE='scale' for softer behavior). Pass-through when model hasn't yet
+    # reached MIN_TRAIN samples — strictly additive, never blocks when unsure.
+    META_FILTER_ENABLED: bool = True
+    META_FILTER_MIN_TRAIN: int = 30      # need ≥N closed trades to fit
+    META_FILTER_MIN_PROB: float = 0.33   # reject if P(win) below this (lowered from 0.40 Apr 16 —
+                                         # base_wr=0.308 meant 0.40 rejected ~69% of candidates;
+                                         # 0.33 is "clearly below baseline" only. Gemini can tune further)
+    META_FILTER_MODE: str = "zero"       # "zero" (hard reject) or "scale" (0.2× dampen)
+    # ==================== S2: Regime-Detector Ensemble ====================
+    # Legacy HMM alone labeled every bar mean_reverting even in clear trends. The
+    # ensemble gives 4 classical signals a vote — slope, ADX, lag-1 autocorrelation,
+    # range expansion — combined with HMM as a 5th voter when available.
+    REGIME_DETECTOR_MODE: str = "ensemble"  # "ensemble" (default) or "hmm" (legacy)
+    # Voter thresholds — raise → more mean-reverting; lower → more trending
+    REGIME_SLOPE_THRESHOLD: float = 0.025                # normalized slope over window
+    REGIME_ADX_TREND_THRESHOLD: float = 25.0             # ADX ≥ this → trend
+    REGIME_ADX_NO_TREND_THRESHOLD: float = 20.0          # ADX ≤ this → mean-revert
+    REGIME_AUTOCORR_TREND_THRESHOLD: float = 0.06        # |lag-1 rho| ≥ this → signal
+    REGIME_RANGE_EXPANSION_THRESHOLD: float = 1.30       # short/long ATR ratio
+    REGIME_RANGE_CONTRACTION_THRESHOLD: float = 0.85
+    # Ensemble aggregation: how much of the vote mass must be trending to declare one
+    REGIME_ENSEMBLE_TREND_DOMINANCE: float = 0.50
+    # Force-refresh persisted regime cache on startup. Normally the version-marker
+    # in regime_cache.json handles this automatically, but setting this True for
+    # one run forces a clean recompute via detect_regime (useful after code changes).
+    REGIME_FORCE_REFRESH_ON_STARTUP: bool = False
+    # ==================== A1: Cross-Sectional Momentum Gate ====================
+    # Daily re-rank of the current universe by momentum + volume + drawdown. Applies
+    # a multiplicative gate to target weights so today's winners get a boost and
+    # today's laggards get dampened. Preserves PPO obs shape (no retrain) while
+    # capturing cross-sectional alpha. Set WEIGHT=0 to disable.
+    CROSS_SECTIONAL_WEIGHT: float = 1.0        # 0.0 disables; 1.0 full effect
+    CROSS_SECTIONAL_MAX_MULT: float = 1.25     # top-tercile boost
+    CROSS_SECTIONAL_MIN_MULT: float = 0.50     # bottom-tercile dampen
+    CROSS_SECTIONAL_NEUTRAL_BAND: float = 0.25  # z-score within [-0.25, 0.25] = no change
+    # ==================== B5: Anti-Earnings Filter ====================
+    # Auto-flat positions N days before earnings and block new entries during a
+    # pre/post blackout window. Cheapest WR boost: don't trade through earnings.
+    EARNINGS_FILTER_ENABLED: bool = True
+    EARNINGS_BLACKOUT_PRE_DAYS: int = 2     # no NEW entries in last 2 days pre-earnings
+    EARNINGS_BLACKOUT_POST_DAYS: int = 1    # no NEW entries for 1 day after
+    EARNINGS_CLOSE_PRE_DAYS: int = 1        # close OPEN positions 1 day before earnings
+    # ==================== B4: Sentiment Velocity ====================
+    # Level alone saturates (0.2-0.6 range mostly). Velocity = Δ level over past N hours
+    # captures information ARRIVAL. Applied direction-aware so positive Δ boosts longs
+    # and dampens shorts. Weight=0.15 means +0.5 velocity gives ~1.075x boost.
+    SENTIMENT_VELOCITY_WEIGHT: float = 0.15
+    SENTIMENT_VELOCITY_LOOKBACK_HOURS: int = 4
+    # ==================== AC: Correlation-Aware Sizing ====================
+    # Discount each position by its average correlation to same-sign peers. Prevents
+    # 4 correlated tech longs from becoming one effective mega-position.
+    CROWDING_DISCOUNT_ENABLED: bool = True
+    CROWDING_DISCOUNT_THRESHOLD: float = 0.5   # only kicks in above this avg correlation
+    CROWDING_DISCOUNT_STRENGTH: float = 0.5    # slope of discount (1.0 = aggressive)
+    CROWDING_DISCOUNT_MIN_FACTOR: float = 0.4  # hard floor, never below this
+    # ==================== B2: Adverse Selection Detector ====================
+    # Tracks post-fill price drift per symbol. If recent fills were consistently
+    # followed by adverse moves, we're being picked off → dampen that symbol's
+    # weight until drift recovers. Rolling 20-fill window at 5-min offset.
+    ADVERSE_SELECTION_ENABLED: bool = True
+    ADVERSE_SELECTION_THRESHOLD: float = -0.002  # -20bp consistent drift = toxic
+    ADVERSE_SELECTION_MAX_PENALTY: float = 0.5   # up to 50% weight reduction
+    # ==================== BPS: Bayesian Per-Symbol Sizing ====================
+    # Beta(α, β) posterior per symbol updated after every closed trade. Scales
+    # each symbol's target weight by expected return. SMCI at 100% WR → up to 1.6×;
+    # TSLA at 25% WR → down to 0.4×. Small-sample shrinkage prevents over-reacting.
+    BAYESIAN_SIZING_ENABLED: bool = True
+    BAYESIAN_SIZING_MIN_MULT: float = 0.4
+    BAYESIAN_SIZING_MAX_MULT: float = 1.6
+    BAYESIAN_SIZING_REFERENCE_EV: float = 0.003   # +0.3% ev_per_trade → full boost
+    BAYESIAN_SIZING_SHRINKAGE_N: int = 8          # need this many trades before full weight
+    # ==================== ESP: Slippage-Prediction Veto ====================
+    # Learn realized slippage per (symbol, hour, size). At entry, predict expected
+    # slippage; if > edge × safety multiple → skip or dampen.
+    SLIPPAGE_VETO_ENABLED: bool = True
+    SLIPPAGE_VETO_MULTIPLE: float = 1.2    # pred_bps > edge × this → veto
+    SLIPPAGE_VETO_SCALE: float = 0.3       # dampen to 30% when vetoed
+    # ==================== PSD: PPO–Stacking Divergence Gate ====================
+    # If PPO says go hard in one direction but stacking ensemble predicts the
+    # OPPOSITE direction, that's high-conviction disagreement — historically
+    # unprofitable. Dampen rather than blindly follow PPO.
+    DIVERGENCE_GATE_ENABLED: bool = True
+    DIVERGENCE_GATE_SCALE: float = 0.5     # dampen to 50% on strong disagreement
+    DIVERGENCE_MIN_WEIGHT: float = 0.03    # PPO weight must exceed this to trigger
+    DIVERGENCE_MIN_META: float = 0.20      # |meta_signed| must exceed this to trigger
     # L33: CAUSAL_EDGE_THRESHOLD and COUNTERFACTUAL_SAMPLES removed (dead code, never read by GES fast-path)
     # ==================== Multi-Agent RL Settings ====================
     USE_MULTI_AGENT: bool = False  # M55 FIX: Feature is dead code (not imported anywhere) — disabled
@@ -253,6 +371,15 @@ class TradingBotConfig(BaseModel):
     RATCHET_TIER2_PCT: float = 0.025                   # Was 0.03 — transition to aggressive ratchet sooner
     RATCHET_TIER2_FLOOR_PCT: float = 0.8               # Was 1.0 — tighter floor locks in more
     RATCHET_TIER3_FLOOR_PCT: float = 0.4               # Was 0.5 — tighter aggressive floor
+    # ==================== S3: Asymmetric Loss-Side Tightening ====================
+    # When a position is underwater and hasn't gone meaningfully green, tighten the
+    # trailing stop so we cut losses faster instead of letting a losing trade drift
+    # all the way to the original wide stop. Gated by MFE so we don't penalize
+    # winning trades that pulled back.
+    RATCHET_LOSS_TIGHTEN_ENABLED: bool = True
+    RATCHET_LOSS_TIGHTEN_THRESHOLD: float = -0.007     # fires at -0.7% unrealized
+    RATCHET_LOSS_TIGHTEN_FACTOR: float = 0.55          # trail → 55% of original width
+    RATCHET_LOSS_TIGHTEN_MFE_MAX: float = 0.004        # skip if MFE ever exceeded +0.4%
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty

@@ -40,6 +40,171 @@ def reset_divergence_streaks():
     with _divergence_streak_lock:
         _divergence_streak.clear()
 
+def _regime_from_slope(prices: pd.Series, lookback: int = 50) -> tuple[str, float]:
+    """Normalized linear-regression slope voter.
+    Trending when |slope/price| > threshold; sign picks direction.
+    Returns (regime, strength ∈ [0,1])."""
+    if len(prices) < lookback + 1:
+        return 'mean_reverting', 0.5
+    y = prices.tail(lookback).values.astype(float)
+    x = np.arange(len(y), dtype=float)
+    try:
+        # Linear regression via numpy polyfit
+        slope, _ = np.polyfit(x, y, 1)
+    except Exception:
+        return 'mean_reverting', 0.5
+    mean_price = float(np.mean(y)) or 1.0
+    slope_pct = (slope * lookback) / mean_price  # total normalized move over window
+    thresh = CONFIG.get('REGIME_SLOPE_THRESHOLD', 0.02)  # 2% move over window ⇒ trending
+    if abs(slope_pct) < thresh:
+        return 'mean_reverting', float(np.clip(1.0 - abs(slope_pct) / thresh, 0.0, 1.0))
+    strength = float(np.clip(abs(slope_pct) / (3.0 * thresh), 0.5, 1.0))
+    return ('trending_up' if slope_pct > 0 else 'trending_down'), strength
+
+
+def _regime_from_adx(data: pd.DataFrame, lookback: int = 50) -> tuple[str, float]:
+    """Classic ADX voter.
+    ADX > 25 → strong trend (direction from +DI vs -DI). ADX < 20 → no trend.
+    Uses 14-period ADX on the last `lookback` bars."""
+    if len(data) < lookback + 15 or not all(c in data.columns for c in ('high', 'low', 'close')):
+        return 'mean_reverting', 0.5
+    try:
+        high = data['high'].astype(float)
+        low = data['low'].astype(float)
+        close = data['close'].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        # Wilder-style smoothing (EMA with alpha = 1/14)
+        atr = tr.ewm(alpha=1/14, adjust=False).mean()
+        plus_di = 100.0 * pd.Series(plus_dm, index=data.index).ewm(alpha=1/14, adjust=False).mean() / atr.replace(0, np.nan)
+        minus_di = 100.0 * pd.Series(minus_dm, index=data.index).ewm(alpha=1/14, adjust=False).mean() / atr.replace(0, np.nan)
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0.0)
+        last_adx = float(adx.iloc[-1])
+        last_plus = float(plus_di.iloc[-1] or 0.0)
+        last_minus = float(minus_di.iloc[-1] or 0.0)
+    except Exception:
+        return 'mean_reverting', 0.5
+    trend_thresh = CONFIG.get('REGIME_ADX_TREND_THRESHOLD', 25.0)
+    no_trend_thresh = CONFIG.get('REGIME_ADX_NO_TREND_THRESHOLD', 20.0)
+    if last_adx >= trend_thresh:
+        strength = float(np.clip((last_adx - trend_thresh) / 25.0 + 0.6, 0.6, 0.95))
+        return ('trending_up' if last_plus >= last_minus else 'trending_down'), strength
+    if last_adx <= no_trend_thresh:
+        return 'mean_reverting', float(np.clip(1.0 - last_adx / no_trend_thresh, 0.5, 0.9))
+    return 'mean_reverting', 0.5  # ambiguous zone — neutral MR vote
+
+
+def _regime_from_autocorr(prices: pd.Series, lookback: int = 100) -> tuple[str, float]:
+    """Lag-1 return autocorrelation voter.
+    +corr → momentum/trending. -corr → mean-reverting. Direction from sign of
+    cumulative return over window (trend direction is independent of autocorr sign)."""
+    if len(prices) < lookback + 2:
+        return 'mean_reverting', 0.5
+    try:
+        returns = prices.pct_change().dropna().tail(lookback)
+        if len(returns) < 20 or returns.std() < 1e-6:
+            return 'mean_reverting', 0.5
+        shifted = returns.shift(1).dropna()
+        aligned_cur = returns.loc[shifted.index]
+        if len(aligned_cur) < 15:
+            return 'mean_reverting', 0.5
+        rho = float(np.corrcoef(aligned_cur.values, shifted.values)[0, 1])
+        if np.isnan(rho):
+            return 'mean_reverting', 0.5
+        # Cumulative signed move for direction
+        total_move = float(prices.iloc[-1] / prices.iloc[-lookback] - 1.0)
+    except Exception:
+        return 'mean_reverting', 0.5
+    trend_thresh = CONFIG.get('REGIME_AUTOCORR_TREND_THRESHOLD', 0.06)
+    if rho > trend_thresh:
+        strength = float(np.clip(0.5 + rho, 0.55, 0.95))
+        return ('trending_up' if total_move >= 0 else 'trending_down'), strength
+    if rho < -trend_thresh:
+        strength = float(np.clip(0.5 + abs(rho), 0.55, 0.95))
+        return 'mean_reverting', strength
+    return 'mean_reverting', 0.55  # weak vote for MR in the ambiguous middle
+
+
+def _regime_from_range(data: pd.DataFrame, lookback: int = 50) -> tuple[str, float]:
+    """Range-expansion voter.
+    If recent 10-bar ATR is > k × 50-bar ATR, we're in a breakout/trending leg.
+    Direction from the sign of the recent 10-bar return."""
+    if len(data) < lookback + 2 or not all(c in data.columns for c in ('high', 'low', 'close')):
+        return 'mean_reverting', 0.5
+    try:
+        high = data['high'].astype(float)
+        low = data['low'].astype(float)
+        close = data['close'].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        short_atr = float(tr.tail(10).mean())
+        long_atr = float(tr.tail(lookback).mean())
+        if long_atr < 1e-8:
+            return 'mean_reverting', 0.5
+        ratio = short_atr / long_atr
+        recent_ret = float(close.iloc[-1] / close.iloc[-min(10, len(close))] - 1.0)
+    except Exception:
+        return 'mean_reverting', 0.5
+    expand_thresh = CONFIG.get('REGIME_RANGE_EXPANSION_THRESHOLD', 1.30)
+    contract_thresh = CONFIG.get('REGIME_RANGE_CONTRACTION_THRESHOLD', 0.85)
+    if ratio >= expand_thresh:
+        strength = float(np.clip(0.5 + (ratio - expand_thresh) * 0.5, 0.55, 0.9))
+        return ('trending_up' if recent_ret >= 0 else 'trending_down'), strength
+    if ratio <= contract_thresh:
+        return 'mean_reverting', float(np.clip(0.5 + (contract_thresh - ratio), 0.55, 0.9))
+    return 'mean_reverting', 0.5
+
+
+def _ensemble_vote(votes: list[tuple[str, float]]) -> tuple[str, float]:
+    """Combine voter tuples into final (regime, persistence).
+    Scoring: each trending_up = +strength, trending_down = -strength, mean_reverting
+    contributes |strength| to a 'neutral pile'. Direction = sign of net signed score;
+    trending fires when |signed| dominates neutral pile by config threshold."""
+    if not votes:
+        return 'mean_reverting', 0.5
+    signed = 0.0
+    neutral = 0.0
+    up_strength = 0.0
+    down_strength = 0.0
+    n = len(votes)
+    for regime, strength in votes:
+        s = float(max(0.0, min(1.0, strength)))
+        if regime == 'trending_up':
+            signed += s
+            up_strength += s
+        elif regime == 'trending_down':
+            signed -= s
+            down_strength += s
+        else:
+            neutral += s
+    total = up_strength + down_strength + neutral
+    if total < 1e-6:
+        return 'mean_reverting', 0.5
+    trend_dominance = (up_strength + down_strength) / total
+    trend_threshold = CONFIG.get('REGIME_ENSEMBLE_TREND_DOMINANCE', 0.50)
+    direction_consistency = abs(signed) / max(up_strength + down_strength, 1e-6)
+    if trend_dominance < trend_threshold or direction_consistency < 0.5:
+        # Not enough trending votes, or trending votes disagree on direction
+        persistence = float(np.clip(0.4 + (1.0 - trend_dominance) * 0.5, 0.4, 0.95))
+        return 'mean_reverting', persistence
+    regime = 'trending_up' if signed >= 0 else 'trending_down'
+    persistence = float(np.clip(0.55 + 0.40 * trend_dominance * direction_consistency, 0.55, 0.95))
+    return regime, persistence
+
+
 def detect_regime(
     data: pd.DataFrame,
     symbol: str = None,
@@ -50,8 +215,12 @@ def detect_regime(
 ) -> tuple[str, float]:
     """
     Returns (regime: str, persistence_score: float 0.0-1.0)
-    persistence_score = average self-transition probability from HMM ensemble
-    (higher = more persistent/trending behavior)
+    S2 UPGRADE: The HMM alone was broken (labeled every bar mean_reverting even in
+    strong trends). We now run a 4-signal ensemble — slope, ADX, return autocorrelation,
+    range expansion — and combine with HMM as a fifth voter when available. Each voter
+    returns (regime, strength ∈ [0,1]); ensemble_vote aggregates using direction
+    consistency and trend dominance.
+    Toggle via REGIME_DETECTOR_MODE: 'ensemble' (default) or 'hmm' (legacy).
     """
     # HIGH-24 FIX: Resolve lookback at call time, not import time
     if lookback is None:
@@ -88,6 +257,29 @@ def detect_regime(
         if recent_return < -0.005:
             logger.debug(f"[REGIME OVERRIDE SKIPPED] {symbol} weak recent return {recent_return:.4f} — would have forced mean-reverting 0.35, but using HMM instead")
 
+    # === S2: ENSEMBLE REGIME VOTING ===
+    # The HMM-alone detector labeled every bar mean_reverting during clear trends.
+    # The ensemble gives slope/ADX/autocorr/range voters a seat at the table.
+    detector_mode = CONFIG.get('REGIME_DETECTOR_MODE', 'ensemble')
+    ensemble_result = None
+    if detector_mode == 'ensemble':
+        try:
+            # Slope & autocorr need just prices; ADX & range need OHLC
+            slope_vote = _regime_from_slope(prices, lookback=min(50, len(prices) - 1))
+            adx_vote = _regime_from_adx(full_data, lookback=min(50, len(full_data) - 1))
+            autocorr_vote = _regime_from_autocorr(prices, lookback=min(100, len(prices) - 1))
+            range_vote = _regime_from_range(full_data, lookback=min(50, len(full_data) - 1))
+            votes = [slope_vote, adx_vote, autocorr_vote, range_vote]
+            ensemble_result = _ensemble_vote(votes)
+            if verbose:
+                logger.debug(
+                    f"[REGIME ENSEMBLE] {symbol} | slope={slope_vote} | adx={adx_vote} | "
+                    f"autocorr={autocorr_vote} | range={range_vote} | → {ensemble_result}"
+                )
+        except Exception as e:
+            logger.warning(f"[REGIME ENSEMBLE] {symbol} voter failure: {e} — falling back to HMM only")
+            ensemble_result = None
+
     # Primary: HMM Ensemble — now much more robust
     if GaussianHMM is not None:
         try:
@@ -112,7 +304,7 @@ def detect_regime(
             # Configurable params
             ensemble_size = CONFIG.get('HMM_ENSEMBLE_SIZE', 4)  # reduced default — faster with higher n_init
             n_components = CONFIG.get('HMM_N_COMPONENTS', 2)
-            seeds = [42, 123, 456, 789, 1011, 2024, 314, 271][:ensemble_size]
+            seeds = [42, 123, 456, 789, 2024, 314, 271, 1337][:ensemble_size]
 
             trending_votes = 0
             votes_cast = 0  # Track actual votes (excludes skipped indistinguishable states)
@@ -180,10 +372,6 @@ def detect_regime(
                     f"persistence={avg_self_prob:.3f} | regime={regime} | "
                     f"avg_direction={np.mean(direction_votes):.6f} | last_bar={full_data.index[-1]}"
                 )
-            else:
-                logger.info(
-                    f"HMM Ensemble | {symbol} | regime={regime} | persistence={avg_self_prob:.3f} | votes={trending_votes}/{votes_cast}"
-                )
 
             persistence = float(avg_self_prob)
 
@@ -193,6 +381,31 @@ def detect_regime(
 
     else:
         regime, persistence = None, None  # GaussianHMM not available
+
+    # === S2: Merge HMM result into ensemble vote when in ensemble mode ===
+    if detector_mode == 'ensemble' and ensemble_result is not None:
+        ens_regime, ens_persistence = ensemble_result
+        if regime is not None and persistence is not None:
+            # HMM got a result — blend it in as a 5th voter (weight = persistence)
+            hmm_strength = float(np.clip(persistence, 0.5, 0.95))
+            combined_votes = [
+                _regime_from_slope(prices, lookback=min(50, len(prices) - 1)),
+                _regime_from_adx(full_data, lookback=min(50, len(full_data) - 1)),
+                _regime_from_autocorr(prices, lookback=min(100, len(prices) - 1)),
+                _regime_from_range(full_data, lookback=min(50, len(full_data) - 1)),
+                (regime, hmm_strength),
+            ]
+            regime, persistence = _ensemble_vote(combined_votes)
+            logger.info(
+                f"[REGIME ENSEMBLE+HMM] {symbol} | regime={regime} | persistence={persistence:.3f} "
+                f"| HMM voted ({combined_votes[-1][0]}, {hmm_strength:.2f})"
+            )
+        else:
+            # HMM failed — ensemble alone decides
+            regime, persistence = ens_regime, ens_persistence
+            logger.info(
+                f"[REGIME ENSEMBLE] {symbol} | regime={regime} | persistence={persistence:.3f} (HMM unavailable)"
+            )
 
     # Hurst fallback (only if HMM didn't produce a result)
     if regime is None:

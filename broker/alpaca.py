@@ -82,6 +82,34 @@ class AlpacaBroker:
             f"extended_hours={self.use_extended_hours}, fractional={self.use_fractional}"
         )
 
+    def _record_close(self, symbol: str, direction: int, entry_price: float,
+                      exit_price: float, filled_qty: float, regime: str,
+                      exit_reason: str, filled_at: str = None):
+        """Record a trade closure in the autopsy engine and clear velocity tracker.
+        Called from ALL close paths (stream fill, software SL, reattach block, frac cleanup)."""
+        if not hasattr(self, 'signal_gen') or not self.signal_gen:
+            return
+        pnl = (exit_price - entry_price) * filled_qty * direction
+        try:
+            from models.features import _fetch_macro_features
+            vix = _fetch_macro_features().get('vix_close', 20)
+        except Exception:
+            vix = 20
+        bars_held = 0
+        if filled_at:
+            try:
+                entry_time = datetime.fromisoformat(filled_at)
+                bars_held = int((datetime.now(tz=_UTC) - entry_time).total_seconds() / 900)
+            except Exception:
+                pass
+        self.signal_gen.autopsy_engine.record_autopsy(
+            symbol=symbol, direction=direction,
+            entry_price=entry_price, exit_price=exit_price,
+            pnl=pnl, bars_held=bars_held,
+            regime=regime, vix=vix, exit_reason=exit_reason,
+        )
+        self.signal_gen.profit_velocity.clear(symbol)
+
     def _get_symbol_lock(self, symbol: str) -> threading.Lock:
         """Lazily create and return a per-symbol threading.Lock to prevent TOCTOU races.
         FIX #18: Changed from asyncio.Lock to threading.Lock so stream handler (different thread)
@@ -782,22 +810,71 @@ class AlpacaBroker:
             entry_price = group.entry_price or current_price
             trailing_stop_id = group.trailing_stop_id
             old_trail = group.trail_percent or 99.0
+            # NEW — update MFE/MAE on every ratchet tick so meta-labeling and the
+            # asymmetric loss-side branch below have fresh numbers.
+            live_unrealized = (current_price - entry_price) / entry_price * direction if entry_price else 0.0
+            if live_unrealized > group.max_favorable_pct:
+                group.max_favorable_pct = float(live_unrealized)
+            if live_unrealized < group.max_adverse_pct:
+                group.max_adverse_pct = float(live_unrealized)
+            if group.original_trail_percent is None and group.trail_percent:
+                group.original_trail_percent = float(group.trail_percent)
+            mfe = group.max_favorable_pct
+            mae = group.max_adverse_pct
+            original_trail = group.original_trail_percent or old_trail
         now = datetime.now(tz=_UTC)
         last_ratchet = self.last_ratchet_time.get(symbol, _EPOCH)
         elapsed = (now - last_ratchet).total_seconds()
 
-        # Skip losing positions
-        unrealized_pct = (current_price - entry_price) / entry_price * direction if entry_price else 0.0
-        if unrealized_pct <= 0:
-            return
-
-        # Regime-adaptive throttle
+        # Regime-adaptive throttle (reused below for both profit and loss branches)
         if is_trending(regime) and persistence >= 0.7:
             min_interval = self.config.get('RATCHET_TRENDING_INTERVAL_SEC', 180)
             regime_factor = self.config.get('RATCHET_REGIME_FACTOR_TRENDING', 0.65)
         else:
             min_interval = self.config.get('RATCHET_MEAN_REVERTING_INTERVAL_SEC', 540)
             regime_factor = self.config.get('RATCHET_REGIME_FACTOR_MEAN_REVERTING', 1.35)
+
+        unrealized_pct = live_unrealized
+
+        # === S3: ASYMMETRIC LOSS-SIDE TIGHTENING ===
+        # When the position is underwater and hasn't gone meaningfully positive,
+        # tighten the trail to cut losses faster. This is the "don't let winners
+        # turn into losers" idea applied as "don't let losers become disasters".
+        # Only fires when MFE is small (i.e., trade never went green in a real way).
+        loss_tighten_enabled = self.config.get('RATCHET_LOSS_TIGHTEN_ENABLED', True)
+        loss_tighten_thresh = self.config.get('RATCHET_LOSS_TIGHTEN_THRESHOLD', -0.007)  # -0.7%
+        loss_tighten_factor = self.config.get('RATCHET_LOSS_TIGHTEN_FACTOR', 0.55)
+        mfe_disqualify = self.config.get('RATCHET_LOSS_TIGHTEN_MFE_MAX', 0.004)  # 0.4% MFE
+        if unrealized_pct <= 0:
+            if (loss_tighten_enabled
+                    and unrealized_pct <= loss_tighten_thresh
+                    and mfe <= mfe_disqualify
+                    and elapsed >= min_interval):
+                tight_trail = round(max(0.5, original_trail * loss_tighten_factor), 2)
+                if tight_trail < old_trail:
+                    logger.warning(f"[RATCHET LOSS-TIGHTEN] {symbol} unrealized "
+                                   f"{unrealized_pct*100:+.2f}% (MFE {mfe*100:+.2f}%) — "
+                                   f"tightening trail {old_trail:.2f}% → {tight_trail:.2f}%")
+                    try:
+                        with self._sets_lock:
+                            self._ratchet_pending.add(symbol)
+                        replace_req = ReplaceOrderRequest(trail=tight_trail)
+                        new_order = self.client.replace_order_by_id(trailing_stop_id, replace_req)
+                        new_order_id = str(new_order.id) if new_order and hasattr(new_order, 'id') else None
+                        if new_order_id and new_order_id != trailing_stop_id:
+                            with self.tracker._lock:
+                                fresh_group = self.tracker.groups.get(symbol)
+                                if fresh_group and fresh_group.state == GroupState.OPEN:
+                                    fresh_group.trailing_stop_id = new_order_id
+                                    fresh_group.trail_percent = tight_trail
+                                    self.tracker._save()
+                        self.last_ratchet_time[symbol] = now
+                    except Exception as e:
+                        logger.warning(f"[RATCHET LOSS-TIGHTEN] {symbol} replace failed: {e}")
+                    finally:
+                        with self._sets_lock:
+                            self._ratchet_pending.discard(symbol)
+            return
 
         if elapsed < min_interval:
             return
@@ -832,7 +909,18 @@ class AlpacaBroker:
             )
             trail_floor_pct = self.config.get('RATCHET_TIER3_FLOOR_PCT', 0.5)
 
-        distance = atr * trailing_mult * regime_factor * profit_protection
+        # === PROFIT VELOCITY ADJUSTMENT ===
+        # Dynamic trail width based on P&L momentum — tighten when momentum fades
+        velocity_mult = 1.0
+        if hasattr(self, 'signal_gen') and self.signal_gen:
+            pv = self.signal_gen.profit_velocity
+            pv.update(symbol, current_price, entry_price, direction)
+            velocity_mult = pv.get_trail_multiplier(symbol)
+            if velocity_mult != 1.0:
+                logger.info(f"[VELOCITY] {symbol}: trail mult={velocity_mult:.2f} "
+                           f"({'widening' if velocity_mult > 1 else 'tightening'})")
+
+        distance = atr * trailing_mult * regime_factor * profit_protection * velocity_mult
         new_trail_pct = round(max(trail_floor_pct, min(35.0, (distance / current_price) * 100)), 2)
 
         # Only tighten (lower trail %), never widen (old_trail read under lock above)
@@ -1040,8 +1128,19 @@ class AlpacaBroker:
                 if sl_hit:
                     logger.info(f"[SOFTWARE SL] {sym} @ {current_price:.2f} hit stop {group.stop_price:.2f} — closing")
                     try:
+                        # Cancel existing trailing stop first — it holds shares reserved
+                        # which prevents close_position from working
+                        if group.trailing_stop_id:
+                            try:
+                                await asyncio.to_thread(self.client.cancel_order_by_id, group.trailing_stop_id)
+                                logger.info(f"[SOFTWARE SL] {sym} cancelled trailing stop {group.trailing_stop_id} before close")
+                            except Exception as cancel_e:
+                                logger.debug(f"[SOFTWARE SL] {sym} trailing stop cancel failed (may already be filled): {cancel_e}")
                         await asyncio.to_thread(self.client.close_position, sym)
                         logger.info(f"[SOFTWARE SL] {sym} position closed")
+                        self._record_close(sym, group.direction, group.entry_price or current_price,
+                                          current_price, group.filled_qty, group.regime, 'software_stop',
+                                          getattr(group, 'filled_at', None))
                         self.tracker.mark_closed(sym)
                         self.tracker.remove_group(sym)
                         with self._entry_times_lock:
@@ -1086,6 +1185,18 @@ class AlpacaBroker:
         group = tracked_group  # FIX #8: use local snapshot
         if group and group.state == GroupState.OPEN and not group.trailing_stop_id and abs(qty) >= 1:
             if is_market_open():
+                # Anti-churn check: if too many recent stops, close instead of reattaching
+                if hasattr(self, 'signal_gen') and self.signal_gen and hasattr(self.signal_gen, 'memory'):
+                    churn = self.signal_gen.memory.get_churn_penalty(sym, group.direction)
+                    if churn < 0.3:
+                        logger.warning(f"[REATTACH-STOP BLOCKED] {sym}: churn {churn:.3f} — closing instead")
+                        try:
+                            await asyncio.to_thread(self.client.close_position, sym)
+                            self.tracker.mark_closed(sym)
+                            self.tracker.remove_group(sym)
+                        except Exception as e:
+                            logger.error(f"[REATTACH-STOP BLOCKED] Failed to close {sym}: {e}")
+                        return
                 logger.info(f"[REATTACH-STOP] {sym} tracked but no trailing stop — resubmitting")
                 trail_pct = group.trail_percent or self._get_trail_percent(current_price, atr, regime)
                 close_side = OrderSide.SELL if group.direction > 0 else OrderSide.BUY
@@ -1164,7 +1275,31 @@ class AlpacaBroker:
 
     async def _reattach_exits(self, symbol: str, qty: float, direction: int,
                               current_price: float, atr: float, regime: str):
-        """Re-attach trailing stop + TP for orphaned positions (no tracker group)."""
+        """Re-attach trailing stop + TP for orphaned positions (no tracker group).
+        Now checks anti-churn gate — if the signal generator's memory shows recent
+        stops in this direction, close the position instead of reattaching."""
+        # === ANTI-CHURN GATE: Check if we should even keep this position ===
+        if hasattr(self, 'signal_gen') and self.signal_gen and hasattr(self.signal_gen, 'memory'):
+            mem = self.signal_gen.memory
+            churn_penalty = mem.get_churn_penalty(symbol, direction)
+            if churn_penalty < 0.3:
+                # Too many recent stops in this direction — close instead of reattach
+                logger.warning(f"[REATTACH BLOCKED] {symbol}: churn penalty {churn_penalty:.3f} — "
+                             f"closing orphan instead of reattaching (too many recent stops)")
+                try:
+                    await asyncio.to_thread(self.client.close_position, symbol)
+                    logger.info(f"[REATTACH BLOCKED] {symbol} position closed")
+                except Exception as e:
+                    logger.error(f"[REATTACH BLOCKED] Failed to close {symbol}: {e}")
+                return
+            if mem.is_defensive():
+                logger.warning(f"[REATTACH BLOCKED] {symbol}: defensive mode active — closing orphan")
+                try:
+                    await asyncio.to_thread(self.client.close_position, symbol)
+                    logger.info(f"[REATTACH BLOCKED] {symbol} position closed (defensive)")
+                except Exception as e:
+                    logger.error(f"[REATTACH BLOCKED] Failed to close {symbol}: {e}")
+                return
         logger.info(f"[REATTACH] Creating protective orders for orphaned position {symbol}")
 
         # Cancel any stale orders holding qty before submitting new ones
@@ -1187,7 +1322,24 @@ class AlpacaBroker:
         tp_price = self._get_tp_price(current_price, atr, regime, direction)
         close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
         position_intent = PositionIntent.SELL_TO_CLOSE if direction > 0 else PositionIntent.BUY_TO_CLOSE
+        # FIX (Apr 16 gap #2): The caller's qty can be stale (tracker/sync drift — saw
+        # AMD tracker=10.4257 but Alpaca actual=0.4257, causing submit-order rejection).
+        # Always re-query actual available qty from Alpaca right before submitting the
+        # protective stop so we don't request size we don't have.
         abs_qty = abs(qty)
+        try:
+            live_pos = await asyncio.to_thread(self.client.get_open_position, symbol)
+            if live_pos and hasattr(live_pos, 'qty'):
+                live_qty = abs(float(live_pos.qty))
+                if live_qty > 0 and abs(live_qty - abs_qty) / max(abs_qty, 1e-6) > 0.05:
+                    logger.warning(f"[REATTACH] {symbol} qty-drift: tracker={abs_qty:.4f} "
+                                   f"actual={live_qty:.4f} — using actual")
+                    abs_qty = live_qty
+                elif live_qty == 0:
+                    logger.warning(f"[REATTACH] {symbol} actual position zero — skipping reattach")
+                    return
+        except Exception as e:
+            logger.debug(f"[REATTACH] {symbol} live-qty check failed: {e} — using caller qty {abs_qty}")
 
         trailing_stop_id = None
         tp_order_id = None

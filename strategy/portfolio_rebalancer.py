@@ -27,7 +27,9 @@ class PortfolioRebalancer:
         prices: Dict[str, float],
         regimes: Dict[str, Any], # ← NEW: accept regimes dict for persistence symmetry
         positions: Dict[str, int],
-        precomputed_env: PortfolioEnv = None # ISSUE #6: Accept persistent env from bot.py
+        precomputed_env: PortfolioEnv = None, # ISSUE #6: Accept persistent env from bot.py
+        daily_equity: Dict = None,  # NEW: intraday risk pacing
+        live_signal_history: Dict = None,  # NEW: consecutive-loss tracking
     ) -> Dict[str, float]:
         """
         Full rebalance pipeline for portfolio PPO mode.
@@ -64,7 +66,9 @@ class PortfolioRebalancer:
             equity=current_equity,
             symbols=symbols,
             confidences=confidences,
-            regimes=regimes # ← NEW: forward regimes dict so persistence can be averaged
+            regimes=regimes, # ← NEW: forward regimes dict so persistence can be averaged
+            daily_equity=daily_equity,  # NEW: intraday risk pacing
+            live_signal_history=live_signal_history,  # NEW: consecutive-loss tracking
         )
         # ==================== END NEW SYMMETRY ====================
         # Apply CVaR dollar risk to final weights

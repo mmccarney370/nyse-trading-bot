@@ -148,29 +148,70 @@ class TradingBot:
         # ISSUE #5 FIX: Pass CONFIG to UniverseManager (required after universe.py update)
         self.universe_manager = UniverseManager(self.data_ingestion, self.live_signal_history, CONFIG)
         self.last_universe_update = datetime.now(tz=tz.gettz('America/New_York'))
+        # S1: Meta-labeling filter (refit nightly from live_signal_history)
+        from strategy.meta_filter import MetaLabeler
+        self.meta_labeler = MetaLabeler(symbols=config['SYMBOLS'])
+        # Share with signal_gen so generate_portfolio_actions can consult it
+        self.signal_gen.meta_labeler = self.meta_labeler
+        # B5: Anti-earnings filter — auto-flat before earnings, block new entries
+        from strategy.earnings_filter import EarningsCalendar
+        self.earnings_calendar = EarningsCalendar(symbols=config['SYMBOLS'])
+        self.signal_gen.earnings_calendar = self.earnings_calendar
+        # B2: Adverse selection detector — track post-fill drift, flag toxic fills
+        from strategy.adverse_selection import AdverseSelectionDetector
+        self.adverse_selection = AdverseSelectionDetector()
+        self.signal_gen.adverse_selection = self.adverse_selection
+        self.broker.adverse_selection = self.adverse_selection  # broker will record fills
+        # BPS: Bayesian per-symbol sizing (size by posterior P(win))
+        from strategy.bayesian_sizing import BayesianSymbolSizer
+        self.bayesian_sizer = BayesianSymbolSizer(symbols=config['SYMBOLS'])
+        self.signal_gen.bayesian_sizer = self.bayesian_sizer
+        # ESP: Execution slippage predictor (skip entries with predicted > alpha)
+        from strategy.slippage_predictor import SlippagePredictor
+        self.slippage_predictor = SlippagePredictor()
+        self.signal_gen.slippage_predictor = self.slippage_predictor
+        self.broker.slippage_predictor = self.slippage_predictor  # broker records on fill
     def _load_regime_cache(self):
+        # FIX (Apr 16 gap #3): Regime detection code now uses S2 ensemble (slope +
+        # ADX + autocorr + range + HMM). Old cache entries were produced by the
+        # legacy HMM-only heuristic. Version-bump the cache so stale entries are
+        # discarded — first call to _get_all_regimes will repopulate via the new
+        # detect_regime which exercises the S2 voters.
+        EXPECTED_VERSION = 2
+        # Also honor a config flag to force refresh (useful for development)
+        if CONFIG.get('REGIME_FORCE_REFRESH_ON_STARTUP', False):
+            logger.info("[REGIME CACHE] REGIME_FORCE_REFRESH_ON_STARTUP=True — starting fresh")
+            return {}
         if os.path.exists(REGIME_CACHE_FILE):
             try:
                 with open(REGIME_CACHE_FILE, 'r') as f:
                     data = json.load(f)
+                # Version check: if missing/mismatched, discard (triggers S2 recompute)
+                file_version = data.pop('__version__', 1)
+                if file_version != EXPECTED_VERSION:
+                    logger.info(f"[REGIME CACHE] Version {file_version} != expected {EXPECTED_VERSION} — "
+                                f"discarding {len(data)} stale entries, will re-detect via S2 ensemble")
+                    return {}
                 # Validate types: ensure persistence values are float (JSON may deserialize as int)
                 for key, value in data.items():
                     if isinstance(value, (list, tuple)) and len(value) == 2:
                         data[key] = (value[0], float(value[1]))
                     elif isinstance(value, str):
                         data[key] = (value, 0.5)
-                logger.info(f"Loaded persistent regime cache with {len(data)} symbols")
+                logger.info(f"Loaded persistent regime cache with {len(data)} symbols (v{EXPECTED_VERSION})")
                 return data
             except Exception as e:
                 logger.warning(f"Failed to load regime cache: {e}")
         return {}
     def _save_regime_cache(self):
-        """Atomic save for regime cache (Priority 1 fix)"""
+        """Atomic save for regime cache (Priority 1 fix).
+        Embeds __version__=2 so startup can discard stale pre-S2 entries."""
         try:
             path = REGIME_CACHE_FILE
             dir_name = os.path.dirname(path) or '.'
+            snapshot = {'__version__': 2, **self.regime_cache}
             with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_name) as tmp:
-                json.dump(self.regime_cache, tmp, default=lambda x: float(x) if isinstance(x, (np.integer, np.floating)) else (x.tolist() if isinstance(x, np.ndarray) else str(x)))
+                json.dump(snapshot, tmp, default=lambda x: float(x) if isinstance(x, (np.integer, np.floating)) else (x.tolist() if isinstance(x, np.ndarray) else str(x)))
                 tmp.flush()
                 os.fsync(tmp.fileno())
             shutil.move(tmp.name, path)
@@ -394,6 +435,35 @@ class TradingBot:
                 continue
             regimes = await asyncio.to_thread(self._get_all_regimes)
             positions = await asyncio.to_thread(self.broker.get_positions_dict)
+            # === B2: Update adverse-selection post-fill drift samples ===
+            if (CONFIG.get('ADVERSE_SELECTION_ENABLED', True)
+                    and hasattr(self, 'adverse_selection') and self.latest_prices):
+                try:
+                    await asyncio.to_thread(self.adverse_selection.update_prices,
+                                              dict(self.latest_prices))
+                except Exception as e:
+                    logger.debug(f"[ADVERSE-SEL] update_prices failed: {e}")
+            # === B5: Pre-earnings auto-close ===
+            # If we're holding a position and earnings is within N days, flatten.
+            # Runs BEFORE signal generation so the closed slot can be reused.
+            if (CONFIG.get('EARNINGS_FILTER_ENABLED', True)
+                    and hasattr(self, 'earnings_calendar')
+                    and positions):
+                close_pre = CONFIG.get('EARNINGS_CLOSE_PRE_DAYS', 1)
+                for sym, qty in list(positions.items()):
+                    if qty == 0:
+                        continue
+                    should_close, reason = self.earnings_calendar.should_close_before_earnings(
+                        sym, close_pre_days=close_pre
+                    )
+                    if should_close:
+                        logger.warning(f"[EARNINGS AUTO-CLOSE] {sym} — {reason} — flattening position")
+                        try:
+                            await asyncio.to_thread(self.broker.close_position_safely, sym)
+                        except Exception as e:
+                            logger.error(f"[EARNINGS AUTO-CLOSE] {sym} close failed: {e}")
+                # Re-read positions after any closures
+                positions = await asyncio.to_thread(self.broker.get_positions_dict)
             if self.portfolio_ppo and self.trainer.portfolio_ppo_model is not None:
                 logger.debug("Generating portfolio-level actions via multi-asset PPO")
                 try:
@@ -426,13 +496,16 @@ class TradingBot:
                         else:
                             logger.debug("[C-3] Portfolio causal graph deferred — neutral penalty until built")
                     # ISSUE #6 PATCH: Pass persistent self.portfolio_env to rebalance_portfolio
+                    # NEW: also pass daily_equity + live_signal_history for intraday risk pacing
                     target_weights_dict = await self.rebalancer.rebalance_portfolio(
                         current_equity=current_equity,
                         data_dict=data_dict,
                         prices=prices,
                         regimes=regimes,
                         positions=positions,
-                        precomputed_env=self.portfolio_env # Persistent env (ISSUE #6)
+                        precomputed_env=self.portfolio_env, # Persistent env (ISSUE #6)
+                        daily_equity=self.daily_equity,
+                        live_signal_history=self.live_signal_history,
                     )
                     # ====================== END REBALANCER DELEGATION ======================
                     # Only the final order execution loop remains here (min-hold, close, bracket)
@@ -735,6 +808,27 @@ class TradingBot:
                 max_leverage=self.config.get('MAX_LEVERAGE', 2.0)
             )
             logger.info(f"Persistent PortfolioEnv created with {len(self.portfolio_env.timeline)} steps")
+            # CAUSAL BOOTSTRAP: seed the portfolio replay buffer by replaying recent
+            # historical bars through the env with PPO-predicted actions. Without this,
+            # the portfolio causal graph stays in fallback until ≥100 live trades
+            # accumulate organically (can take weeks at current trade cadence).
+            if (CONFIG.get('USE_CAUSAL_RL', False)
+                    and self.signal_gen.portfolio_causal_manager is not None):
+                pcm = self.signal_gen.portfolio_causal_manager
+                bootstrap_n = CONFIG.get('CAUSAL_BOOTSTRAP_STEPS', 1500)
+                noise_sigma = CONFIG.get('CAUSAL_BOOTSTRAP_NOISE_SIGMA', 0.4)
+                if bootstrap_n > 0:
+                    vec_norm = getattr(self.trainer, 'portfolio_vec_norm', None)
+                    added = await asyncio.to_thread(
+                        pcm.bootstrap_from_env,
+                        self.portfolio_env,
+                        self.trainer.portfolio_ppo_model,
+                        bootstrap_n,
+                        vec_norm,
+                        noise_sigma,
+                    )
+                    if added > 0:
+                        pcm.save_buffer()
         # C-3 SAFETY: After full startup (including warmup_causal_buffers), ensure causal graphs are ready
         if CONFIG.get('USE_CAUSAL_RL', False):
             for sym, mgr in self.signal_gen.causal_manager.items():
@@ -889,6 +983,11 @@ class TradingBot:
                 else:
                     cache_misses.append(sym)
         # Phase 2: Fetch data outside lock (no I/O under lock)
+        # FIX (Apr 16 gap #3): Previously used an inline heuristic that bypassed
+        # S2's regime ensemble entirely. Now delegate to detect_regime so the
+        # slope/ADX/autocorr/range + HMM ensemble voters actually exercise.
+        # Falls back to the simple heuristic on any error to avoid blocking trades.
+        from strategy.regime import detect_regime as _detect_regime_full
         new_prices = {}
         for sym in cache_misses:
             data = self.data_ingestion.get_latest_data(sym, timeframe='15Min')
@@ -898,24 +997,28 @@ class TradingBot:
                 regime = 'mean_reverting'
                 persistence = 0.5
             else:
-                recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
-                # Compute rolling volatility ratio to distinguish trending from mean-reverting
-                # High ratio of directional move to volatility → trending
-                returns = data['close'].pct_change().dropna().iloc[-20:]
-                rolling_vol = returns.std() if len(returns) > 1 else 0.01
-                threshold = 0.015
-                directional_strength = abs(recent_return) / max(rolling_vol * np.sqrt(20), 1e-6)
-                if directional_strength > 1.5:
-                    regime = 'trending_up' if recent_return >= 0 else 'trending_down'
-                elif directional_strength < 0.5:
-                    regime = 'mean_reverting'
-                else:
-                    if abs(recent_return) > threshold:
+                try:
+                    regime, persistence = _detect_regime_full(
+                        data=data,
+                        symbol=sym,
+                        data_ingestion=self.data_ingestion,
+                        lookback=self.config.get('LOOKBACK', 900),
+                        is_backtest=False,
+                        verbose=False,
+                    )
+                except Exception as e:
+                    logger.debug(f"[_get_all_regimes] {sym} detect_regime failed ({e}) — heuristic fallback")
+                    recent_return = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20]
+                    returns = data['close'].pct_change().dropna().iloc[-20:]
+                    rolling_vol = returns.std() if len(returns) > 1 else 0.01
+                    directional_strength = abs(recent_return) / max(rolling_vol * np.sqrt(20), 1e-6)
+                    if directional_strength > 1.5:
                         regime = 'trending_up' if recent_return >= 0 else 'trending_down'
-                    else:
+                    elif directional_strength < 0.5:
                         regime = 'mean_reverting'
-                # Scale persistence by signal strength (clamped 0.3–0.8)
-                persistence = float(np.clip(0.3 + 0.5 * min(directional_strength / 2.0, 1.0), 0.3, 0.8))
+                    else:
+                        regime = 'trending_up' if recent_return >= 0.015 else ('trending_down' if recent_return <= -0.015 else 'mean_reverting')
+                    persistence = float(np.clip(0.3 + 0.5 * min(directional_strength / 2.0, 1.0), 0.3, 0.8))
             regimes[sym] = (regime, persistence)
         # Phase 3: Update cache (lock held briefly)
         if cache_misses:
@@ -1185,6 +1288,27 @@ class TradingBot:
                             self.causal_manager.sync_daily_rewards()
                     except Exception as e:
                         logger.error(f"Causal graph refresh failed: {e}", exc_info=True)
+                # B5: Earnings calendar refresh (daily at 3:30 AM, internal TTL=weekly)
+                if CONFIG.get('EARNINGS_FILTER_ENABLED', True) and hasattr(self, 'earnings_calendar'):
+                    try:
+                        await asyncio.to_thread(
+                            self.earnings_calendar.refresh, self.config['SYMBOLS']
+                        )
+                    except Exception as e:
+                        logger.warning(f"[EARNINGS] Daily refresh failed: {e}")
+                # S1: Meta-labeler refresh (daily at 3:30 AM alongside Gemini/causal)
+                if CONFIG.get('META_FILTER_ENABLED', True):
+                    try:
+                        logger.info("Refitting meta-label filter from live_signal_history...")
+                        stats = await asyncio.to_thread(
+                            self.meta_labeler.fit_from_history,
+                            self.live_signal_history,
+                            CONFIG.get('META_FILTER_MIN_TRAIN', 30),
+                            float(self.broker.get_equity() or 30000.0),
+                        )
+                        logger.info(f"[META-FILTER] Daily refit result: {stats}")
+                    except Exception as e:
+                        logger.error(f"Meta-filter refit failed: {e}", exc_info=True)
             except asyncio.CancelledError:
                 break
             except Exception as e:

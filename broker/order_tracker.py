@@ -46,6 +46,10 @@ class OrderGroup:
     slippage: Optional[float] = None       # Entry slippage measured on fill
     extended_hours: bool = False
     exit_initiated_at: Optional[str] = None  # When exit was submitted (PENDING_EXIT timestamp)
+    # NEW — MFE/MAE tracking for asymmetric ratcheting and meta-labeling
+    max_favorable_pct: float = 0.0  # peak unrealized P&L as % of entry (direction-signed)
+    max_adverse_pct: float = 0.0    # deepest underwater as % of entry (direction-signed, negative)
+    original_trail_percent: Optional[float] = None  # preserved initial trail for loss-tighten logic
 
     def __post_init__(self):
         if self.created_at is None:

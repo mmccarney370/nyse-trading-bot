@@ -48,12 +48,13 @@ os.makedirs(TFT_CACHE_DIR, exist_ok=True)
 MAX_TFT_CACHE_ROWS = 2000 # Keep only ~30 days of 15min bars in memory/disk
 CACHE_MAX_AGE_DAYS = 1 # FIX #36: Reduced from 7 to 1 day — stale TFT features degrade signal quality
 # ──────────────────────────────────────────────────────────────────
-# Simple daily cache for macro data
+# Hourly cache for macro data (was daily — intraday VIX/SPX shifts were
+# invisible to the feature pipeline until next day's fetch)
 # HIGH-25 FIX: Add threading lock to protect from concurrent access during parallel training
 import threading
 _macro_cache_lock = threading.Lock()
 _macro_cache = {
-    'date': None,
+    'cache_key': None,  # (date, hour) tuple — refreshes hourly
     'vix_close': 20.0,
     'vix_rsi': 50.0,
     'tnx_yield': 0.04,
@@ -62,16 +63,17 @@ _macro_cache = {
     'spx_mom': 0.0
 }
 def _fetch_macro_features() -> dict:
-    """Fetch VIX and 10Y yield once per day with safe fallbacks.
+    """Fetch VIX and 10Y yield hourly with safe fallbacks.
 
-    NOTE: yfinance HTTP calls are blocking but only happen once per day on cache miss
-    (guarded by _macro_cache with date check). Subsequent calls within the same day
-    return immediately from cache. The per-call try/except blocks ensure individual
-    ticker failures don't block the rest.
+    Changed from daily to hourly caching so intraday macro moves (VIX spikes, SPX
+    breaks of the 200-SMA) actually reach the feature matrix and the portfolio
+    gates. yfinance calls here are blocking but only hit once per hour per worker.
+    Per-call try/except blocks ensure individual ticker failures don't propagate.
     """
-    today = datetime.now(tz=tz.gettz('UTC')).date()
+    now = datetime.now(tz=tz.gettz('UTC'))
+    cache_key = (now.date(), now.hour)
     with _macro_cache_lock:
-        if _macro_cache['date'] == today:
+        if _macro_cache['cache_key'] == cache_key:
             return _macro_cache.copy()
     try:
         vix_ticker = yf.Ticker('^VIX')
@@ -121,7 +123,7 @@ def _fetch_macro_features() -> dict:
         spx_mom = 0.0
     with _macro_cache_lock:
         _macro_cache.update({
-            'date': today,
+            'cache_key': cache_key,
             'vix_close': vix_close,
             'vix_rsi': vix_rsi,
             'tnx_yield': tnx_yield,

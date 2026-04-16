@@ -305,6 +305,64 @@ GROUP 7: Regime Detection
   VIX_THRESHOLD                [22 – 35]     current: {current_config.get('VIX_THRESHOLD')}
   BREAKOUT_BOOST_FACTOR        [1.0 – 1.5]   current: {current_config.get('BREAKOUT_BOOST_FACTOR')}
 
+GROUP 8: Intraday Risk Pacing (S4) — throttle as today's losses accumulate
+  RISK_PACING_TIER1_LOSS       [-0.010 – -0.002]  current: {current_config.get('RISK_PACING_TIER1_LOSS')}
+  RISK_PACING_TIER1_SCALE      [0.3 – 0.8]        current: {current_config.get('RISK_PACING_TIER1_SCALE')}
+  RISK_PACING_TIER2_LOSS       [-0.030 – -0.010]  current: {current_config.get('RISK_PACING_TIER2_LOSS')}
+  RISK_PACING_TIER2_SCALE      [0.1 – 0.4]        current: {current_config.get('RISK_PACING_TIER2_SCALE')}
+  RISK_PACING_CONSECUTIVE_LOSSES       [2 – 5]    current: {current_config.get('RISK_PACING_CONSECUTIVE_LOSSES')}
+  RISK_PACING_CONSECUTIVE_LOSS_SCALE   [0.15 – 0.6] current: {current_config.get('RISK_PACING_CONSECUTIVE_LOSS_SCALE')}
+
+GROUP 9: Asymmetric Trailing & Loss Tightening (S3) — cut losers, let winners breathe
+  RATCHET_LOSS_TIGHTEN_THRESHOLD   [-0.015 – -0.003]  current: {current_config.get('RATCHET_LOSS_TIGHTEN_THRESHOLD')}
+  RATCHET_LOSS_TIGHTEN_FACTOR      [0.35 – 0.85]      current: {current_config.get('RATCHET_LOSS_TIGHTEN_FACTOR')}
+  RATCHET_LOSS_TIGHTEN_MFE_MAX     [0.001 – 0.010]    current: {current_config.get('RATCHET_LOSS_TIGHTEN_MFE_MAX')}
+
+GROUP 10: Meta-Label Filter (S1) — reject low-probability trades before entry
+  META_FILTER_MIN_PROB   [0.30 – 0.55]  current: {current_config.get('META_FILTER_MIN_PROB')}
+
+GROUP 11: Cross-Sectional Momentum Gate (A1) — tilt toward today's leaders
+  CROSS_SECTIONAL_WEIGHT     [0.5 – 1.2]  current: {current_config.get('CROSS_SECTIONAL_WEIGHT')}
+  CROSS_SECTIONAL_MAX_MULT   [1.10 – 1.50]  current: {current_config.get('CROSS_SECTIONAL_MAX_MULT')}
+  CROSS_SECTIONAL_MIN_MULT   [0.30 – 0.70]  current: {current_config.get('CROSS_SECTIONAL_MIN_MULT')}
+  CROSS_SECTIONAL_NEUTRAL_BAND [0.10 – 0.50]  current: {current_config.get('CROSS_SECTIONAL_NEUTRAL_BAND')}
+
+GROUP 12: Anti-Earnings Filter (B5) — blackout around earnings events
+  EARNINGS_BLACKOUT_PRE_DAYS   [1 – 4]  current: {current_config.get('EARNINGS_BLACKOUT_PRE_DAYS')}
+  EARNINGS_BLACKOUT_POST_DAYS  [0 – 3]  current: {current_config.get('EARNINGS_BLACKOUT_POST_DAYS')}
+  EARNINGS_CLOSE_PRE_DAYS      [0 – 3]  current: {current_config.get('EARNINGS_CLOSE_PRE_DAYS')}
+
+GROUP 13: Sentiment Velocity (B4) — Δsentiment as additional multiplier
+  SENTIMENT_VELOCITY_WEIGHT          [0.0 – 0.35]  current: {current_config.get('SENTIMENT_VELOCITY_WEIGHT')}
+  SENTIMENT_VELOCITY_LOOKBACK_HOURS  [2 – 8]       current: {current_config.get('SENTIMENT_VELOCITY_LOOKBACK_HOURS')}
+
+GROUP 14: Correlation-Aware Sizing (AC) — discount crowded directional bets
+  CROWDING_DISCOUNT_THRESHOLD  [0.35 – 0.75]  current: {current_config.get('CROWDING_DISCOUNT_THRESHOLD')}
+  CROWDING_DISCOUNT_STRENGTH   [0.2 – 1.0]    current: {current_config.get('CROWDING_DISCOUNT_STRENGTH')}
+  CROWDING_DISCOUNT_MIN_FACTOR [0.25 – 0.70]  current: {current_config.get('CROWDING_DISCOUNT_MIN_FACTOR')}
+
+GROUP 15: Portfolio Meta-Blend (stacking ensemble overlay)
+  PORTFOLIO_META_WEIGHT  [0.0 – 0.40]  current: {current_config.get('PORTFOLIO_META_WEIGHT')}
+
+GROUP 16: Adverse-Selection Detector (B2) — penalize symbols with toxic fills
+  ADVERSE_SELECTION_THRESHOLD   [-0.005 – -0.0005]  current: {current_config.get('ADVERSE_SELECTION_THRESHOLD')}
+  ADVERSE_SELECTION_MAX_PENALTY [0.2 – 0.7]          current: {current_config.get('ADVERSE_SELECTION_MAX_PENALTY')}
+
+GROUP 17: Bayesian Per-Symbol Sizing (BPS) — size by posterior P(win)
+  BAYESIAN_SIZING_MIN_MULT       [0.2 – 0.7]    current: {current_config.get('BAYESIAN_SIZING_MIN_MULT')}
+  BAYESIAN_SIZING_MAX_MULT       [1.2 – 2.0]    current: {current_config.get('BAYESIAN_SIZING_MAX_MULT')}
+  BAYESIAN_SIZING_REFERENCE_EV   [0.001 – 0.006] current: {current_config.get('BAYESIAN_SIZING_REFERENCE_EV')}
+  BAYESIAN_SIZING_SHRINKAGE_N    [4 – 20]       current: {current_config.get('BAYESIAN_SIZING_SHRINKAGE_N')}
+
+GROUP 18: Slippage Veto (ESP) — skip entries where predicted slip > alpha
+  SLIPPAGE_VETO_MULTIPLE  [0.8 – 2.0]   current: {current_config.get('SLIPPAGE_VETO_MULTIPLE')}
+  SLIPPAGE_VETO_SCALE     [0.1 – 0.6]   current: {current_config.get('SLIPPAGE_VETO_SCALE')}
+
+GROUP 19: PPO-Stacking Divergence (PSD) — dampen when models strongly disagree
+  DIVERGENCE_GATE_SCALE   [0.2 – 0.8]   current: {current_config.get('DIVERGENCE_GATE_SCALE')}
+  DIVERGENCE_MIN_WEIGHT   [0.01 – 0.08] current: {current_config.get('DIVERGENCE_MIN_WEIGHT')}
+  DIVERGENCE_MIN_META     [0.10 – 0.40] current: {current_config.get('DIVERGENCE_MIN_META')}
+
 === CONSTRAINTS ===
 1. HEALTHY systems get NO changes or at most 2 minor tweaks. Do NOT fix what is working.
 2. Maximum 6 parameter changes per cycle. Focused, high-conviction changes only.
@@ -330,7 +388,7 @@ GROUP 7: Regime Detection
         # M11 FIX: Add timeout to prevent indefinite blocking if Gemini API hangs
         response = client.models.generate_content(
             model="gemini-2.5-flash", contents=prompt,
-            config={"timeout": 120}
+            config={"httpOptions": {"timeout": 120_000}}  # timeout in milliseconds
         )
         content = response.text.strip()
         # FIX: Use regex for robust fence stripping (was fragile with trailing whitespace)
@@ -416,6 +474,28 @@ GROUP 7: Regime Detection
                                  'CAUSAL_REWARD_FACTOR'}
                 ppo_params = {'PPO_LEARNING_RATE', 'PPO_ENTROPY_COEFF', 'PPO_GAMMA', 'PPO_GAE_LAMBDA',
                               'PPO_CLIP_RANGE', 'VF_COEF', 'PPO_AUX_LOSS_WEIGHT'}
+                # NEW — newer safeguard params; treat as mid-risk (25% step)
+                new_safeguard_params = {
+                    'RISK_PACING_TIER1_LOSS', 'RISK_PACING_TIER1_SCALE',
+                    'RISK_PACING_TIER2_LOSS', 'RISK_PACING_TIER2_SCALE',
+                    'RISK_PACING_CONSECUTIVE_LOSSES', 'RISK_PACING_CONSECUTIVE_LOSS_SCALE',
+                    'RATCHET_LOSS_TIGHTEN_THRESHOLD', 'RATCHET_LOSS_TIGHTEN_FACTOR',
+                    'RATCHET_LOSS_TIGHTEN_MFE_MAX',
+                    'META_FILTER_MIN_PROB',
+                    'CROSS_SECTIONAL_WEIGHT', 'CROSS_SECTIONAL_MAX_MULT',
+                    'CROSS_SECTIONAL_MIN_MULT', 'CROSS_SECTIONAL_NEUTRAL_BAND',
+                    'EARNINGS_BLACKOUT_PRE_DAYS', 'EARNINGS_BLACKOUT_POST_DAYS',
+                    'EARNINGS_CLOSE_PRE_DAYS',
+                    'SENTIMENT_VELOCITY_WEIGHT', 'SENTIMENT_VELOCITY_LOOKBACK_HOURS',
+                    'CROWDING_DISCOUNT_THRESHOLD', 'CROWDING_DISCOUNT_STRENGTH',
+                    'CROWDING_DISCOUNT_MIN_FACTOR',
+                    'PORTFOLIO_META_WEIGHT',
+                    'ADVERSE_SELECTION_THRESHOLD', 'ADVERSE_SELECTION_MAX_PENALTY',
+                    'BAYESIAN_SIZING_MIN_MULT', 'BAYESIAN_SIZING_MAX_MULT',
+                    'BAYESIAN_SIZING_REFERENCE_EV', 'BAYESIAN_SIZING_SHRINKAGE_N',
+                    'SLIPPAGE_VETO_MULTIPLE', 'SLIPPAGE_VETO_SCALE',
+                    'DIVERGENCE_GATE_SCALE', 'DIVERGENCE_MIN_WEIGHT', 'DIVERGENCE_MIN_META',
+                }
                 if key in risk_params:
                     pct_bound = 0.20
                 elif key in hold_params:
@@ -426,6 +506,8 @@ GROUP 7: Regime Detection
                     pct_bound = 0.25
                 elif key in ppo_params:
                     pct_bound = 0.15  # RL params are sensitive
+                elif key in new_safeguard_params:
+                    pct_bound = 0.25  # graduated tuning on new safeguards
                 else:
                     pct_bound = 0.15
                 # FIX: Handle zero and negative values safely
@@ -490,6 +572,52 @@ GROUP 7: Regime Detection
                     'HURST_TREND_THRESHOLD': (0.35, 0.55),
                     'VIX_THRESHOLD': (22, 35),
                     'BREAKOUT_BOOST_FACTOR': (1.0, 1.5),
+                    # NEW — S4 Intraday risk pacing
+                    'RISK_PACING_TIER1_LOSS': (-0.010, -0.002),
+                    'RISK_PACING_TIER1_SCALE': (0.3, 0.8),
+                    'RISK_PACING_TIER2_LOSS': (-0.030, -0.010),
+                    'RISK_PACING_TIER2_SCALE': (0.1, 0.4),
+                    'RISK_PACING_CONSECUTIVE_LOSSES': (2, 5),
+                    'RISK_PACING_CONSECUTIVE_LOSS_SCALE': (0.15, 0.6),
+                    # NEW — S3 Asymmetric trailing
+                    'RATCHET_LOSS_TIGHTEN_THRESHOLD': (-0.015, -0.003),
+                    'RATCHET_LOSS_TIGHTEN_FACTOR': (0.35, 0.85),
+                    'RATCHET_LOSS_TIGHTEN_MFE_MAX': (0.001, 0.010),
+                    # NEW — S1 Meta-filter
+                    'META_FILTER_MIN_PROB': (0.30, 0.55),
+                    # NEW — A1 Cross-sectional momentum
+                    'CROSS_SECTIONAL_WEIGHT': (0.5, 1.2),
+                    'CROSS_SECTIONAL_MAX_MULT': (1.10, 1.50),
+                    'CROSS_SECTIONAL_MIN_MULT': (0.30, 0.70),
+                    'CROSS_SECTIONAL_NEUTRAL_BAND': (0.10, 0.50),
+                    # NEW — B5 Anti-earnings
+                    'EARNINGS_BLACKOUT_PRE_DAYS': (1, 4),
+                    'EARNINGS_BLACKOUT_POST_DAYS': (0, 3),
+                    'EARNINGS_CLOSE_PRE_DAYS': (0, 3),
+                    # NEW — B4 Sentiment velocity
+                    'SENTIMENT_VELOCITY_WEIGHT': (0.0, 0.35),
+                    'SENTIMENT_VELOCITY_LOOKBACK_HOURS': (2, 8),
+                    # NEW — AC Crowding discount
+                    'CROWDING_DISCOUNT_THRESHOLD': (0.35, 0.75),
+                    'CROWDING_DISCOUNT_STRENGTH': (0.2, 1.0),
+                    'CROWDING_DISCOUNT_MIN_FACTOR': (0.25, 0.70),
+                    # NEW — Portfolio meta-blend
+                    'PORTFOLIO_META_WEIGHT': (0.0, 0.40),
+                    # NEW — B2 Adverse selection
+                    'ADVERSE_SELECTION_THRESHOLD': (-0.005, -0.0005),
+                    'ADVERSE_SELECTION_MAX_PENALTY': (0.2, 0.7),
+                    # NEW — BPS Bayesian sizing
+                    'BAYESIAN_SIZING_MIN_MULT': (0.2, 0.7),
+                    'BAYESIAN_SIZING_MAX_MULT': (1.2, 2.0),
+                    'BAYESIAN_SIZING_REFERENCE_EV': (0.001, 0.006),
+                    'BAYESIAN_SIZING_SHRINKAGE_N': (4, 20),
+                    # NEW — ESP Slippage veto
+                    'SLIPPAGE_VETO_MULTIPLE': (0.8, 2.0),
+                    'SLIPPAGE_VETO_SCALE': (0.1, 0.6),
+                    # NEW — PSD Divergence gate
+                    'DIVERGENCE_GATE_SCALE': (0.2, 0.8),
+                    'DIVERGENCE_MIN_WEIGHT': (0.01, 0.08),
+                    'DIVERGENCE_MIN_META': (0.10, 0.40),
                 }
                 if key in ABSOLUTE_BOUNDS:
                     abs_min, abs_max = ABSOLUTE_BOUNDS[key]

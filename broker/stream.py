@@ -118,7 +118,6 @@ class TradeStreamHandler:
         # Guard against double-call: if already processed (e.g. partial_fill→_handle_fill + real fill),
         # skip exit processing to prevent double reward push / double close
         if order_id in (group.trailing_stop_id, group.take_profit_id):
-            from broker.order_tracker import GroupState
             if group.state in (GroupState.PENDING_EXIT, GroupState.CLOSED):
                 logger.info(f"[STREAM] Fill for {symbol} order {order_id} skipped — group already {group.state.value}")
                 return
@@ -128,7 +127,6 @@ class TradeStreamHandler:
             # HIGH-14 FIX: Guard against duplicate processing — partial_fill completing
             # plus real fill event can both reach here. Only process if group is still
             # in PENDING_ENTRY state (mark_entry_filled transitions to OPEN).
-            from broker.order_tracker import GroupState
             if group.state != GroupState.PENDING_ENTRY:
                 logger.info(f"[STREAM] Entry fill for {symbol} skipped — group already {group.state.value} (duplicate event)")
                 return
@@ -138,6 +136,32 @@ class TradeStreamHandler:
             # Measure slippage
             if group.entry_price:  # limit_price stored temporarily
                 group.slippage = abs(fill_price - group.entry_price) / group.entry_price
+
+            # B2: Adverse-selection — record this fill for post-fill drift tracking
+            if hasattr(self.broker, 'adverse_selection') and self.broker.adverse_selection:
+                try:
+                    self.broker.adverse_selection.record_fill(
+                        symbol=symbol,
+                        side=int(group.direction),
+                        fill_price=float(fill_price),
+                    )
+                except Exception as e:
+                    logger.debug(f"[ADVERSE-SEL] record_fill failed for {symbol}: {e}")
+            # ESP: record realized slippage for future prediction
+            if (hasattr(self.broker, 'slippage_predictor') and self.broker.slippage_predictor
+                    and group.slippage is not None):
+                try:
+                    from datetime import datetime
+                    size_usd = float(fill_price) * float(filled_qty)
+                    self.broker.slippage_predictor.record(
+                        symbol=symbol,
+                        slip_bps=float(group.slippage) * 10000.0,
+                        hour=datetime.now().hour,
+                        size_usd=size_usd,
+                        direction=int(group.direction),
+                    )
+                except Exception as e:
+                    logger.debug(f"[SLIPPAGE] record failed for {symbol}: {e}")
 
             await self.broker.submit_exit_orders(symbol, group, fill_price, filled_qty)
 
@@ -167,10 +191,20 @@ class TradeStreamHandler:
 
                 # Feed adaptive memory: record stop-out or TP hit
                 is_stop = (order_id == group.trailing_stop_id)
+                direction = group.direction if hasattr(group, 'direction') else 1
                 pnl = (fill_price - group.entry_price) * group.filled_qty
-                if group.side == 'sell':  # short position
+                if direction == -1:  # short position: profit when price drops
                     pnl = -pnl
-                direction = 1 if group.side == 'buy' else -1
+                # BPS: update Bayesian posterior with realized return
+                if hasattr(self.broker, 'signal_gen') and self.broker.signal_gen \
+                        and hasattr(self.broker.signal_gen, 'bayesian_sizer') \
+                        and self.broker.signal_gen.bayesian_sizer \
+                        and group.entry_price:
+                    try:
+                        realized_return = pnl / (abs(group.entry_price) * abs(group.filled_qty) + 1e-9)
+                        self.broker.signal_gen.bayesian_sizer.update(symbol, float(realized_return))
+                    except Exception as e:
+                        logger.debug(f"[BAYESIAN-SIZE] update failed for {symbol}: {e}")
                 if hasattr(self.broker, 'signal_gen') and self.broker.signal_gen:
                     mem = self.broker.signal_gen.memory
                     if is_stop:
@@ -181,6 +215,14 @@ class TradeStreamHandler:
                         ppo_prob=getattr(group, '_ppo_prob', 0.5),
                         sentiment=getattr(group, '_sentiment', 0.0),
                     )
+                # Record autopsy + clear velocity via unified helper
+                exit_reason = 'stop' if is_stop else 'take_profit'
+                self.broker._record_close(
+                    symbol, direction, group.entry_price or fill_price,
+                    fill_price, group.filled_qty,
+                    getattr(group, 'regime', 'mean_reverting'),
+                    exit_reason, getattr(group, 'filled_at', None)
+                )
 
                 # HIGH-13 FIX: Perform all close operations under single lock acquisition
                 # to prevent monitor seeing intermediate states.
@@ -270,7 +312,6 @@ class TradeStreamHandler:
                     f"[STREAM] Entry order {event} for {symbol} with partial fill "
                     f"qty={partial_qty} @ {fill_price:.2f} — transitioning to OPEN for monitor reattach"
                 )
-                from broker.order_tracker import GroupState
                 with tracker._lock:
                     group.state = GroupState.OPEN
                     group.filled_qty = partial_qty

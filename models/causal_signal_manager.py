@@ -285,6 +285,22 @@ class CausalSignalManager:
             # Clean data
             data = data.select_dtypes(include=[np.number]).dropna(axis=1, how='all').fillna(0.0)
             logger.info(f"[CAUSAL DEBUG] After cleaning: {data.shape[0]} rows × {data.shape[1]} columns")
+            # === COLUMN CAP for GES tractability ===
+            # GES complexity is roughly O(p^3·n) — portfolio observations are 460-dim so
+            # a raw buffer sample has 462 columns, which makes GES run for hours.
+            # Keep action/reward always; pick the top-K remaining features by variance.
+            max_cols = CONFIG.get('CAUSAL_MAX_FEATURES', 58)
+            if data.shape[1] > max_cols:
+                orig_cols = data.shape[1]
+                feat_cols = [c for c in data.columns if c not in ('action', 'reward')]
+                variances = data[feat_cols].var().sort_values(ascending=False)
+                # Skip constant/near-constant columns (no info for GES)
+                informative = variances[variances > 1e-10]
+                keep_features = informative.head(max_cols - 2).index.tolist()
+                required = [c for c in ('action', 'reward') if c in data.columns]
+                data = data[keep_features + required]
+                logger.info(f"[CAUSAL] Column cap: kept top {len(keep_features)} features + "
+                            f"{len(required)} required (action/reward) — was {orig_cols} cols")
             if data.shape[0] < 500:
                 logger.warning(f"[CAUSAL WARNING] Only {data.shape[0]} rows — GES may find fewer edges.")
             ges = GES(data)
@@ -543,6 +559,185 @@ class CausalSignalManager:
             # If base_factor < 1 (corr says "actions hurt"), opposing → boost (contrarian is good)
             inverted_factor = 1.0 - (base_factor - 1.0) * action_magnitude
             return max(0.5, min(1.2, inverted_factor))
+
+    def bootstrap_from_env(self, env, ppo_model, n_steps: int = 500, vec_norm=None,
+                           action_noise_sigma: float = 0.4):
+        """Seed the ReplayBuffer by stepping a PortfolioEnv through recent historical
+        bars with PPO-predicted actions. Produces real (obs, action, reward) tuples
+        that GES can use to discover action→reward structure.
+
+        Runs only when the buffer's current content is too thin or too deterministic
+        for causal discovery. GES fundamentally requires variance in the treatment
+        (action) to identify action→reward structure. A converged PPO policy is
+        near-deterministic in inference, so bare (deterministic) rollouts produce
+        actions with std ~0.08 → GES finds 0 edges. We inject Gaussian exploration
+        noise so the buffer carries enough action variance for causal discovery,
+        while the underlying mean action still reflects the real PPO policy.
+
+        Skips when the buffer already contains ≥100 samples with action std > 0.2
+        (i.e., non-degenerate data from live trading or a previous noisy bootstrap).
+
+        Args:
+            env: PortfolioEnv (already-constructed, not reset between calls)
+            ppo_model: portfolio PPO model (SB3 RecurrentPPO or similar)
+            n_steps: how many historical bars to replay
+            vec_norm: optional VecNormalize — if provided, obs is normalized before
+                predict, matching live inference semantics
+            action_noise_sigma: Gaussian std added to the scalar portfolio action
+                stored in the buffer (~0.4 gives GES a clear signal while keeping
+                the mean action close to the PPO policy)
+        """
+        if ppo_model is None or env is None:
+            logger.debug(f"[CAUSAL BOOTSTRAP] {self.symbol} — missing env or model, skipping")
+            return 0
+        if len(self.replay_buffer.buffer) >= 100:
+            # Check action variance — if too low, existing buffer is deterministic
+            # and GES won't find edges. Drop it and re-seed with exploration noise.
+            # IMPORTANT: Check std of the most-common-obs-shape subset (what GES
+            # actually receives after ReplayBuffer.sample() filters shape mismatches).
+            # A few legacy entries from older model versions can inflate overall std
+            # and mask the fact that the dominant subset is deterministic.
+            try:
+                from collections import Counter
+                shape_counts = Counter(
+                    tuple(np.asarray(t[0]).shape) for t in self.replay_buffer.buffer
+                )
+                dominant_shape = shape_counts.most_common(1)[0][0]
+                dominant = [
+                    t for t in self.replay_buffer.buffer
+                    if tuple(np.asarray(t[0]).shape) == dominant_shape
+                ]
+                dominant_actions = np.array([
+                    t[1] for t in dominant
+                    if np.isscalar(t[1]) or (hasattr(t[1], 'shape') and t[1].shape == ())
+                ])
+                dom_std = float(dominant_actions.std()) if len(dominant_actions) > 0 else 0.0
+                if len(dominant_actions) == 0 or dom_std < 0.2:
+                    logger.info(f"[CAUSAL BOOTSTRAP] {self.symbol} — dominant shape "
+                                f"{dominant_shape} has {len(dominant)} entries, "
+                                f"action std={dom_std:.3f} is too low for GES; "
+                                f"clearing buffer + stale graph cache and re-bootstrapping")
+                    self.replay_buffer.buffer.clear()
+                    # Invalidate the cached graph BOTH on disk and in memory — otherwise
+                    # the stale 0-edge cache gets loaded via CACHE HIT before GES reruns,
+                    # or the still-set self.causal_graph skips the rebuild entirely.
+                    self.causal_graph = None
+                    self.causal_model = None
+                    self.identified_estimand = None
+                    self._build_in_progress = False
+                    self._last_build_fail = 0
+                    try:
+                        if os.path.exists(self.cache_path):
+                            os.remove(self.cache_path)
+                            logger.info(f"[CAUSAL BOOTSTRAP] {self.symbol} — removed "
+                                        f"stale graph cache at {self.cache_path}")
+                    except Exception as e:
+                        logger.warning(f"[CAUSAL BOOTSTRAP] {self.symbol} — failed to "
+                                       f"remove stale cache at {self.cache_path}: {e} "
+                                       f"— in-memory graph cleared, rebuild will proceed")
+                else:
+                    logger.debug(f"[CAUSAL BOOTSTRAP] {self.symbol} — buffer already has "
+                                 f"{len(self.replay_buffer.buffer)} samples, dominant "
+                                 f"action std={dom_std:.3f}, skipping")
+                    return 0
+            except Exception as e:
+                logger.debug(f"[CAUSAL BOOTSTRAP] {self.symbol} — action variance check "
+                             f"failed ({e}), skipping bootstrap")
+                return 0
+
+        # Save env state so we don't disturb the persistent env used elsewhere
+        saved = {
+            'current_step': getattr(env, 'current_step', None),
+            'balance': getattr(env, 'balance', None),
+            'equity': getattr(env, 'equity', None),
+            'weights': getattr(env, 'weights', None),
+            'last_weights': getattr(env, 'last_weights', None),
+            'weight_history': getattr(env, 'weight_history', None),
+            'episode_start': getattr(env, 'episode_start', None),
+            'cumulative_pnl': getattr(env, 'cumulative_pnl', None),
+            'peak_equity': getattr(env, 'peak_equity', None),
+        }
+
+        added = 0
+        try:
+            # Reset env to get clean initial state, then rewind to the last N bars
+            obs, _ = env.reset()
+            timeline_len = len(env.timeline)
+            start_step = max(0, timeline_len - n_steps - 1)
+            # Jump forward to the bootstrap window
+            env.current_step = start_step
+            env.episode_start = start_step
+            obs = env._get_observation()
+
+            # PortfolioEnv convention: reward at step(action_t) reflects the weights
+            # HELD DURING bar t (i.e., the previous action). So the reward for taking
+            # action_t is delivered by step(action_{t+1}). We buffer the prior
+            # (obs, action) tuple and pair it with the next step's reward.
+            lstm_state = None
+            pending = None  # (obs_prev, action_prev) waiting for its reward
+            for _ in range(n_steps):
+                if env.current_step >= timeline_len - 1:
+                    break
+                obs_for_predict = obs.reshape(1, -1).astype(np.float32)
+                if vec_norm is not None:
+                    try:
+                        obs_for_predict = vec_norm.normalize_obs(obs_for_predict)
+                    except Exception:
+                        pass
+                try:
+                    action, lstm_state = ppo_model.predict(
+                        obs_for_predict,
+                        state=lstm_state,
+                        episode_start=np.array([False]),
+                        deterministic=True,
+                    )
+                except TypeError:
+                    # Non-recurrent PPO signature
+                    action, _ = ppo_model.predict(obs_for_predict, deterministic=True)
+                    lstm_state = None
+                action_arr = np.asarray(action).flatten()
+                # Inject Gaussian exploration noise BEFORE stepping the env so the
+                # reward reflects the noisy action. Without noise, a converged PPO
+                # policy is near-deterministic and GES finds no action→reward edge.
+                if action_noise_sigma > 0:
+                    action_arr = action_arr + np.random.normal(
+                        0.0, action_noise_sigma, size=action_arr.shape
+                    ).astype(action_arr.dtype)
+                    action_arr = np.clip(action_arr, -2.0, 2.0)
+                next_obs, reward, terminal, truncated, _ = env.step(action_arr)
+                # Portfolio-level buffer uses signed gross exposure as the scalar action
+                # (what GES consumes for action→reward edge discovery).
+                if self.symbol == "portfolio":
+                    scalar_action = float(np.sum(action_arr))
+                else:
+                    scalar_action = float(np.mean(action_arr))
+                # Flush the prior (obs, action) with the reward that just arrived —
+                # that reward reflects the weights held during this bar, which were
+                # set by the PREVIOUS action.
+                if pending is not None:
+                    prev_obs, prev_action = pending
+                    self.replay_buffer.push(prev_obs, prev_action, float(reward))
+                    added += 1
+                pending = (obs_for_predict.flatten(), scalar_action)
+                obs = next_obs
+                if terminal:
+                    break
+        except Exception as e:
+            logger.warning(f"[CAUSAL BOOTSTRAP] {self.symbol} — stepping env failed at "
+                           f"step {added}: {e}")
+        finally:
+            # Restore env state so downstream consumers see unchanged env
+            for k, v in saved.items():
+                if v is not None:
+                    try:
+                        setattr(env, k, v)
+                    except Exception:
+                        pass
+
+        logger.info(f"[CAUSAL BOOTSTRAP] {self.symbol} — seeded {added} synthetic "
+                    f"transitions from PortfolioEnv history (buffer now "
+                    f"{len(self.replay_buffer.buffer)})")
+        return added
 
     def warmup_from_history(self, history_entries: list):
         """Replay closed trades from live_signal_history into ReplayBuffer on startup.

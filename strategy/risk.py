@@ -182,11 +182,15 @@ class RiskManager:
 
     def allocate_portfolio_risk(self, equity: float, symbols: list,
                                 confidences: list = None,
-                                regimes: dict = None) -> dict: # ← NEW: regimes dict for persistence symmetry
+                                regimes: dict = None,
+                                daily_equity: dict = None,
+                                live_signal_history: dict = None) -> dict:
         """
         FIXED March 2 2026 + persistence symmetry upgrade.
         Scales total risk budget by average regime confidence before CVaR.
         M-1 FIX: Use cached regimes instead of recomputing
+        NEW: Intraday risk pacing via compute_risk_pacing_scale — throttles new risk
+        as today's drawdown or loss streaks accumulate (graduated, not binary).
         """
         n = len(symbols)
         if n == 0:
@@ -223,6 +227,22 @@ class RiskManager:
         # === CRITICAL FIX #2: Hard safety caps (never blow buying power again) ===
         max_total_risk = equity * self.config.get('MAX_TOTAL_RISK_PCT', 0.12) # max 12% of equity at risk total
         total_risk_budget = min(total_risk_budget, max_total_risk)
+        # === INTRADAY RISK PACING ===
+        # Graduated multiplier on top of the binary pause — throttle new risk as
+        # today's drawdown or loss streaks accumulate. daily_equity/history are
+        # optional (caller may not have them, in which case pacing is a no-op).
+        if daily_equity is not None:
+            pacing_scale, pacing_reason = self.compute_risk_pacing_scale(
+                equity, daily_equity, live_signal_history
+            )
+            if pacing_scale < 1.0:
+                pre_pacing = total_risk_budget
+                total_risk_budget *= pacing_scale
+                logger.warning(f"[RISK PACING] Scaling risk budget "
+                               f"${pre_pacing:,.0f} → ${total_risk_budget:,.0f} "
+                               f"(×{pacing_scale:.2f}) — {pacing_reason}")
+            else:
+                logger.debug(f"[RISK PACING] Full budget — {pacing_reason}")
         logger.info(f"[CVaR REGIME] Using Gemini-tuned risk budget: ${total_risk_budget:,.0f} | "
                     f"regime={regime} | base_risk_pct={base_risk_pct:.4f} | equity=${equity:,.0f} | "
                     f"multiplier={self.config.get('RISK_BUDGET_MULTIPLIER', 1.8):.2f}")
@@ -363,6 +383,80 @@ class RiskManager:
             logger.warning(f"[CVaR FALLBACK] Total allocation ${total_abs_alloc:,.0f} exceeded max_total_risk ${max_total_risk:,.0f} — scaled down by {scale:.3f}")
         logger.info(f"[CVaR FALLBACK] Using conviction-weighted allocations: {alloc}")
         return alloc
+
+    def compute_risk_pacing_scale(self, equity: float, daily_equity: dict,
+                                   live_signal_history: dict = None) -> tuple[float, str]:
+        """Return a multiplicative scale [0.0, 1.0] to apply to the CVaR risk budget
+        based on today's intraday state. This is a graduated alternative to the binary
+        pause — we throttle new risk as losses accumulate instead of only halting at -3%.
+
+        Returns (scale, reason) where reason is a human-readable log string.
+
+        Rules (configurable):
+        - Intraday up >= RISK_PACING_UP_THRESHOLD → full budget (1.0)
+        - Intraday down <= tier1 threshold → scale to tier1 factor
+        - Intraday down <= tier2 threshold → scale to tier2 factor
+        - >= N consecutive losses today → floor to consecutive-loss scale
+        - If RISK_PACING_ENABLED=False → always 1.0 (disabled)
+        """
+        if not self.config.get('RISK_PACING_ENABLED', True):
+            return 1.0, "pacing disabled"
+        today = datetime.now(tz=tz.gettz('America/New_York')).date()
+        if today not in daily_equity or daily_equity[today] <= 0:
+            return 1.0, "no daily open equity"
+        daily_pnl_pct = (equity - daily_equity[today]) / daily_equity[today]
+
+        # Base scale from intraday P&L
+        tier1_loss = self.config.get('RISK_PACING_TIER1_LOSS', -0.005)   # -0.5%
+        tier2_loss = self.config.get('RISK_PACING_TIER2_LOSS', -0.015)   # -1.5%
+        tier1_scale = self.config.get('RISK_PACING_TIER1_SCALE', 0.5)
+        tier2_scale = self.config.get('RISK_PACING_TIER2_SCALE', 0.2)
+        if daily_pnl_pct <= tier2_loss:
+            base_scale = tier2_scale
+            reason = f"intraday {daily_pnl_pct*100:+.2f}% ≤ {tier2_loss*100:.1f}% (tier2)"
+        elif daily_pnl_pct <= tier1_loss:
+            base_scale = tier1_scale
+            reason = f"intraday {daily_pnl_pct*100:+.2f}% ≤ {tier1_loss*100:.1f}% (tier1)"
+        else:
+            base_scale = 1.0
+            reason = f"intraday {daily_pnl_pct*100:+.2f}% (normal)"
+
+        # Consecutive-loss floor (counts today's losing closed trades)
+        cl_trigger = self.config.get('RISK_PACING_CONSECUTIVE_LOSSES', 3)
+        cl_scale = self.config.get('RISK_PACING_CONSECUTIVE_LOSS_SCALE', 0.3)
+        consecutive = 0
+        try:
+            if live_signal_history:
+                # Count today's closed losers working backwards; stop at first winner
+                today_closes = []
+                for sym_hist in live_signal_history.values():
+                    for entry in sym_hist:
+                        ts = entry.get('timestamp')
+                        if ts is None:
+                            continue
+                        if hasattr(ts, 'date'):
+                            ts_date = ts.astimezone(tz.gettz('America/New_York')).date() \
+                                      if ts.tzinfo else ts.date()
+                        else:
+                            continue
+                        if ts_date == today and entry.get('realized_return') is not None:
+                            today_closes.append((ts, entry.get('realized_return')))
+                today_closes.sort(key=lambda x: x[0], reverse=True)
+                for _ts, rret in today_closes:
+                    if rret is None:
+                        break
+                    if rret < 0:
+                        consecutive += 1
+                    else:
+                        break
+        except Exception as e:
+            logger.debug(f"[RISK PACING] consecutive-loss count failed: {e}")
+            consecutive = 0
+        if consecutive >= cl_trigger:
+            base_scale = min(base_scale, cl_scale)
+            reason += f" + {consecutive} consecutive losses today"
+
+        return float(base_scale), reason
 
     def check_pause_conditions(self, equity: float, daily_equity: dict, equity_history: dict, is_backtest: bool = False) -> bool:
         """Check daily loss threshold and 30-day drawdown circuit breaker.
