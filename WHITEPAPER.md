@@ -1,7 +1,7 @@
 # NYSE Trading Bot — Technical Whitepaper
 
 **Author:** Matthew McCartney
-**Version:** 2.2 (April 2026)
+**Version:** 2.8 (April 2026)
 **Status:** Live paper trading
 
 ---
@@ -580,17 +580,73 @@ All learned state round-trips across restarts via atomic file writes (tempfile +
 - **Trading loop**: `asyncio.create_task(self.trading_loop())`
 - **Monitor loop**: `asyncio.create_task(self.broker.monitor_positions())`
 - **Universe rotation**: Friday 8pm ET
-- **Gemini tuner + causal refresh + meta-filter refit + earnings refresh**: 03:30 AM ET daily
+- **Gemini tuner (v2.1 CoT prompt) + causal refresh + meta-filter refit + earnings refresh**: 03:30 AM ET daily
 - **Regime precompute**: 04:00 AM ET daily
-- **PPO retrain**: 18:00 ET daily
+- **A4 pre-market micro-retrain** (5K timesteps, LR=1e-5, strict GUARD): 08:30 AM ET daily
+- **EQ-SCORE daily execution-quality scorecard emit**: 16:30 ET daily
+- **PPO nightly retrain under RETRAIN-GUARD** (75K timesteps, auto-rollback on degradation): 18:00 ET daily
 - **Background regime precompute thread**: on startup, daemon thread
+
+---
+
+### 3.15 RETRAIN-GUARD (`models/trainer.py::_validate_portfolio_model`)
+
+**Motivation.** Nightly retrains previously adopted new weights unconditionally. A single bad retrain — overfitting to noise, distribution shift from new features, reward instability — silently degrades every downstream layer. With 18+ signal layers stacked on top of PPO, a broken base is catastrophic and nearly invisible until P&L bleeds for days.
+
+**Design.** Before each retrain:
+1. Checkpoint `ppo_model.zip → ppo_model_prev.zip`
+2. Deterministic validation rollout (500 steps, fixed seed 1337) → `baseline_score` (mean reward/step)
+3. Run retrain (75K timesteps incremental, LR 5e-5)
+4. Same deterministic validation → `post_score`
+5. If `abs_delta < -MIN_DROP AND rel_delta < -REL_DROP` → **ROLLBACK**: restore from backup, reload model, lock VecNormalize to inference mode.
+
+**First live result.** On its very first run (2026-04-16 18:00 ET), caught a **-8012% relative degradation** (baseline +0.00008 → post -0.00628). Automatic rollback in <1 second. Without this feature, the degraded model would have run for 24 hours undetected.
+
+### 3.16 TIME-STOP (`broker/alpaca.py::_monitor_one_position`)
+
+**Motivation.** "Dead trades" — positions held past their thesis horizon with no meaningful excursion — tie up capital and MAX_POSITIONS slots without earning anything.
+
+**Rule.**
+```
+if bars_held >= TIME_STOP_THRESHOLD_BARS (default 96)
+   AND |MFE| < TIME_STOP_MFE_CEILING (default 0.5%)
+   AND |MAE| < TIME_STOP_MAE_FLOOR (default 0.5%):
+       close_position_safely(symbol)
+```
+Uses `close_position_safely()` which cancels the trailing stop before closing (required because Alpaca reserves qty for active exit orders).
+
+### 3.17 EQ-SCORE (`strategy/execution_scorecard.py`)
+
+**Motivation.** With 18+ multiplicative gates, we need per-day visibility into which gates are actually doing work. "Meta-filter rejected 43 signals today" is actionable; "something happened" is not.
+
+**Design.** Event-recording hooks embedded (via try/except) in every gate's fire path. No latency cost — failure is silently swallowed. Daily emit task fires at 16:30 ET (30 min after market close). Emits one human-readable summary line + full structured JSON to `execution_scorecard_log.jsonl`.
+
+### 3.18 ALPHA-ATTR (`strategy/alpha_attribution.py`)
+
+**Motivation.** When a trade loses $50, we need to know which layer pushed it. The per-trade attribution record captures: baseline weight (raw PPO), final weight (post-all-gates), aggregate transformation, MFE/MAE, exit reason, regime at open/close, held bars. Persists to `alpha_attribution_log.jsonl`.
+
+### 3.19 A4 Pre-Market Micro-Retrain (`models/trainer.py::micro_retrain_portfolio`)
+
+**Motivation.** The nightly retrain at 18:00 ET leaves a 23.5-hour gap until next adaptation. Markets can move meaningfully overnight (earnings, macro, geopolitical). A lighter fine-tune at 08:30 ET (1 hr before open) closes this gap.
+
+**Design.** 5K timesteps on the last 500 bars only (recency-focused). LR=1e-5 (5× smaller than nightly). Stricter RETRAIN-GUARD thresholds (MIN_DROP=0.0015 vs 0.002, REL_DROP=15% vs 20%). Uses separate backup file (`ppo_model_micro_prev.zip`).
+
+### 3.20 Gemini Prompt v2.1
+
+**Three additions to the nightly tuning prompt (v2.8):**
+
+1. **RETRAIN-GUARD History section.** Mines the last 10 `retrain_guard_decision` JSON events from the log. Shows Gemini whether recent retrains were ACCEPTED or ROLLED BACK, with guidance on how to respond (e.g., rollback_count≥2 → reduce PPO_LR).
+
+2. **Chain-of-Thought reasoning block.** Output schema requires 200-500 word `reasoning` field before the JSON prescription. Forces Gemini to explicitly walk through telemetry → bottleneck → causal chain before proposing changes.
+
+3. **Confidence self-rating + step scaling.** Gemini outputs `confidence: low|medium|high`. Server-side scaling: `medium` → half step (interpolate proposed value 50% toward current), `low` → quarter step. Prevents uncertain proposals from moving real parameters.
 
 ---
 
 ## 6. Known Gaps & Future Work
 
 ### 6.1 High-priority (pending)
-- **A4 — Online PPO fine-tuning.** 50 gradient steps per day at 17:00 ET with LR=1e-5. Addresses the "windows 5-6 rejected every retrain" pattern. Medium risk (catastrophic forgetting), needs checksum-based rollback guard.
+- **A4 shipped.** Pre-market micro-retrain implemented (v2.6). ~~50 gradient steps per day~~ Now 5K timesteps at 08:30 ET with strict RETRAIN-GUARD.
 - **B1 — Learned exit policy.** Separate small PPO for close-timing decisions. Uses MFE/MAE from S3. Needs ~30 more closed trades with MFE/MAE tagging before training is viable.
 - **B3 — Transformer-based entry timer.** 1-min bar classifier to defer entries in adverse microstructure. Requires 1-min bar feed in `data/ingestion.py`.
 
@@ -629,4 +685,4 @@ All learned state round-trips across restarts via atomic file writes (tempfile +
 
 ---
 
-*Document last revised: 2026-04-16*
+*Document last revised: 2026-04-16 (v2.8 — 31 upgrades shipped)*

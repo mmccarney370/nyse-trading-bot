@@ -18,7 +18,7 @@ This isn't a moving-average crossover with extra steps. It's a production-grade 
 
 ## What Makes This Bot Unique
 
-Eleven capabilities you **won't find together** in any open-source trading framework. Each one individually takes a research paper to justify; having all eighteen layers stack multiplicatively is what separates signal from noise.
+Sixteen capabilities you **won't find together** in any open-source trading framework. Each one individually takes a research paper to justify; having them all stack multiplicatively is what separates signal from noise.
 
 ### 🧠 1. It Asks "Is This Actually Causal?" Before Every Trade
 Most bots chase correlations. This one runs **GES causal graph discovery** (Greedy Equivalence Search, pgmpy) over 56 features + action + reward, then asks DoWhy whether there's a genuine directed path from `action → reward` for the current market state. Spurious signals get dampened.
@@ -99,10 +99,25 @@ Institutional rule of thumb: stay under **1% of ADV** to keep market impact belo
 
 Ready for when the equity curve grows, or when an aggressive sizing attempt tries to dump 5% of a small-cap's daily volume on the book.
 
-### 🤖 11. Gemini 2.5 Flash Tunes 100+ Parameters Every Night
-At 03:30 AM ET, the bot serializes its full telemetry (Sharpe, Sortino, drawdown, WR, per-symbol P&L, PPO training scalars, regime distribution) and sends it to **Gemini 2.5 Flash** with 22 parameter groups and hard bounds. Gemini proposes changes inside a strict JSON schema. Every value is Pydantic-validated, category-clamped (PPO ±15%, risk ±20%, reward shaping ±25%), anti-oscillation-checked against recent history, and logged as structured JSON.
+### 🛡️ 11. RETRAIN-GUARD — PPO Can't Silently Degrade
+Every nightly PPO retrain (100K timesteps at 18:00 ET) is now **checkpointed, validated before and after, and automatically rolled back** if the new weights perform worse. On its very first run, it caught a **-8012% relative degradation** and restored the previous model in under a second. Without this, every downstream layer would have operated on a broken base for 24 hours before anyone noticed.
 
-Every parameter — from `TRAILING_STOP_ATR_TRENDING` to `META_FILTER_MIN_PROB` to `CROWDING_DISCOUNT_STRENGTH` — is eligible for autonomous tuning. The bot genuinely writes its own configuration.
+### ⏰ 12. TIME-STOP — Dead Trades Don't Get a Free Pass
+Positions held too long without meaningful excursion in either direction (MFE < 0.5%, MAE < 0.5%, held > 96 bars) are **"dead trades"** — the thesis isn't playing out. TIME-STOP auto-closes them to free capital. On first live run, it correctly flagged 4 of 6 positions as dead (PLTR at 178 bars with only +0.11% MFE / -0.27% MAE).
+
+### 📊 13. EQ-SCORE — Daily Gate-Activity Scorecard
+At 16:30 ET, the bot emits a structured JSON report answering "what did the 18 gates actually do today?" — per-symbol meta-filter rejects, divergence triggers, slippage vetos, liquidity scaling events, cross-sectional tercile placements, earnings blackouts, regime distribution, entries submitted/filled. Persists to `execution_scorecard_log.jsonl` for historical analysis.
+
+### 📋 14. ALPHA-ATTR — Every Closed Trade Gets an Attribution Record
+When a trade closes (stop, TP, or safe-close), the bot emits a JSON line recording: baseline weight (raw PPO), final weight (post-gates), aggregate transformation multiplier, MFE/MAE, entry/exit prices, held bars, regime at open/close, exit reason. Persists to `alpha_attribution_log.jsonl`. Answers "which layers pushed this trade out of neutral?" for every trade.
+
+### 🧠 15. A4 — Pre-Market PPO Micro-Retrain
+At 08:30 ET (1 hour before market open), a **lighter fine-tune** (5K timesteps, LR=1e-5, last 500 bars only) adapts the PPO to overnight news, earnings reactions, and futures moves — closing the 23.5-hour gap between nightly retrains. Wrapped in its own RETRAIN-GUARD with **stricter thresholds** (rollback at -15% relative vs -20% for nightly).
+
+### 🤖 16. Gemini 2.5 Flash Tunes 100+ Parameters Every Night (v2.1 Prompt)
+At 03:30 AM ET, the bot sends full telemetry + **RETRAIN-GUARD history** (so Gemini sees whether recent retrains were accepted or rolled back) to **Gemini 2.5 Flash** with 25 parameter groups. Gemini now outputs a **200-500 word Chain-of-Thought reasoning block** before its JSON prescription, plus a **confidence self-rating** (low/med/high) that scales step sizes server-side (medium = half step, low = quarter step). This prevents uncertain guesses from moving real parameters.
+
+Every parameter — from `TRAILING_STOP_ATR_TRENDING` to `META_FILTER_MIN_PROB` to `PPO_MICRO_RETRAIN_LR` — is eligible for autonomous tuning. The bot genuinely writes its own configuration.
 
 ---
 
@@ -162,16 +177,18 @@ All state persists across crashes: `meta_filter.pkl`, `bayesian_sizing.pkl`, `sl
 
 ## Nightly Self-Improvement Cycle
 
-While you're asleep, seven things happen on schedule:
+While you're asleep, nine things happen on schedule:
 
 | Time (ET) | What Runs |
 |---|---|
-| **03:30 AM** | Full telemetry → Gemini 2.5 Flash → parameter adjustments → Pydantic validation → atomic apply + structured audit log |
+| **03:30 AM** | Full telemetry + RETRAIN-GUARD history → Gemini 2.5 Flash (v2.1 CoT prompt) → parameter adjustments → Pydantic validation → atomic apply + structured audit log |
 | **03:30 AM** | GES causal graph rebuild with latest feature data + replay buffer |
 | **03:30 AM** | Meta-label classifier retrained on updated live_signal_history |
 | **03:30 AM** | yfinance earnings calendar sweep (weekly TTL, uses cache when fresh) |
 | **04:00 AM** | Parallel ensemble regime detection refresh across all symbols |
-| **06:00 PM** | Online PPO retrain (~75K timesteps incremental update) |
+| **08:30 AM** | **A4 pre-market micro-retrain** — 5K timesteps on last 500 bars, LR=1e-5, with strict RETRAIN-GUARD |
+| **04:30 PM** | **EQ-SCORE** daily execution-quality scorecard emitted (JSON + one-liner) |
+| **06:00 PM** | Online PPO retrain (~75K timesteps) — **RETRAIN-GUARD** validates + auto-rolls back if degraded |
 | **Friday 8 PM** | Universe rotation — evaluate 34 candidates, swap losers, full retrain on new roster |
 
 ---
@@ -215,7 +232,7 @@ trading_bot/
 |-- config.py                       # 100+ settings, Pydantic-validated
 |-- __main__.py                     # Entry point
 |-- backtest.py                     # Full backtesting engine
-|-- gemini_tuner.py                 # Gemini 2.5 Flash (22 parameter groups)
+|-- gemini_tuner.py                 # Gemini 2.5 Flash v2.1 (25 parameter groups, CoT reasoning)
 |
 |-- broker/
 |   |-- alpaca.py                   # Orders + ratchet + asymmetric loss-tighten + reattach qty-drift fix
@@ -236,6 +253,8 @@ trading_bot/
 |   |-- slippage_predictor.py       # Grouped-mean slippage predictor
 |   |-- adverse_selection.py        # Post-fill toxicity detector
 |   |-- cognitive.py                # Equity curve trader + profit velocity + autopsy
+|   |-- execution_scorecard.py      # [NEW] EQ-SCORE daily gate-activity summary
+|   |-- alpha_attribution.py        # [NEW] Per-trade alpha attribution logger
 |
 |-- models/
 |   |-- trainer.py                  # PPO/RecurrentPPO training
