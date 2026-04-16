@@ -363,6 +363,18 @@ GROUP 19: PPO-Stacking Divergence (PSD) — dampen when models strongly disagree
   DIVERGENCE_MIN_WEIGHT   [0.01 – 0.08] current: {current_config.get('DIVERGENCE_MIN_WEIGHT')}
   DIVERGENCE_MIN_META     [0.10 – 0.40] current: {current_config.get('DIVERGENCE_MIN_META')}
 
+GROUP 20: Kelly Sizing (KELLY) — mathematically-optimal per-symbol sizing
+  BAYESIAN_SIZING_KELLY_FRACTION   [0.10 – 0.50]  current: {current_config.get('BAYESIAN_SIZING_KELLY_FRACTION')}
+  BAYESIAN_SIZING_REFERENCE_KELLY  [0.04 – 0.15]  current: {current_config.get('BAYESIAN_SIZING_REFERENCE_KELLY')}
+
+GROUP 21: Regime-Conditional Exits (REX) — differentiated TP/trail by alignment
+  REX_ALIGN_TP_MULT    [1.15 – 1.80]  current: {current_config.get('REX_ALIGN_TP_MULT')}
+  REX_ALIGN_TRAIL_MULT [1.05 – 1.50]  current: {current_config.get('REX_ALIGN_TRAIL_MULT')}
+  REX_OPPOSE_TP_MULT   [0.50 – 0.90]  current: {current_config.get('REX_OPPOSE_TP_MULT')}
+  REX_OPPOSE_TRAIL_MULT[0.55 – 0.95]  current: {current_config.get('REX_OPPOSE_TRAIL_MULT')}
+  REX_MR_TP_MULT       [0.65 – 1.00]  current: {current_config.get('REX_MR_TP_MULT')}
+  REX_MR_TRAIL_MULT    [0.75 – 1.05]  current: {current_config.get('REX_MR_TRAIL_MULT')}
+
 === CONSTRAINTS ===
 1. HEALTHY systems get NO changes or at most 2 minor tweaks. Do NOT fix what is working.
 2. Maximum 6 parameter changes per cycle. Focused, high-conviction changes only.
@@ -495,6 +507,10 @@ GROUP 19: PPO-Stacking Divergence (PSD) — dampen when models strongly disagree
                     'BAYESIAN_SIZING_REFERENCE_EV', 'BAYESIAN_SIZING_SHRINKAGE_N',
                     'SLIPPAGE_VETO_MULTIPLE', 'SLIPPAGE_VETO_SCALE',
                     'DIVERGENCE_GATE_SCALE', 'DIVERGENCE_MIN_WEIGHT', 'DIVERGENCE_MIN_META',
+                    'BAYESIAN_SIZING_KELLY_FRACTION', 'BAYESIAN_SIZING_REFERENCE_KELLY',
+                    'REX_ALIGN_TP_MULT', 'REX_ALIGN_TRAIL_MULT',
+                    'REX_OPPOSE_TP_MULT', 'REX_OPPOSE_TRAIL_MULT',
+                    'REX_MR_TP_MULT', 'REX_MR_TRAIL_MULT',
                 }
                 if key in risk_params:
                     pct_bound = 0.20
@@ -618,6 +634,16 @@ GROUP 19: PPO-Stacking Divergence (PSD) — dampen when models strongly disagree
                     'DIVERGENCE_GATE_SCALE': (0.2, 0.8),
                     'DIVERGENCE_MIN_WEIGHT': (0.01, 0.08),
                     'DIVERGENCE_MIN_META': (0.10, 0.40),
+                    # NEW — KELLY sizing
+                    'BAYESIAN_SIZING_KELLY_FRACTION': (0.10, 0.50),
+                    'BAYESIAN_SIZING_REFERENCE_KELLY': (0.04, 0.15),
+                    # NEW — REX Regime-Conditional Exits
+                    'REX_ALIGN_TP_MULT': (1.15, 1.80),
+                    'REX_ALIGN_TRAIL_MULT': (1.05, 1.50),
+                    'REX_OPPOSE_TP_MULT': (0.50, 0.90),
+                    'REX_OPPOSE_TRAIL_MULT': (0.55, 0.95),
+                    'REX_MR_TP_MULT': (0.65, 1.00),
+                    'REX_MR_TRAIL_MULT': (0.75, 1.05),
                 }
                 if key in ABSOLUTE_BOUNDS:
                     abs_min, abs_max = ABSOLUTE_BOUNDS[key]

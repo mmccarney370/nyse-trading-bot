@@ -143,29 +143,81 @@ class BayesianSymbolSizer:
             al = float(st.get("avg_loss", -0.008))
         return p * aw + (1.0 - p) * al
 
+    def kelly_fraction(self, symbol: str) -> float:
+        """Full Kelly fraction: f* = (p·b − q) / b
+        where p=P(win), q=1−p, b=|avg_win|/|avg_loss|.
+        Returns the raw Kelly fraction (can be negative if symbol has negative edge).
+        Caller should scale by fractional-Kelly coefficient (default 0.25) for safety."""
+        p = self.p_win(symbol)
+        q = 1.0 - p
+        with self._lock:
+            st = self._state.get(symbol, self._fresh_entry())
+            aw = abs(float(st.get("avg_win", 0.01)))
+            al = abs(float(st.get("avg_loss", 0.008)))
+        if al < 1e-9 or aw < 1e-9:
+            return 0.0
+        b = aw / al  # win:loss ratio
+        # Standard Kelly: f* = (bp - q) / b = p - q/b
+        f_star = (b * p - q) / b
+        return float(f_star)
+
     def size_multiplier(
         self,
         symbol: str,
         min_mult: float = 0.4,
         max_mult: float = 1.6,
-        reference_ev: float = 0.003,  # +0.3% ev_per_trade → +1 on the scale
+        reference_ev: float = 0.003,  # legacy (EV-based) path — kept for rollback
         shrinkage_n: int = 8,
+        method: str = "kelly",          # NEW: "kelly" (default) or "ev" (legacy)
+        kelly_fraction: float = 0.25,    # ¼ Kelly is institutional-standard safety
+        reference_kelly: float = 0.08,   # raw f* of 0.08 → full boost at max_mult
     ) -> Tuple[float, str]:
-        """Convert per-symbol expected return into a weight multiplier in
-        [min_mult, max_mult]. Below `shrinkage_n` total trades we blend toward
-        1.0 (neutral) so small samples don't dominate."""
-        ev = self.expected_return(symbol)
+        """Convert per-symbol edge into a weight multiplier ∈ [min_mult, max_mult].
+
+        KELLY METHOD (default):
+            Raw Kelly f* = (p·b − q) / b, scaled by fractional coefficient (0.25)
+            then mapped to multiplier. Positive edge → boost up to max_mult;
+            negative edge → dampen down to min_mult. Mathematically optimal for
+            long-run geometric growth.
+
+        EV METHOD (legacy, backward-compat):
+            mult = 1 + EV / reference_ev, clipped.
+
+        Shrinkage: when total closed trades n < shrinkage_n, blend toward 1.0
+        (neutral) so 2-3 lucky trades don't dominate sizing."""
         with self._lock:
             st = self._state.get(symbol, self._fresh_entry())
             n = int(st.get("n", 0))
-        # Core scale factor from EV
+
+        if method == "kelly":
+            # Fractional Kelly as signed edge, then remap around 1.0
+            f_raw = self.kelly_fraction(symbol)             # ∈ roughly [-0.5, +0.5]
+            f_scaled = f_raw * kelly_fraction                # ¼-Kelly typically
+            # Map scaled fraction → multiplier.
+            # f_scaled == 0          → mult = 1.0 (neutral)
+            # f_scaled == +reference_kelly → mult = max_mult
+            # f_scaled == -reference_kelly → mult = min_mult
+            if f_scaled >= 0:
+                raw = 1.0 + (f_scaled / max(reference_kelly, 1e-9)) * (max_mult - 1.0)
+            else:
+                raw = 1.0 + (f_scaled / max(reference_kelly, 1e-9)) * (1.0 - min_mult)
+            raw = max(min_mult, min(max_mult, raw))
+            # Shrinkage toward 1.0 for small n (avoid overreacting to lucky streaks)
+            shrink = min(1.0, n / max(1, shrinkage_n))
+            mult = 1.0 + shrink * (raw - 1.0)
+            mult = max(min_mult, min(max_mult, mult))
+            p = self.p_win(symbol)
+            reason = (f"kelly_f*={f_raw:+.3f} scaled(¼)={f_scaled:+.3f} "
+                      f"p={p:.2f} n={n} shrink={shrink:.2f}")
+            return float(mult), reason
+        # --- legacy EV method ---
+        ev = self.expected_return(symbol)
         raw = 1.0 + (ev / reference_ev)
         raw = max(min_mult, min(max_mult, raw))
-        # Shrinkage toward 1.0 for small n
         shrink = min(1.0, n / max(1, shrinkage_n))
         mult = 1.0 + shrink * (raw - 1.0)
         mult = max(min_mult, min(max_mult, mult))
-        reason = f"p_win={self.p_win(symbol):.2f} ev={ev:+.4f} n={n} shrink={shrink:.2f}"
+        reason = f"ev-legacy p_win={self.p_win(symbol):.2f} ev={ev:+.4f} n={n} shrink={shrink:.2f}"
         return float(mult), reason
 
     def snapshot(self) -> Dict[str, Dict[str, float]]:

@@ -335,6 +335,12 @@ class TradingBotConfig(BaseModel):
     BAYESIAN_SIZING_MAX_MULT: float = 1.6
     BAYESIAN_SIZING_REFERENCE_EV: float = 0.003   # +0.3% ev_per_trade → full boost
     BAYESIAN_SIZING_SHRINKAGE_N: int = 8          # need this many trades before full weight
+    # KELLY: mathematically-optimal sizing via f* = (pb - q)/b with fractional safety.
+    # Default is ¼ Kelly — industry-standard conservative multiplier.
+    # reference_kelly=0.08 means a ¼-Kelly f* of 0.08 triggers full max_mult boost.
+    BAYESIAN_SIZING_METHOD: str = "kelly"         # "kelly" or "ev" (legacy)
+    BAYESIAN_SIZING_KELLY_FRACTION: float = 0.25
+    BAYESIAN_SIZING_REFERENCE_KELLY: float = 0.08
     # ==================== ESP: Slippage-Prediction Veto ====================
     # Learn realized slippage per (symbol, hour, size). At entry, predict expected
     # slippage; if > edge × safety multiple → skip or dampen.
@@ -380,6 +386,20 @@ class TradingBotConfig(BaseModel):
     RATCHET_LOSS_TIGHTEN_THRESHOLD: float = -0.007     # fires at -0.7% unrealized
     RATCHET_LOSS_TIGHTEN_FACTOR: float = 0.55          # trail → 55% of original width
     RATCHET_LOSS_TIGHTEN_MFE_MAX: float = 0.004        # skip if MFE ever exceeded +0.4%
+    # ==================== REX: Regime-Conditional Exits ====================
+    # Apply a multiplier on top of the regime-base ATR multipliers, based on whether
+    # the trade ALIGNS with or OPPOSES the current regime direction. Aligned trades
+    # (long in uptrend, short in downtrend) get wider TP + trail — let winners run.
+    # Counter-trend trades get tighter TP + trail — take profits fast, accept quick
+    # exits. Mean-reverting regime → tighter TP (expect reversal). Strictly additive:
+    # REX_ENABLED=False returns multipliers to 1.0 neutral.
+    REX_ENABLED: bool = True
+    REX_ALIGN_TP_MULT: float = 1.4       # Long in uptrend: TP ×1.4 of regime-base
+    REX_ALIGN_TRAIL_MULT: float = 1.25   # Long in uptrend: trail ×1.25 of regime-base
+    REX_OPPOSE_TP_MULT: float = 0.7      # Short in uptrend: TP ×0.7 (quick profit)
+    REX_OPPOSE_TRAIL_MULT: float = 0.75  # Short in uptrend: trail ×0.75 (tight stop)
+    REX_MR_TP_MULT: float = 0.85         # Mean-reverting: TP ×0.85 (fast profit)
+    REX_MR_TRAIL_MULT: float = 0.92      # Mean-reverting: trail ×0.92 (modest tighten)
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty

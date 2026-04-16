@@ -1065,6 +1065,9 @@ class SignalGenerator:
                     bps_max = self.config.get('BAYESIAN_SIZING_MAX_MULT', 1.6)
                     bps_ref_ev = self.config.get('BAYESIAN_SIZING_REFERENCE_EV', 0.003)
                     bps_shrink_n = self.config.get('BAYESIAN_SIZING_SHRINKAGE_N', 8)
+                    bps_method = self.config.get('BAYESIAN_SIZING_METHOD', 'kelly')
+                    bps_kelly_frac = self.config.get('BAYESIAN_SIZING_KELLY_FRACTION', 0.25)
+                    bps_ref_kelly = self.config.get('BAYESIAN_SIZING_REFERENCE_KELLY', 0.08)
                     bps_parts = []
                     for sym in list(target_weights.keys()):
                         if target_weights[sym] == 0.0:
@@ -1072,6 +1075,8 @@ class SignalGenerator:
                         mult, reason = self.bayesian_sizer.size_multiplier(
                             sym, min_mult=bps_min, max_mult=bps_max,
                             reference_ev=bps_ref_ev, shrinkage_n=bps_shrink_n,
+                            method=bps_method, kelly_fraction=bps_kelly_frac,
+                            reference_kelly=bps_ref_kelly,
                         )
                         if abs(mult - 1.0) > 0.01:
                             target_weights[sym] *= mult

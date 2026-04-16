@@ -389,7 +389,7 @@ class AlpacaBroker:
         current_price = self._get_current_price(symbol)
         atr = self._reconcile_get_atr(symbol)
         regime = group.regime or 'mean_reverting'
-        trail_pct = self._get_trail_percent(current_price, atr, regime)
+        trail_pct = self._get_trail_percent(current_price, atr, regime, direction=direction)
         tp_price = self._get_tp_price(current_price, atr, regime, direction)
         close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
         stop_est = round(current_price * (1 - direction * trail_pct / 100), 2)
@@ -550,14 +550,53 @@ class AlpacaBroker:
             return regime, 0.5
         return 'mean_reverting', 0.5
 
-    def _get_trail_percent(self, current_price: float, atr: float, regime: str) -> float:
-        """Compute trailing stop as a percentage of price (for TrailingStopOrderRequest)."""
+    def _rex_alignment_mults(self, regime: str, direction: int) -> tuple[float, float]:
+        """REX (Regime-Conditional Exits): compute (tp_mult, trail_mult) applied
+        on top of the regime-base ATR multipliers, based on whether the trade
+        ALIGNS with or OPPOSES the current regime direction.
+
+        Align with trend (long in uptrend, short in downtrend):
+            → wider TP, wider trail (let winners run in momentum regime)
+        Oppose the trend (counter-trend bet):
+            → tighter TP, tighter trail (take quick profits, accept quick exit)
+        Mean-reverting regime:
+            → tighter TP (expect reversal), slightly tighter trail
+
+        Fully configurable via REX_* config keys. Direction=0 means caller
+        doesn't know direction yet → returns (1.0, 1.0) neutral."""
+        if direction == 0 or not self.config.get('REX_ENABLED', True):
+            return 1.0, 1.0
+        if regime == 'trending_up':
+            if direction > 0:
+                return (self.config.get('REX_ALIGN_TP_MULT', 1.4),
+                        self.config.get('REX_ALIGN_TRAIL_MULT', 1.25))
+            else:
+                return (self.config.get('REX_OPPOSE_TP_MULT', 0.7),
+                        self.config.get('REX_OPPOSE_TRAIL_MULT', 0.75))
+        if regime == 'trending_down':
+            if direction < 0:
+                return (self.config.get('REX_ALIGN_TP_MULT', 1.4),
+                        self.config.get('REX_ALIGN_TRAIL_MULT', 1.25))
+            else:
+                return (self.config.get('REX_OPPOSE_TP_MULT', 0.7),
+                        self.config.get('REX_OPPOSE_TRAIL_MULT', 0.75))
+        # mean_reverting: take profits fast, modest trail tightening
+        return (self.config.get('REX_MR_TP_MULT', 0.85),
+                self.config.get('REX_MR_TRAIL_MULT', 0.92))
+
+    def _get_trail_percent(self, current_price: float, atr: float, regime: str,
+                           direction: int = 0) -> float:
+        """Compute trailing stop as a percentage of price (for TrailingStopOrderRequest).
+        REX: when direction is provided, applies regime-alignment multiplier so trades
+        aligned with the trend get wider trails (let winners run), counter-trend or
+        mean-reverting trades get tighter trails."""
         trailing_mult = (
             self.config.get('TRAILING_STOP_ATR_TRENDING', self.config.get('TRAILING_STOP_ATR', 3.0) * 0.8)
             if is_trending(regime)
             else self.config.get('TRAILING_STOP_ATR_MEAN_REVERTING', self.config.get('TRAILING_STOP_ATR', 4.0))
         )
-        trail_distance = atr * trailing_mult
+        _tp_align, trail_align = self._rex_alignment_mults(regime, direction)
+        trail_distance = atr * trailing_mult * trail_align
         trail_pct = (trail_distance / current_price) * 100  # Alpaca expects percentage
         # Clamp: at least 0.5%, at most 35%
         return round(max(0.5, min(35.0, trail_pct)), 2)
@@ -571,13 +610,16 @@ class AlpacaBroker:
     def _get_tp_price(self, current_price: float, atr: float, regime: str, direction: int) -> float:
         """Compute take-profit limit price.
         HIGH-7 FIX: Clamp TP distance to at most 50% of current price to prevent near-zero
-        short TPs when ATR multiplier is high (e.g. trending regime with 30x ATR)."""
-        tp_mult = (
+        short TPs when ATR multiplier is high (e.g. trending regime with 30x ATR).
+        REX: applies regime-alignment multiplier (aligned trades get farther TP for
+        more upside; counter-trend / mean-reverting get tighter TP for faster profit-taking)."""
+        tp_mult_regime = (
             self.config.get('TAKE_PROFIT_ATR_TRENDING', self.config.get('TAKE_PROFIT_ATR', 30.0) * 1.2)
             if is_trending(regime)
             else self.config.get('TAKE_PROFIT_ATR_MEAN_REVERTING', self.config.get('TAKE_PROFIT_ATR', 12.0))
         )
-        tp_distance = tp_mult * atr
+        tp_align, _trail_align = self._rex_alignment_mults(regime, direction)
+        tp_distance = tp_mult_regime * atr * tp_align
         # HIGH-7 FIX: Cap TP distance at 50% of price to avoid near-zero short TPs
         max_tp_distance = current_price * 0.50
         tp_distance = min(tp_distance, max_tp_distance)
@@ -720,7 +762,7 @@ class AlpacaBroker:
             if data is not None and len(data) >= 14:
                 atr = self._compute_current_atr(data)
 
-        trail_pct = self._get_trail_percent(fill_price, atr, regime)
+        trail_pct = self._get_trail_percent(fill_price, atr, regime, direction=direction)
         tp_price = self._get_tp_price(fill_price, atr, regime, direction)
 
         close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
@@ -1198,7 +1240,7 @@ class AlpacaBroker:
                             logger.error(f"[REATTACH-STOP BLOCKED] Failed to close {sym}: {e}")
                         return
                 logger.info(f"[REATTACH-STOP] {sym} tracked but no trailing stop — resubmitting")
-                trail_pct = group.trail_percent or self._get_trail_percent(current_price, atr, regime)
+                trail_pct = group.trail_percent or self._get_trail_percent(current_price, atr, regime, direction=group.direction)
                 close_side = OrderSide.SELL if group.direction > 0 else OrderSide.BUY
                 trail_qty = int(abs(qty))
                 try:
@@ -1318,7 +1360,7 @@ class AlpacaBroker:
         except Exception as e:
             logger.debug(f"[REATTACH] Could not check open orders for {symbol}: {e}")
 
-        trail_pct = self._get_trail_percent(current_price, atr, regime)
+        trail_pct = self._get_trail_percent(current_price, atr, regime, direction=direction)
         tp_price = self._get_tp_price(current_price, atr, regime, direction)
         close_side = OrderSide.SELL if direction > 0 else OrderSide.BUY
         position_intent = PositionIntent.SELL_TO_CLOSE if direction > 0 else PositionIntent.BUY_TO_CLOSE
