@@ -1,14 +1,14 @@
 # NYSE Trading Bot — Technical Whitepaper
 
 **Author:** Matthew McCartney
-**Version:** 2.0 (April 2026)
+**Version:** 2.2 (April 2026)
 **Status:** Live paper trading
 
 ---
 
 ## Abstract
 
-This document describes the technical architecture of an autonomous, self-improving equity trading system combining deep reinforcement learning, causal inference, Bayesian statistics, Lopez-de-Prado meta-labeling, ensemble regime detection, and LLM-powered hyperparameter optimization. The system trades a configurable universe of 8 US equities on 15-minute bars via the Alpaca API, with 16+ multiplicative signal layers and 100+ auto-tuned parameters. The design emphasizes strict additivity (every new layer defaults to neutral on insufficient data), state persistence across restarts, and explicit observability of every decision point.
+This document describes the technical architecture of an autonomous, self-improving equity trading system combining deep reinforcement learning, causal inference, Kelly-fractional Bayesian sizing, Lopez-de-Prado meta-labeling, ensemble regime detection, regime-conditional exits, liquidity-scaled sizing, and LLM-powered hyperparameter optimization. The system trades a configurable universe of US equities on 15-minute bars via the Alpaca API, with 18+ multiplicative signal layers and 100+ auto-tuned parameters. The design emphasizes strict additivity (every new layer defaults to neutral on insufficient data), state persistence across restarts, and explicit observability of every decision point.
 
 ---
 
@@ -30,29 +30,34 @@ The Gemini self-tuner can modify 100+ parameters but each is clamped by hard bou
 
 ## 2. Signal Pipeline
 
-The portfolio-level signal pipeline transforms market data into position changes through 16 sequential multiplicative layers. Each symbol's target weight `w_s ∈ [-2, +2]` flows through:
+The portfolio-level signal pipeline transforms market data into position changes through 18 sequential multiplicative layers. Each symbol's target weight `w_s ∈ [-2, +2]` flows through:
 
 ```
 w_s  ←  PPO(portfolio_obs)                     [base signal]
 w_s  ←  w_s · causal_factor(obs, action)       [Layer 1: causal penalty]
 w_s  ←  w_s · (1 + W_meta · meta_signed_s)     [Layer 2: stacking ensemble overlay]
-w_s  ←  w_s · bps_multiplier(s)                [Layer 3: Bayesian per-symbol sizing]
-w_s  ←  w_s · cs_multiplier(s)                 [Layer 4: cross-sectional momentum]
-w_s  ←  w_s · crowding_discount(s, w_*)        [Layer 5: correlation-aware]
-w_s  ←  w_s · (1 + W_sent · sent_s) · vel_factor_s [Layer 6: sentiment level+velocity]
-if in_earnings_blackout(s): w_s ← 0             [Layer 7: anti-earnings]
-if P_meta_label(s) < θ: w_s ← 0                 [Layer 8: meta-label filter]
-if slippage_veto(s): w_s ← w_s · 0.3            [Layer 9: slippage prediction]
-if divergence_strong(s): w_s ← w_s · 0.5        [Layer 10: PPO-stacking disagree]
-w_s  ←  w_s · ava_multiplier(s)                [Layer 11: adverse selection]
-w_s  ←  w_s · regime_gate(s, regime)           [Layer 12: regime direction]
-w_s  ←  w_s · vix_gate(VIX, direction)         [Layer 13: volatility regime]
-w_s  ←  w_s · spx_gate(SPX<200SMA, direction)  [Layer 14: market breadth]
-w_s  ←  w_s · hourly_trend_gate(s, direction)  [Layer 15: 1h alignment]
-w_s  ←  w_s · churn_defensive(s)               [Layer 16: adaptive memory]
-w_s  ←  w_s · eq_curve_scale                   [meta: equity-curve trader]
-risk_budget_today ← CVaR_budget · pacing_scale [intraday pacing]
+w_s  ←  w_s · bps_kelly_multiplier(s)          [Layer 3: Kelly-fractional Bayesian sizing]
+w_s  ←  w_s · liquidity_scaler(s, w_s, equity) [Layer 4: liquidity-scaled sizing]
+w_s  ←  w_s · cs_multiplier(s)                 [Layer 5: cross-sectional momentum]
+w_s  ←  w_s · crowding_discount(s, w_*)        [Layer 6: correlation-aware]
+w_s  ←  w_s · (1 + W_sent · sent_s) · vel_factor_s [Layer 7: sentiment level+velocity]
+if in_earnings_blackout(s): w_s ← 0             [Layer 8: anti-earnings]
+if P_meta_label(s) < θ: w_s ← 0                 [Layer 9: meta-label filter]
+if slippage_veto(s): w_s ← w_s · 0.3            [Layer 10: slippage prediction]
+if divergence_strong(s): w_s ← w_s · 0.5        [Layer 11: PPO-stacking disagree]
+w_s  ←  w_s · ava_multiplier(s)                [Layer 12: adverse selection]
+w_s  ←  w_s · regime_gate(s, regime)           [Layer 13: regime direction]
+w_s  ←  w_s · vix_gate(VIX, direction)         [Layer 14: volatility regime]
+w_s  ←  w_s · spx_gate(SPX<200SMA, direction)  [Layer 15: market breadth]
+w_s  ←  w_s · hourly_trend_gate(s, direction)  [Layer 16: 1h alignment]
+w_s  ←  w_s · churn_defensive(s)               [Layer 17: adaptive memory]
+w_s  ←  w_s · eq_curve_scale                   [Layer 18: equity-curve trader]
+risk_budget_today ← CVaR_budget · pacing_scale  [intraday pacing on CVaR budget]
 final_w_s ← notional_cap(w_s · risk_budget_today / price_s)
+
+# Exit-side (applied at order submission, not in weight pipeline):
+trail_pct_s  ← regime_base_trail · REX_alignment_mult(regime, direction_s)
+tp_price_s   ← regime_base_tp    · REX_alignment_mult(regime, direction_s)
 ```
 
 ---
@@ -87,7 +92,7 @@ else:
     persistence = clip(0.55 + 0.4 · dominance · consistency, 0.55, 0.95)
 ```
 
-**Validation.** Live test on current universe: under old HMM-only detector, all 8 symbols labeled `mean_reverting` persistence 0.95+. Under new ensemble: 5 of 8 correctly labeled `trending_up` (SOFI, AMD, NVDA, TSLA, SMCI) with persistence 0.79-0.86 — matching the rally the HMM was missing.
+**Validation.** Live test on a trending tape: under the old HMM-only detector all symbols in the universe were labeled `mean_reverting` with persistence 0.95+ (ceiling-stuck). The 5-voter ensemble correctly differentiated — a majority of symbols labeled `trending_up` with persistence 0.70-0.86 — catching the rally the HMM was missing, with meaningful variation in confidence across symbols.
 
 **Wire-up (`bot.py:_get_all_regimes`).** Previously bypassed `detect_regime` and used a 20-bar slope/volatility heuristic inline. Now delegates to `strategy.regime.detect_regime` on every cache miss, so the ensemble voters actually execute on the live trading path. Cache is versioned (`__version__: 2` in `regime_cache.json`) so stale pre-ensemble entries are discarded on startup.
 
@@ -112,7 +117,7 @@ Full DoWhy identification runs asynchronously in a background thread for operato
 ```
 action_bootstrap = action_ppo + N(0, σ=0.4)
 ```
-applied to the env BEFORE `step()` so the reward reflects the noisy action. This provides GES with treatment variance while the mean action still matches production PPO. Result: **23 edges discovered** on first run with bootstrap noise.
+applied to the env BEFORE `step()` so the reward reflects the noisy action. This provides GES with treatment variance while the mean action still matches production PPO. Result: GES now discovers a non-trivial number of action→reward edges on first run with bootstrap noise (typical: 15-30 edges depending on the specific feature-variance profile of the current universe).
 
 **Column cap for tractability.** GES complexity is approximately `O(p³·n)`. Portfolio observation is 460-dim so raw buffer samples produce 462-column matrices (invariant to sample size `n`). On this width, GES did not complete in 30 minutes of compute. Fix: cap GES input to top `k=58` features by variance, always preserving `action` and `reward` columns. Per-symbol buffers (obs dim 56) are unaffected. With cap, GES completes in 6-7 seconds.
 
@@ -143,7 +148,7 @@ if P(win) < θ_min (default 0.33):
 ```
 Or, optionally, `mode='scale'` for ×0.2 dampening instead of hard reject.
 
-**Threshold tuning.** The model was trained on base WR = 0.308 with mean prediction = 0.297. Initial threshold 0.40 rejected 69% of candidates (887 of ~1,280). Empirical tuning lowered to 0.33 ("clearly below baseline only"), which brought rejections to ~3% while still catching the worst candidates.
+**Threshold tuning.** The appropriate `META_FILTER_MIN_PROB` depends on the model's base rate and mean prediction. A threshold significantly above mean prediction rejects too aggressively (most candidates fall near the mean). The default `0.33` is set just above the observed long-run base win rate and rejects only clearly-below-baseline candidates; Gemini auto-tunes this based on observed rejection rate vs. subsequent live win-rate calibration.
 
 **Pass-through on insufficient data.** If fewer than `META_FILTER_MIN_TRAIN=30` closed trades exist, the classifier is not fit and `should_enter()` returns `True` by default. Strictly additive.
 
@@ -151,7 +156,7 @@ Or, optionally, `mode='scale'` for ×0.2 dampening instead of hard reject.
 
 ### 3.4 Kelly-Fractional Bayesian Per-Symbol Sizing (`strategy/bayesian_sizing.py`)
 
-**Motivation.** Today's P&L skew: SMCI 100% WR carries the book while JPM (28% WR), AAPL (0%), and TSLA (25%) bleed. Flat CVaR sizing treats all symbols identically. A posterior-based sizer allocates more capital to symbols with demonstrated edge.
+**Motivation.** Unbalanced per-symbol P&L distributions are common in multi-asset strategies — a handful of winners can carry the book while other names consistently bleed. Flat CVaR sizing treats all symbols identically, losing opportunity to allocate more to proven winners and reduce exposure to losers. A posterior-based sizer solves this by maintaining a per-symbol distribution over win probability.
 
 **Posterior.** Beta(α, β) conjugate update:
 ```
@@ -201,7 +206,7 @@ final_mult = clip(final_mult, min_mult, max_mult)
 
 Kelly is more conservative on small-N high-payoff symbols (TSLA 1.14 vs 1.60) and less harsh on decent-W/L negative-edge symbols (JPM 0.82 vs 0.59). The Kelly version is defensibly optimal; the EV version was a heuristic.
 
-**Validation (fit on 39 historical trades):**
+**Validation example** (illustrative fit from an early snapshot — posterior evolves continuously):
 
 | Symbol | n | E[P(win)] | avg_win | avg_loss | EV | Multiplier |
 |--------|---|-----------|---------|----------|-----|------------|
@@ -331,11 +336,11 @@ if unrealized_s ≤ LOSS_THRESHOLD (default -0.007, i.e. -0.7%)
 
 The `MFE_MAX` gate ensures this doesn't fire on winning positions that pulled back — we only tighten positions that never went meaningfully green.
 
-**Live verification.** Observed two loss-tighten events on Apr 16:
-- `PLTR unrealized -1.02% (MFE +0.00%) — tightening trail 2.42% → 1.33%`
-- `SMCI unrealized -0.78% (MFE +0.00%) — tightening trail 2.65% → 1.46%`
+**Live verification examples.** Observed events in production:
+- Losing position at -1.0% unrealized with zero MFE → trail tightens from ~2.4% to ~1.3%
+- Position at -0.8% unrealized, MFE still 0 → trail tightens from ~2.65% to ~1.46%
 
-Both positions had never gone green, both got tightened on time.
+Both positions had never gone green, both got tightened on schedule. Once a position's MFE exceeds `RATCHET_LOSS_TIGHTEN_MFE_MAX`, loss-tighten disables and the normal profit-tier ratchet takes over.
 
 ---
 
@@ -482,7 +487,7 @@ Direction-aware multiplication: rising sentiment boosts longs and dampens shorts
 5. Per-symbol performance breakdown
 6. PPO training scalars (entropy, value loss)
 7. Previous tuning actions (anti-oscillation context)
-8. 19 parameter groups with current values + hard bounds
+8. 22 parameter groups with current values + hard bounds
 
 **Output (strict JSON):**
 ```json
@@ -501,7 +506,7 @@ Direction-aware multiplication: rising sentiment boosts longs and dampens shorts
 2. Absolute hard bounds from `ABSOLUTE_BOUNDS` table (Pydantic-validated)
 3. Atomic staged update — revert on any validation error
 
-**19 groups, ~60 tunable parameters,** covering: risk budgets, trailing stops, ratchet timing, signal confidence, PPO hyperparameters, reward shaping, regime detection, intraday pacing, asymmetric trailing, meta-filter threshold, cross-sectional weights, anti-earnings windows, sentiment velocity, crowding discount, portfolio meta-blend weight, adverse selection, Bayesian sizing bounds, slippage veto, PPO-stacking divergence.
+**22 groups, ~60 tunable parameters,** covering: risk budgets, trailing stops, ratchet timing, signal confidence, PPO hyperparameters, reward shaping, regime detection, intraday pacing, asymmetric trailing, meta-filter threshold, cross-sectional weights, anti-earnings windows, sentiment velocity, crowding discount, portfolio meta-blend weight, adverse selection, Bayesian sizing bounds, slippage veto, PPO-stacking divergence.
 
 **Audit trail.** Every change logged as `{"event": "gemini_tuning_batch", "timestamp": ..., "changes_count": N, "parameters_changed": [...], "pnl_context": {...}}` — grep-ready JSON.
 

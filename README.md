@@ -21,14 +21,16 @@ This isn't a moving-average crossover with extra steps. It's a production-grade 
 Eleven capabilities you **won't find together** in any open-source trading framework. Each one individually takes a research paper to justify; having all eighteen layers stack multiplicatively is what separates signal from noise.
 
 ### 🧠 1. It Asks "Is This Actually Causal?" Before Every Trade
-Most bots chase correlations. This one runs **GES causal graph discovery** (Greedy Equivalence Search, pgmpy) over 56 features + action + reward, then asks DoWhy whether there's a genuine directed path from `action → reward` for the current market state. Spurious signals get dampened. **23 causal edges discovered** on the current universe, firing on every cycle — you can literally read which features are causally linked to P&L in `causal_cache_portfolio.pkl`.
+Most bots chase correlations. This one runs **GES causal graph discovery** (Greedy Equivalence Search, pgmpy) over 56 features + action + reward, then asks DoWhy whether there's a genuine directed path from `action → reward` for the current market state. Spurious signals get dampened.
+
+The graph is **bootstrapped from historical PortfolioEnv rollouts with Gaussian exploration noise** (converged PPO is near-deterministic — GES needs treatment variance), rebuilt nightly at 03:30 ET, and firing on every cycle. You can literally read which features are causally linked to P&L in `causal_cache_portfolio.pkl`.
 
 Every cycle logs `✅ [CAUSAL PENALTY APPLIED in generate_portfolio_actions]` or falls back cleanly to neutral.
 
 ### 🎯 2. Lopez-de-Prado Meta-Labeling Filter
 After the PPO emits a trade, a **nightly-trained LightGBM classifier** answers a different question: *"given that PPO says go long on AAPL right now, is this actually going to win?"* Probability below `META_FILTER_MIN_PROB` and the trade is **rejected outright**. This is the two-model architecture from *Advances in Financial Machine Learning* (López de Prado, 2018) — the primary model predicts direction, the secondary decides whether to place the bet.
 
-Currently trained on 39 closed trades (Brier score 0.088, well-calibrated). Self-refits nightly at 03:30 ET as the trade log grows.
+The classifier self-refits nightly at 03:30 ET; Brier calibration improves as the closed-trade log grows. Threshold is a tunable knob (`META_FILTER_MIN_PROB`) that Gemini auto-calibrates based on observed rejection rate vs. live win rate.
 
 ### 💰 3. Kelly-Fractional Bayesian Per-Symbol Sizing
 Every symbol gets its own **Beta(α, β) posterior on P(win)**, updated after every single closed trade. Instead of heuristic "if positive EV, boost" logic, sizing uses the **Kelly Criterion**:
@@ -40,15 +42,14 @@ mult = 1 + (¼·f*) / reference_kelly · (max_mult − 1)
 
 **¼ Kelly** is the institutional-standard conservative multiplier (Thorp, 1969). Winners get scaled up to **1.6×**; bleeders get dampened to **0.4×**. Small-sample shrinkage blends toward 1.0 so two lucky trades don't suddenly triple a position. This directly attacks the "one stock carries the book" failure mode and is mathematically optimal for compound growth.
 
-Live Kelly analysis from 39 historical trades:
+Example Kelly profile (live bot state, illustrative):
 ```
-SOFI  b=3.85  f*=+0.160  → mult 1.26   (big winners relative to small losses)
-TSLA  b=2.95  f*=+0.073  → mult 1.14   (asymmetric payoffs favor holding)
-SMCI  b=1.22  f*=+0.090  → mult 1.06   (balanced W/L with positive edge)
-JPM   b=1.55  f*=-0.098  → mult 0.82   (slight negative edge)
-AAPL  b=1.12  f*=-0.327  → mult 0.62   (poor W/L ratio despite decent WR)
+Symbol with high W/L ratio (b≈3.85) and positive edge    → boost ~1.26×
+Symbol with balanced W/L and modest positive edge         → boost ~1.06×
+Symbol with decent W/L but negative posterior edge        → dampen ~0.82×
+Symbol with poor W/L and negative edge                    → floor ~0.62×
 ```
-Capital flows automatically to symbols where the posterior shows real edge, weighted by Kelly's risk-of-ruin calculus.
+Capital flows automatically to symbols where the posterior shows real edge, weighted by Kelly's risk-of-ruin calculus. Posteriors update after every closed trade; behavior gets sharper as sample size grows.
 
 ### 📡 4. Five-Voter Ensemble Regime Detection (HMM Isn't Enough)
 HMM alone kept labeling every single bar "mean_reverting" at 95%+ persistence — even during clear multi-week rallies. This bot ships an ensemble of **slope + ADX + lag-1 autocorrelation + ATR range-expansion + HMM**, aggregated by direction-consistency voting. The result: `trending_up`, `trending_down`, or `mean_reverting` with a *differentiated* persistence score (0.65–0.90 live, not stuck at ceiling).
@@ -99,7 +100,7 @@ Institutional rule of thumb: stay under **1% of ADV** to keep market impact belo
 Ready for when the equity curve grows, or when an aggressive sizing attempt tries to dump 5% of a small-cap's daily volume on the book.
 
 ### 🤖 11. Gemini 2.5 Flash Tunes 100+ Parameters Every Night
-At 03:30 AM ET, the bot serializes its full telemetry (Sharpe, Sortino, drawdown, WR, per-symbol P&L, PPO training scalars, regime distribution) and sends it to **Gemini 2.5 Flash** with 19 parameter groups and hard bounds. Gemini proposes changes inside a strict JSON schema. Every value is Pydantic-validated, category-clamped (PPO ±15%, risk ±20%, reward shaping ±25%), anti-oscillation-checked against recent history, and logged as structured JSON.
+At 03:30 AM ET, the bot serializes its full telemetry (Sharpe, Sortino, drawdown, WR, per-symbol P&L, PPO training scalars, regime distribution) and sends it to **Gemini 2.5 Flash** with 22 parameter groups and hard bounds. Gemini proposes changes inside a strict JSON schema. Every value is Pydantic-validated, category-clamped (PPO ±15%, risk ±20%, reward shaping ±25%), anti-oscillation-checked against recent history, and logged as structured JSON.
 
 Every parameter — from `TRAILING_STOP_ATR_TRENDING` to `META_FILTER_MIN_PROB` to `CROWDING_DISCOUNT_STRENGTH` — is eligible for autonomous tuning. The bot genuinely writes its own configuration.
 
@@ -198,7 +199,7 @@ While you're asleep, seven things happen on schedule:
 | **Adaptive Exits** | Alpaca native trailing stops + software take-profit + profit-tier ratchet + loss-tighten |
 | **Walk-Forward Validation** | 6-window walk-forward threshold optimization with IS/OOS gap monitoring and overfitting rejection |
 | **Adaptive Memory** | Real-time anti-churn, cross-asset panic detection, online Bayesian signal-component reweighting |
-| **Self-Tuning** | Gemini 2.5 Flash with 19 parameter groups, Pydantic-validated bounds, anti-oscillation history |
+| **Self-Tuning** | Gemini 2.5 Flash with 22 parameter groups, Pydantic-validated bounds, anti-oscillation history |
 | **Dynamic Universe Rotation** | Weekly evaluation of 34 candidate symbols; auto retrain on roster changes |
 | **State Persistence** | Atomic writes for every learned quantity; schema-versioned where it matters |
 | **Structured Observability** | Searchable log prefixes for every subsystem + TensorBoard for PPO curves |
@@ -214,7 +215,7 @@ trading_bot/
 |-- config.py                       # 100+ settings, Pydantic-validated
 |-- __main__.py                     # Entry point
 |-- backtest.py                     # Full backtesting engine
-|-- gemini_tuner.py                 # Gemini 2.5 Flash (19 parameter groups)
+|-- gemini_tuner.py                 # Gemini 2.5 Flash (22 parameter groups)
 |
 |-- broker/
 |   |-- alpaca.py                   # Orders + ratchet + asymmetric loss-tighten + reattach qty-drift fix
@@ -222,7 +223,7 @@ trading_bot/
 |   |-- order_tracker.py            # State machine with MFE/MAE per-position tracking
 |
 |-- strategy/
-|   |-- signals.py                  # Signal blend + 16-layer gate cascade
+|   |-- signals.py                  # Signal blend + 18-layer gate cascade
 |   |-- regime.py                   # 5-voter ensemble (slope + ADX + autocorr + range + HMM)
 |   |-- risk.py                     # CVaR + intraday pacing + Kelly sizing
 |   |-- portfolio_rebalancer.py     # Portfolio-level rebalance + causal final scaling
@@ -315,7 +316,7 @@ Logs: `logs/nyse_bot.log` + `nyse_bot.log` (root) | Training curves: `tensorboar
 
 ## Configuration
 
-Everything lives in `config.py` with Pydantic validation. **100+ tunable parameters** across 19 groups — every one of them eligible for autonomous nightly tuning by Gemini inside clamped safety bounds.
+Everything lives in `config.py` with Pydantic validation. **100+ tunable parameters** across 22 groups — every one of them eligible for autonomous nightly tuning by Gemini inside clamped safety bounds.
 
 | Group | Example Parameters |
 |---|---|
