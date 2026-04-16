@@ -149,7 +149,7 @@ Or, optionally, `mode='scale'` for ×0.2 dampening instead of hard reject.
 
 ---
 
-### 3.4 Bayesian Per-Symbol Sizing (`strategy/bayesian_sizing.py`)
+### 3.4 Kelly-Fractional Bayesian Per-Symbol Sizing (`strategy/bayesian_sizing.py`)
 
 **Motivation.** Today's P&L skew: SMCI 100% WR carries the book while JPM (28% WR), AAPL (0%), and TSLA (25%) bleed. Flat CVaR sizing treats all symbols identically. A posterior-based sizer allocates more capital to symbols with demonstrated edge.
 
@@ -163,22 +163,43 @@ Mean:       E[P(win)] = α / (α + β)
 
 Running tracking of `avg_win` and `avg_loss` via incremental means (one per observation).
 
-**Expected return per trade.**
+**Kelly Criterion (v2.1 — default since April 2026).** Replaces the original EV-based heuristic with the mathematically-optimal Kelly fraction (Kelly 1956, Thorp 1969):
 ```
-EV = E[P(win)] · avg_win + (1 - E[P(win)]) · avg_loss
-```
-Note `avg_loss` is negative, so EV is signed.
-
-**Sizing multiplier.**
-```
-raw_mult    = 1.0 + EV / reference_EV       where reference_EV = 0.003 (0.3%)
-raw_mult    = clip(raw_mult, 0.4, 1.6)
-shrinkage   = min(1, n / shrinkage_N)       where shrinkage_N = 8
-final_mult  = 1.0 + shrinkage · (raw_mult - 1.0)
-final_mult  = clip(final_mult, 0.4, 1.6)
+b = |avg_win| / |avg_loss|               (win/loss payoff ratio)
+f* = (p·b - q) / b                        (raw Kelly fraction)
+   = p - q/b
 ```
 
-Shrinkage ensures that with fewer than 8 trades, the multiplier blends toward 1.0 (neutral) — preventing overreaction to small samples.
+For a symbol with p=0.5, avg_win=5%, avg_loss=-4% → b=1.25, f*=0.1 (10% of bankroll full-Kelly).
+
+**Fractional Kelly for safety.** Full Kelly maximizes expected log-wealth but has 50% drawdown expectation at the optimum. **¼-Kelly** is the institutional-standard conservative multiplier (reduces drawdown ~4× while giving up ~44% of return — dominant risk-adjusted tradeoff).
+
+**Mapping Kelly to multiplier.**
+```
+f_scaled = f* · kelly_fraction            (default kelly_fraction = 0.25)
+if f_scaled ≥ 0:
+    raw_mult = 1 + (f_scaled / reference_kelly) · (max_mult - 1)
+else:
+    raw_mult = 1 + (f_scaled / reference_kelly) · (1 - min_mult)
+raw_mult  = clip(raw_mult, min_mult, max_mult)
+shrinkage = min(1, n / shrinkage_N)
+final_mult = 1 + shrinkage · (raw_mult - 1)
+final_mult = clip(final_mult, min_mult, max_mult)
+```
+
+`reference_kelly = 0.08` means a ¼-Kelly fraction of 0.08 (raw f* = 0.32) triggers the full `max_mult` boost. Shrinkage ensures small-N samples don't dominate sizing.
+
+**Legacy "ev" method.** The original mult = 1 + EV/reference_ev heuristic is retained via `BAYESIAN_SIZING_METHOD='ev'` for rollback. The two methods give different rankings:
+
+| Symbol | n | b=W/L | p | raw f* | Kelly mult (¼) | Legacy EV mult |
+|--------|---|-------|---|--------|----------------|-----------------|
+| SOFI | 7 | 3.85 | 0.33 | +0.160 | **1.26** | 1.53 |
+| TSLA | 8 | 2.95 | 0.31 | +0.073 | 1.14 | **1.60** |
+| SMCI | 3 | 1.22 | 0.50 | +0.090 | 1.06 | 1.23 |
+| JPM | 10 | 1.55 | 0.33 | -0.098 | 0.82 | 0.59 |
+| AAPL | 5 | 1.12 | 0.30 | -0.327 | 0.62 | 0.62 |
+
+Kelly is more conservative on small-N high-payoff symbols (TSLA 1.14 vs 1.60) and less harsh on decent-W/L negative-edge symbols (JPM 0.82 vs 0.59). The Kelly version is defensibly optimal; the EV version was a heuristic.
 
 **Validation (fit on 39 historical trades):**
 
@@ -237,6 +258,54 @@ w_s ← w_s · discount_s
 **Example.** At `avg_corr = 0.87`, `crowding = 0.37`, `discount = 1 - 0.5·0.37 = 0.81×`. Each of AMD/NVDA/SMCI independently gets ~0.82× in a tech-cluster long scenario. Floored at `0.4×` to prevent pathological over-suppression.
 
 ---
+
+### 3.6b Regime-Conditional Exits (REX, `broker/alpaca.py::_rex_alignment_mults`)
+
+**Motivation.** Today's observed failure mode: the bot used the same exit parameters (TP distance, trailing stop width) regardless of whether the market was trending or mean-reverting. Result: in trending regimes, the trailing stop triggered on normal trend-noise pullbacks, exiting winners early. In mean-reverting regimes, the TP was too far away, expecting continuation that reversed back into losses.
+
+With S2's ensemble regime detector now correctly differentiating `trending_up`, `trending_down`, and `mean_reverting`, REX applies **alignment-aware multipliers** on top of the regime-base ATR multipliers:
+
+| Scenario | TP Multiplier | Trail Multiplier | Rationale |
+|---|---|---|---|
+| Long in `trending_up` (aligned) | × 1.40 | × 1.25 | Let the trend run; distant TP captures more upside, wider trail survives noise |
+| Short in `trending_up` (counter) | × 0.70 | × 0.75 | Counter-trend bet — take quick profits, accept tight stops |
+| Short in `trending_down` (aligned) | × 1.40 | × 1.25 | Symmetric to long-in-uptrend |
+| Long in `trending_down` (counter) | × 0.70 | × 0.75 | Symmetric to short-in-uptrend |
+| Any direction in `mean_reverting` | × 0.85 | × 0.92 | Expect reversal → take profits fast, modest trail tighten |
+
+These multiply onto the regime-base ATR multipliers (which already differentiate trending from MR in a coarser way). REX adds the **direction-alignment** dimension that the base multipliers lack.
+
+**Wire-up.** All four call sites of `_get_trail_percent()` and `_get_tp_price()` pass the `direction` parameter — entry submission, reconcile reattach, orphaned-position reattach, sync path. `REX_ENABLED=False` returns (1.0, 1.0) neutral for rollback.
+
+### 3.6c Liquidity-Scaled Sizing (LIQ, `strategy/liquidity_scaler.py`)
+
+**Motivation.** Every symbol has an Average Daily (dollar) Volume (ADV). When position notional starts to rival ADV, market-impact slippage becomes non-negligible. Institutional rule of thumb: participation should stay below 1% of ADV to keep impact below a few basis points.
+
+At current $30K equity all 8 symbols participate at <1bp of ADV — LIQ is dormant. But as equity grows or the universe picks up thinner names, impact risk escalates quadratically.
+
+**Computation.** Average daily dollar volume over last 20 trading days from 15-min bars:
+```
+adv_s = mean(close_t · volume_t · 26) over last 20 days   (26 fifteen-min bars/day)
+participation_s = |w_s| · equity / adv_s
+```
+
+**Scaling.**
+```
+warn = 0.001 (0.1% of ADV)     — below this: no action
+hard = 0.01  (1.0% of ADV)     — above this: floor at min_mult
+
+if participation ≤ warn:         mult = 1.0
+elif participation ≥ hard:       mult = min_mult (default 0.3)
+else: linear interpolation from 1.0 → min_mult
+```
+
+**Extended-hours tightening.** Pre-market (04:00-09:30 ET) and after-hours (16:00-20:00 ET) have 10-20× thinner liquidity than RTH. `LIQUIDITY_EH_FACTOR=5.0` tightens both thresholds by 5×, making the floor kick in at 0.2% of ADV instead of 1.0% during extended hours.
+
+**Stress validation** (at $10M equity, stress scenario):
+- SOFI (ADV $507M): 39bp participation → 0.77× mult
+- SMCI (ADV $656M): 46bp participation → 0.72× mult
+- During extended hours: both hard-floored at 0.30× (39bp > 20bp EH threshold)
+- Mid/large-caps (NVDA, TSLA, AAPL at $3B-$12B ADV): unaffected
 
 ### 3.7 Asymmetric Trailing Stops (`broker/alpaca.py` + `broker/order_tracker.py`)
 
