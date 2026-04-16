@@ -149,6 +149,52 @@ def log_structured_gemini_change(param: str, old_value: Any, new_value: Any, pnl
     }
     logger.info(json.dumps(entry, default=str))  # default=str handles datetime/numpy/non-serializable
 
+def _extract_retrain_guard_history(log_path: str = "logs/nyse_bot.log",
+                                    max_events: int = 10) -> list:
+    """Mine the last N retrain_guard_decision JSON events from the main log.
+    Returns list of dicts sorted by recency. Empty list if log missing or none found.
+
+    PROMPT-V2.1 — feeding this into Gemini lets it see whether recent retrains
+    were ACCEPTED or ROLLED BACK, and how large the degradation was. This is
+    critical signal for tuning PPO hyperparameters after a rollback."""
+    events = []
+    candidate_paths = [log_path, os.path.join(_PROJECT_ROOT, log_path),
+                       os.path.join(_PROJECT_ROOT, "logs", "nyse_bot.log")]
+    log_file = None
+    for p in candidate_paths:
+        if os.path.exists(p):
+            log_file = p
+            break
+    if log_file is None:
+        return events
+    try:
+        # Stream last ~50K lines (cap memory) looking for retrain_guard_decision events
+        from collections import deque
+        recent_lines = deque(maxlen=50_000)
+        with open(log_file, 'r', errors='replace') as f:
+            for line in f:
+                if 'retrain_guard_decision' in line or 'micro_retrain_guard_decision' in line:
+                    recent_lines.append(line)
+        for line in recent_lines:
+            # Find the JSON object in the line
+            brace_idx = line.find('{')
+            if brace_idx < 0:
+                continue
+            try:
+                payload = json.loads(line[brace_idx:].strip())
+                # Tag timestamp prefix for ordering
+                ts_prefix = line[:19] if len(line) >= 19 else ''
+                payload['_log_ts'] = ts_prefix
+                events.append(payload)
+            except Exception:
+                continue
+        # Return most recent first, capped
+        return events[-max_events:] if events else []
+    except Exception as e:
+        logger.debug(f"[PROMPT-V2.1] retrain-guard history mine failed: {e}")
+        return []
+
+
 def query_gemini_for_tuning(context_data: dict, current_config: dict, symbol_performance: dict = None) -> dict:
     logger.info("[GEMINI TUNER] Querying Gemini 2.5 Flash...")
     # ────────────────────────────────────────────────────────────────────────────────
@@ -172,6 +218,30 @@ def query_gemini_for_tuning(context_data: dict, current_config: dict, symbol_per
             logger.debug(f"[TEMPORAL CONTEXT] Loaded {len(previous_changes)} previous tuning changes")
         except Exception as e:
             logger.warning(f"Failed to load tuning history: {e}")
+    # PROMPT-V2.1: Mine recent RETRAIN-GUARD decisions from log.
+    # If there were recent ROLLBACKs, Gemini should tune PPO hyperparameters
+    # more conservatively or introduce stabilization changes.
+    retrain_guard_events = _extract_retrain_guard_history(max_events=10)
+    if retrain_guard_events:
+        # Compact summary: just the key fields
+        guard_summary_lines = []
+        for e in retrain_guard_events:
+            ts = e.get('_log_ts', '?')
+            decision = e.get('decision', '?')
+            base = e.get('baseline_score', 0.0)
+            post = e.get('post_score', 0.0)
+            abs_delta = e.get('abs_delta', 0.0)
+            rel_delta = e.get('rel_delta', 0.0)
+            kind = 'MICRO' if 'micro' in str(e.get('event', '')) else 'NIGHTLY'
+            guard_summary_lines.append(
+                f"  {ts} [{kind}] baseline={base:+.5f} post={post:+.5f} "
+                f"Δ={abs_delta:+.5f} rel={rel_delta:+.2%} → {decision}"
+            )
+        retrain_guard_summary = "\n".join(guard_summary_lines)
+        rollback_count = sum(1 for e in retrain_guard_events if e.get('decision') == 'ROLLBACK')
+    else:
+        retrain_guard_summary = "  (no retrain-guard decisions recorded yet)"
+        rollback_count = 0
     # NEW: Entropy-gated tuning focus
     entropy = ppo_scalars.get('entropy_loss', -1.0)
     if entropy > -0.05:  # entropy_loss near 0 = LOW entropy = policy is peaked/over-exploiting
@@ -215,6 +285,19 @@ Per-Symbol Breakdown (regime, persistence, sharpe, win_rate, pnl_dollars, recent
 
 === PREVIOUS TUNING ACTIONS (anti-oscillation context) ===
 {json.dumps(previous_changes, indent=2) if previous_changes else "First tuning cycle — no history."}
+
+=== RETRAIN-GUARD HISTORY (last {len(retrain_guard_events)} decisions) ===
+Recent PPO retrain outcomes — ROLLBACK means the new weights DEGRADED model quality
+and the system auto-restored the previous model. ACCEPT means the new weights were
+kept. Use this to calibrate how aggressively to tune PPO hyperparameters.
+{retrain_guard_summary}
+
+Rollback count in window: {rollback_count}
+  - If rollback_count ≥ 2 in the last week: PPO hyperparameters are causing instability.
+    Reduce PPO_LEARNING_RATE and/or PPO_ENTROPY_COEFF and/or PORTFOLIO_ONLINE_TIMESTEPS.
+  - If rollback_count = 1 (isolated event): possibly just noise; investigate before
+    major hyperparameter changes. The rollback itself protected us.
+  - If rollback_count = 0: PPO retrain pipeline is healthy. Don't over-tune PPO params.
 
 === DIAGNOSTIC PROTOCOL ===
 
@@ -409,7 +492,14 @@ GROUP 25: Time-Stop — liquidate dead trades
 8. Cross-validate: if you tighten stops, consider whether risk-per-trade should compensate. If you widen dead zone, check that MIN_CONFIDENCE still allows sufficient trade flow.
 
 === OUTPUT FORMAT (strict JSON, no markdown fences, no commentary outside JSON) ===
+
+Think step-by-step. Use the `reasoning` field as a Chain-of-Thought scratchpad —
+walk through the telemetry, the RETRAIN-GUARD history, the diagnostic protocol,
+and your proposed changes with explicit causal links. This forces calibration.
+
+Schema:
 {{
+  "reasoning": "200-500 words. Walk through: (1) observed metrics vs targets, (2) RETRAIN-GUARD history interpretation, (3) entropy-gated focus, (4) single bottleneck identification, (5) causal chain to proposed changes, (6) anti-oscillation check vs prior tunings.",
   "triage": "CRITICAL | DEGRADED | SUBOPTIMAL | HEALTHY",
   "diagnosis": "One sentence identifying the #1 bottleneck from the diagnostic protocol.",
   "root_cause": "One sentence explaining what market/system condition is causing the bottleneck.",
@@ -417,7 +507,8 @@ GROUP 25: Time-Stop — liquidate dead trades
   "proposed_universe": ["SYM1", "SYM2", ...],
   "parameters": {{
     "PARAM_NAME": new_numeric_value_or_null
-  }}
+  }},
+  "confidence": "low | medium | high   (self-assessed confidence that these changes improve performance; default medium unless triage=HEALTHY→low or you have strong evidence→high)"
 }}"""
     try:
         # M11 FIX: Add timeout to prevent indefinite blocking if Gemini API hangs
@@ -432,6 +523,15 @@ GROUP 25: Time-Stop — liquidate dead trades
         if fence_match:
             content = fence_match.group(1).strip()
         tweaks = json.loads(content)
+        # PROMPT-V2.1: log the new reasoning + confidence fields so we can audit Gemini's thinking
+        _reasoning = tweaks.get('reasoning')
+        _confidence = tweaks.get('confidence')
+        if _reasoning:
+            # Log as a single truncated line + full JSON for jq
+            preview = (_reasoning[:280] + '…') if len(_reasoning) > 280 else _reasoning
+            logger.info(f"[GEMINI REASONING] {preview}")
+        if _confidence:
+            logger.info(f"[GEMINI CONFIDENCE] self-rated={_confidence}")
         applied = {}
         # Prepare pnl_context for structured logging (same for all changes)
         pnl_context = {
@@ -489,10 +589,27 @@ GROUP 25: Time-Stop — liquidate dead trades
         # FIX #29: Collect all changes into staging dict first, apply atomically at end.
         # This prevents CONFIG from being half-modified if parsing fails midway.
         staged_changes = {}  # key -> clamped_value
+        # PROMPT-V2.1: apply confidence-based step scaling
+        # Gemini's self-rated confidence shrinks the effective step size for
+        # low-confidence proposals. High stays full, medium halves the step
+        # (relative to current_val), low quarters it. Prevents Gemini's hedged
+        # guesses from moving parameters as much as confident prescriptions.
+        confidence_scale_map = {'high': 1.0, 'medium': 0.5, 'low': 0.25}
+        conf_scale = confidence_scale_map.get(str(_confidence).lower(), 1.0) if _confidence else 1.0
+        if conf_scale < 1.0:
+            logger.info(f"[GEMINI CONFIDENCE SCALING] confidence={_confidence} → step×{conf_scale}")
         for key, value in tweaks.get("parameters", {}).items():
             if value is None or key not in current_config:
                 continue
             current_val = current_config.get(key)
+            # Apply confidence-based interpolation before the absolute-bounds clamp.
+            # new_val = current + conf_scale × (proposed - current)
+            # high (1.0) → full move. medium (0.5) → half move. low (0.25) → quarter move.
+            if isinstance(current_val, (int, float)) and conf_scale < 1.0:
+                value = current_val + conf_scale * (value - current_val)
+                # Preserve int type for int params
+                if isinstance(current_val, int):
+                    value = int(round(value))
             if isinstance(current_val, (int, float)):
                 # FIX: Category-aware clamp bounds (was uniform 15% for all params)
                 risk_params = {'RISK_PER_TRADE', 'RISK_PER_TRADE_TRENDING', 'RISK_PER_TRADE_MEAN_REVERTING',
