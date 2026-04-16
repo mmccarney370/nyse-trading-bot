@@ -171,6 +171,11 @@ class TradingBot:
         self.slippage_predictor = SlippagePredictor()
         self.signal_gen.slippage_predictor = self.slippage_predictor
         self.broker.slippage_predictor = self.slippage_predictor  # broker records on fill
+        # EQ-SCORE: Daily execution-quality scorecard (aggregates gate/reject telemetry)
+        from strategy.execution_scorecard import ExecutionScorecard
+        self.execution_scorecard = ExecutionScorecard()
+        self.signal_gen.execution_scorecard = self.execution_scorecard
+        self.broker.execution_scorecard = self.execution_scorecard
     def _load_regime_cache(self):
         # FIX (Apr 16 gap #3): Regime detection code now uses S2 ensemble (slope +
         # ADX + autocorr + range + HMM). Old cache entries were produced by the
@@ -860,6 +865,7 @@ class TradingBot:
             asyncio.create_task(self._universe_update_task(), name='universe'),
             asyncio.create_task(self.gemini_scheduled_task(), name='gemini'),
             asyncio.create_task(self.ppo_nightly_retrain_task(), name='ppo_nightly'),
+            asyncio.create_task(self._execution_scorecard_task(), name='eq_score'),
         ]
         # Critical tasks that must be restarted if they crash
         critical_task_names = {'trading', 'monitor', 'data_stream', 'trade_stream'}
@@ -1314,6 +1320,52 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Gemini + Causal task failed: {e}", exc_info=True)
                 await asyncio.sleep(300)
+    async def _execution_scorecard_task(self):
+        """EQ-SCORE: Emit the daily execution-quality scorecard shortly after market close.
+        Runs at 16:30 ET on trading days, ~30 min after the bell. Also flushes
+        on shutdown via __aexit__ semantics (naturally cleaned by task cancel)."""
+        logger.info("Execution-scorecard daily emit scheduled — 16:30 ET on trading days")
+        while True:
+            try:
+                tz_et = tz.gettz('America/New_York')
+                now = datetime.now(tz_et)
+                target = now.replace(hour=16, minute=30, second=0, microsecond=0)
+                if now >= target:
+                    target += timedelta(days=1)
+                while target.weekday() >= 5:
+                    target += timedelta(days=1)
+                sleep_seconds = (target - now).total_seconds()
+                await asyncio.sleep(sleep_seconds)
+                logger.info("=== Emitting EQ-SCORE daily scorecard ===")
+                # Build a snapshot of current live state
+                try:
+                    snapshot = {
+                        "equity": float(await asyncio.to_thread(self.broker.get_equity) or 0.0),
+                        "open_positions": len(await asyncio.to_thread(self.broker.get_positions_dict) or {}),
+                        "portfolio_size": len(self.config.get('SYMBOLS', [])),
+                    }
+                    # Append Bayesian posterior snapshot if available
+                    if hasattr(self, 'bayesian_sizer') and self.bayesian_sizer:
+                        snapshot["bayesian_posterior"] = self.bayesian_sizer.snapshot()
+                except Exception as e:
+                    snapshot = {"snapshot_error": str(e)}
+                if hasattr(self, 'execution_scorecard') and self.execution_scorecard:
+                    try:
+                        await asyncio.to_thread(self.execution_scorecard.emit, snapshot)
+                    except Exception as e:
+                        logger.error(f"[EQ-SCORE] emit failed: {e}", exc_info=True)
+            except asyncio.CancelledError:
+                # Flush one last time on clean shutdown
+                try:
+                    if hasattr(self, 'execution_scorecard') and self.execution_scorecard:
+                        self.execution_scorecard.emit({"reason": "shutdown"})
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                logger.error(f"[EQ-SCORE] task failed: {e}", exc_info=True)
+                await asyncio.sleep(300)
+
     async def ppo_nightly_retrain_task(self):
         logger.info("PPO nightly retrain task scheduled — will run daily at 6:00 PM ET")
         while True:

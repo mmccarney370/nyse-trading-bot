@@ -1051,6 +1051,15 @@ class SignalGenerator:
                             mult = cs_mults.get(sym, 1.0)
                             blended = 1.0 + cs_weight * (mult - 1.0)
                             target_weights[sym] *= blended
+                            # EQ-SCORE: track tercile placement
+                            if getattr(self, 'execution_scorecard', None):
+                                try:
+                                    raw_mult = cs_mults.get(sym, 1.0)
+                                    tercile = ('top' if raw_mult > 1.1
+                                               else ('bottom' if raw_mult < 0.9 else 'mid'))
+                                    self.execution_scorecard.record_cs_tercile(sym, tercile)
+                                except Exception:
+                                    pass
                 except Exception as e:
                     logger.debug(f"[CS-MOMENTUM] skipped ({e})")
             # === BPS: BAYESIAN PER-SYMBOL SIZING ===
@@ -1104,9 +1113,14 @@ class SignalGenerator:
                         min_mult=self.config.get('LIQUIDITY_MIN_MULT', 0.3),
                         extended_hours_factor=self.config.get('LIQUIDITY_EH_FACTOR', 5.0),
                     )
-                    for sym, (mult, _part, _reason) in liq_mults.items():
+                    for sym, (mult, part, _reason) in liq_mults.items():
                         if mult < 0.995 and sym in target_weights:
                             target_weights[sym] *= mult
+                            if getattr(self, 'execution_scorecard', None):
+                                try:
+                                    self.execution_scorecard.record_liquidity_scale(sym, part)
+                                except Exception:
+                                    pass
                     _liq_log(liq_mults)
                 except Exception as e:
                     logger.debug(f"[LIQ] skipped ({e})")
@@ -1227,6 +1241,11 @@ class SignalGenerator:
                             gate_mult *= self.config.get('SLIPPAGE_VETO_SCALE', 0.3)
                             gate_reasons.append(f"SLIP({slip_reason})")
                             logger.info(f"{sym} SLIPPAGE-VETO: {slip_reason} — scaling weight")
+                            if getattr(self, 'execution_scorecard', None):
+                                try:
+                                    self.execution_scorecard.record_slippage_veto(sym, pred_bps)
+                                except Exception:
+                                    pass
                     except Exception as e:
                         logger.debug(f"{sym} slippage veto error: {e}")
                 # === PSD: PPO/STACKING DIVERGENCE GATE ===
@@ -1270,6 +1289,11 @@ class SignalGenerator:
                                                 gate_mult *= dmult
                                                 gate_reasons.append(f"DIVERGE({meta_signed_d:+.2f})")
                                                 logger.info(f"{sym} DIVERGENCE: PPO_dir={direction} vs meta_signed={meta_signed_d:+.2f} — scaling ×{dmult}")
+                                                if getattr(self, 'execution_scorecard', None):
+                                                    try:
+                                                        self.execution_scorecard.record_divergence(sym)
+                                                    except Exception:
+                                                        pass
                     except Exception as e:
                         logger.debug(f"{sym} divergence gate error: {e}")
                 # === B2: ADVERSE-SELECTION (FILL TOXICITY) GATE ===
@@ -1306,6 +1330,11 @@ class SignalGenerator:
                             gate_mult = 0.0
                             gate_reasons.append(f"EARNINGS({reason})")
                             logger.info(f"{sym} EARNINGS BLACKOUT — blocking new entry ({reason})")
+                            if getattr(self, 'execution_scorecard', None):
+                                try:
+                                    self.execution_scorecard.record_earnings_blackout(sym)
+                                except Exception:
+                                    pass
                     except Exception as e:
                         logger.debug(f"{sym} earnings gate error: {e}")
                 # === S1: META-LABEL GATE ===
@@ -1346,6 +1375,11 @@ class SignalGenerator:
                                 gate_mult = 0.0
                                 gate_reasons.append(f"META-REJECT({mprob:.2f}<{meta_min_prob:.2f})")
                                 logger.info(f"{sym} META-FILTER: P(win)={mprob:.3f} < {meta_min_prob:.2f} — REJECTED")
+                            if getattr(self, 'execution_scorecard', None):
+                                try:
+                                    self.execution_scorecard.record_meta_reject(sym, mprob)
+                                except Exception:
+                                    pass
                         else:
                             logger.debug(f"{sym} META-FILTER: P(win)={mprob:.3f} ≥ {meta_min_prob:.2f} — accept")
                     except Exception as e:
@@ -1414,6 +1448,14 @@ class SignalGenerator:
                 scale = max_leverage / abs_sum
                 target_weights = {sym: w * scale for sym, w in target_weights.items()}
             logger.info(f"Portfolio PPO actions (post-gate): {target_weights}")
+            # EQ-SCORE: record this cycle + regimes for daily scorecard
+            if getattr(self, 'execution_scorecard', None):
+                try:
+                    regime_snapshot = {s: self.regime_cache.get(s, ('mean_reverting', 0.5))
+                                        for s in target_weights.keys()}
+                    self.execution_scorecard.record_cycle(regime_snapshot)
+                except Exception:
+                    pass
             logger.debug("========== PORTFOLIO PPO DEBUG END ==========")
             return target_weights
         except Exception as e:

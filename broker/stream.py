@@ -137,6 +137,12 @@ class TradeStreamHandler:
             if group.entry_price:  # limit_price stored temporarily
                 group.slippage = abs(fill_price - group.entry_price) / group.entry_price
 
+            # EQ-SCORE: record entry fill
+            if hasattr(self.broker, 'execution_scorecard') and self.broker.execution_scorecard:
+                try:
+                    self.broker.execution_scorecard.record_entry_filled(symbol)
+                except Exception:
+                    pass
             # B2: Adverse-selection — record this fill for post-fill drift tracking
             if hasattr(self.broker, 'adverse_selection') and self.broker.adverse_selection:
                 try:
