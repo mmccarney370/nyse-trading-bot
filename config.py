@@ -419,6 +419,20 @@ class TradingBotConfig(BaseModel):
     RETRAIN_GUARD_VALIDATION_STEPS: int = 500   # env steps for deterministic rollout
     RETRAIN_GUARD_MIN_DROP: float = 0.002       # need >0.002 abs mean-reward/step drop
     RETRAIN_GUARD_REL_DROP: float = 0.20        # AND >20% relative drop
+    # ==================== A4: Pre-Market PPO Micro-Retrain ====================
+    # A lighter retrain that fires at 08:30 ET (1 hr before market open). Adapts
+    # the model to overnight news/futures moves using just the most recent bars.
+    # Strictly gated by RETRAIN-GUARD with tighter thresholds than the 18:00 run.
+    # Much smaller than the nightly 100K retrain — 5K timesteps, LR=1e-5, recent-bars only.
+    PPO_MICRO_RETRAIN_ENABLED: bool = True
+    PPO_MICRO_RETRAIN_HOUR: int = 8             # ET hour for pre-market fire
+    PPO_MICRO_RETRAIN_MINUTE: int = 30
+    PPO_MICRO_RETRAIN_TIMESTEPS: int = 5000     # 20× smaller than nightly
+    PPO_MICRO_RETRAIN_LR: float = 1e-5           # 5× smaller than nightly online LR
+    PPO_MICRO_RETRAIN_BARS: int = 500            # last-N bars only (recency-focused)
+    PPO_MICRO_RETRAIN_VALIDATION_STEPS: int = 300  # fewer than nightly — faster
+    PPO_MICRO_RETRAIN_MIN_DROP: float = 0.0015  # stricter than nightly
+    PPO_MICRO_RETRAIN_REL_DROP: float = 0.15    # stricter 15% relative
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty

@@ -386,6 +386,13 @@ GROUP 23: Retrain-Guard (RG) — rollback if nightly retrain degrades model
   RETRAIN_GUARD_MIN_DROP         [0.0005 – 0.01] current: {current_config.get('RETRAIN_GUARD_MIN_DROP')}
   RETRAIN_GUARD_REL_DROP         [0.10 – 0.40]   current: {current_config.get('RETRAIN_GUARD_REL_DROP')}
 
+GROUP 24: Pre-Market Micro-Retrain (A4) — adapt to overnight news before open
+  PPO_MICRO_RETRAIN_TIMESTEPS  [2000 – 10000]  current: {current_config.get('PPO_MICRO_RETRAIN_TIMESTEPS')}
+  PPO_MICRO_RETRAIN_LR         [5e-6 – 5e-5]   current: {current_config.get('PPO_MICRO_RETRAIN_LR')}
+  PPO_MICRO_RETRAIN_BARS       [200 – 1000]    current: {current_config.get('PPO_MICRO_RETRAIN_BARS')}
+  PPO_MICRO_RETRAIN_MIN_DROP   [0.0005 – 0.005] current: {current_config.get('PPO_MICRO_RETRAIN_MIN_DROP')}
+  PPO_MICRO_RETRAIN_REL_DROP   [0.08 – 0.30]    current: {current_config.get('PPO_MICRO_RETRAIN_REL_DROP')}
+
 === CONSTRAINTS ===
 1. HEALTHY systems get NO changes or at most 2 minor tweaks. Do NOT fix what is working.
 2. Maximum 6 parameter changes per cycle. Focused, high-conviction changes only.
@@ -526,6 +533,9 @@ GROUP 23: Retrain-Guard (RG) — rollback if nightly retrain degrades model
                     'LIQUIDITY_MIN_MULT', 'LIQUIDITY_EH_FACTOR',
                     'RETRAIN_GUARD_VALIDATION_STEPS', 'RETRAIN_GUARD_MIN_DROP',
                     'RETRAIN_GUARD_REL_DROP',
+                    'PPO_MICRO_RETRAIN_TIMESTEPS', 'PPO_MICRO_RETRAIN_LR',
+                    'PPO_MICRO_RETRAIN_BARS', 'PPO_MICRO_RETRAIN_MIN_DROP',
+                    'PPO_MICRO_RETRAIN_REL_DROP',
                 }
                 if key in risk_params:
                     pct_bound = 0.20
@@ -668,6 +678,12 @@ GROUP 23: Retrain-Guard (RG) — rollback if nightly retrain degrades model
                     'RETRAIN_GUARD_VALIDATION_STEPS': (200, 1000),
                     'RETRAIN_GUARD_MIN_DROP': (0.0005, 0.01),
                     'RETRAIN_GUARD_REL_DROP': (0.10, 0.40),
+                    # NEW — A4 Pre-market micro-retrain
+                    'PPO_MICRO_RETRAIN_TIMESTEPS': (2000, 10000),
+                    'PPO_MICRO_RETRAIN_LR': (5e-6, 5e-5),
+                    'PPO_MICRO_RETRAIN_BARS': (200, 1000),
+                    'PPO_MICRO_RETRAIN_MIN_DROP': (0.0005, 0.005),
+                    'PPO_MICRO_RETRAIN_REL_DROP': (0.08, 0.30),
                 }
                 if key in ABSOLUTE_BOUNDS:
                     abs_min, abs_max = ABSOLUTE_BOUNDS[key]

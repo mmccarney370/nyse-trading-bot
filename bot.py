@@ -870,6 +870,7 @@ class TradingBot:
             asyncio.create_task(self._universe_update_task(), name='universe'),
             asyncio.create_task(self.gemini_scheduled_task(), name='gemini'),
             asyncio.create_task(self.ppo_nightly_retrain_task(), name='ppo_nightly'),
+            asyncio.create_task(self._ppo_micro_retrain_task(), name='ppo_micro'),
             asyncio.create_task(self._execution_scorecard_task(), name='eq_score'),
         ]
         # Critical tasks that must be restarted if they crash
@@ -1325,6 +1326,46 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Gemini + Causal task failed: {e}", exc_info=True)
                 await asyncio.sleep(300)
+    async def _ppo_micro_retrain_task(self):
+        """A4 — Pre-market micro-retrain at 08:30 ET. Adapts PPO to overnight
+        market moves (news, futures, earnings reactions) before market open
+        at 09:30. 5K timesteps on the last 500 bars, LR=1e-5. Wrapped in
+        RETRAIN-GUARD with stricter thresholds than the 18:00 nightly.
+
+        Rollback-safe: if the micro-update degrades validation score, we
+        restore the pre-update weights automatically."""
+        if not CONFIG.get('PPO_MICRO_RETRAIN_ENABLED', True):
+            logger.info("[MICRO-RETRAIN] Disabled via config — task idle")
+            return
+        logger.info("PPO micro-retrain task scheduled — will run daily at 08:30 ET (pre-market)")
+        while True:
+            try:
+                tz_et = tz.gettz('America/New_York')
+                now = datetime.now(tz_et)
+                hr = CONFIG.get('PPO_MICRO_RETRAIN_HOUR', 8)
+                mn = CONFIG.get('PPO_MICRO_RETRAIN_MINUTE', 30)
+                target = now.replace(hour=hr, minute=mn, second=0, microsecond=0)
+                if now >= target:
+                    target += timedelta(days=1)
+                # Skip weekends
+                while target.weekday() >= 5:
+                    target += timedelta(days=1)
+                sleep_seconds = (target - now).total_seconds()
+                logger.info(f"[MICRO-RETRAIN] Next run scheduled for {target.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                            f"({sleep_seconds/3600:.1f} hours)")
+                await asyncio.sleep(sleep_seconds)
+                if not self.portfolio_ppo:
+                    logger.debug("[MICRO-RETRAIN] portfolio_ppo disabled — skip")
+                    continue
+                logger.info("=== Starting Pre-Market Micro-Retrain at 08:30 ET ===")
+                result = await asyncio.to_thread(self.trainer.micro_retrain_portfolio)
+                logger.info(f"[MICRO-RETRAIN] Result: {result}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[MICRO-RETRAIN] Task failed: {e}", exc_info=True)
+                await asyncio.sleep(300)
+
     async def _execution_scorecard_task(self):
         """EQ-SCORE: Emit the daily execution-quality scorecard shortly after market close.
         Runs at 16:30 ET on trading days, ~30 min after the bell. Also flushes

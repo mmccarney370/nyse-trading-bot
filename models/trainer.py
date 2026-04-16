@@ -4,7 +4,7 @@ import logging
 import os
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 from optuna.samplers import TPESampler
@@ -829,6 +829,154 @@ class Trainer:
                     logger.info(f"[RETRAIN-GUARD] Training failed — restored previous model from backup")
                 except Exception as restore_err:
                     logger.error(f"[RETRAIN-GUARD] Backup restore also failed: {restore_err}")
+
+    def micro_retrain_portfolio(self, timesteps: Optional[int] = None,
+                                 recent_bars: Optional[int] = None,
+                                 learning_rate: Optional[float] = None) -> Dict:
+        """A4 — Pre-market micro-retrain.
+
+        Lighter version of `update_portfolio_weights`:
+          - Much fewer timesteps (default 5K vs 100K)
+          - Smaller LR (default 1e-5 vs 5e-5)
+          - Uses only the last N bars (default 500 vs ~5000)
+          - Wrapped in RETRAIN-GUARD with STRICTER thresholds (small update
+            should have small variance — if it still degrades materially,
+            rollback aggressively)
+
+        Runs at 08:30 ET (pre-market) to adapt overnight.
+        Returns dict with decision + scores.
+        """
+        import shutil as _shutil
+        result = {"status": "skipped", "reason": "unknown"}
+
+        if self.portfolio_ppo_model is None:
+            result["reason"] = "no_portfolio_model"
+            return result
+
+        symbols = self.config.get('SYMBOLS', [])
+        if not symbols:
+            result["reason"] = "no_symbols"
+            return result
+
+        timesteps = timesteps or CONFIG.get('PPO_MICRO_RETRAIN_TIMESTEPS', 5000)
+        recent_bars = recent_bars or CONFIG.get('PPO_MICRO_RETRAIN_BARS', 500)
+        learning_rate = learning_rate or CONFIG.get('PPO_MICRO_RETRAIN_LR', 1e-5)
+
+        # Fetch recent data only — recency-focused update
+        data_dict = {}
+        for sym in symbols:
+            data = self.data_ingestion.get_latest_data(sym)
+            if data is None or len(data) < recent_bars + 50:
+                result["reason"] = f"insufficient_data_for_{sym}"
+                return result
+            # Tail to most-recent `recent_bars` — narrow window drives adaptation
+            data_dict[sym] = data.tail(recent_bars)
+
+        # RETRAIN-GUARD (stricter than nightly)
+        guard_enabled = CONFIG.get('RETRAIN_GUARD_ENABLED', True)
+        model_path = os.path.join("ppo_checkpoints", "portfolio", "ppo_model.zip")
+        backup_path = os.path.join("ppo_checkpoints", "portfolio", "ppo_model_micro_prev.zip")
+        baseline_score = None
+        backup_created = False
+        if guard_enabled and os.path.exists(model_path):
+            try:
+                _shutil.copy2(model_path, backup_path)
+                backup_created = True
+                logger.info(f"[MICRO-RETRAIN GUARD] Checkpointed to {backup_path}")
+            except Exception as e:
+                logger.warning(f"[MICRO-RETRAIN GUARD] Backup failed ({e})")
+
+        try:
+            # Build micro-training env over recent-bars-only window
+            env = DummyVecEnv([lambda: Monitor(PortfolioEnv(
+                data_dict=data_dict,
+                symbols=symbols,
+                initial_balance=self.config.get('INITIAL_BALANCE', 100_000.0),
+                max_leverage=self.config.get('MAX_LEVERAGE', 3.0)
+            ))])
+            new_vec_env = VecNormalize(env, norm_obs=True, norm_reward=True)
+            if self.portfolio_vec_norm is not None:
+                new_vec_env.obs_rms = self.portfolio_vec_norm.obs_rms
+                new_vec_env.ret_rms = self.portfolio_vec_norm.ret_rms
+
+            model = self.portfolio_ppo_model
+            model.set_env(new_vec_env)
+            original_lr = model.learning_rate
+            model.learning_rate = learning_rate
+
+            # Stricter validation thresholds for micro-retrain — tiny update so
+            # any meaningful drop should trigger rollback
+            guard_val_steps = CONFIG.get('PPO_MICRO_RETRAIN_VALIDATION_STEPS', 300)
+            if guard_enabled:
+                baseline_score = self._validate_portfolio_model(model, new_vec_env, n_steps=guard_val_steps)
+                logger.info(f"[MICRO-RETRAIN GUARD] Baseline: {baseline_score:+.5f} mean-r/step")
+
+            logger.info(f"[MICRO-RETRAIN] Starting {timesteps} timesteps at LR={learning_rate} "
+                        f"over last {recent_bars} bars")
+            nan_cb = NaNStopCallback()
+            profit_cb = ProfitLoggingCallback()
+            aux_cb = AuxVolatilityCallback() if CONFIG.get('PPO_AUX_TASK', True) else None
+            callbacks = [nan_cb, profit_cb] + ([aux_cb] if aux_cb else [])
+            model.learn(total_timesteps=timesteps, callback=callbacks, reset_num_timesteps=False)
+            model.learning_rate = original_lr
+            self.portfolio_vec_norm = new_vec_env
+
+            # Save new weights
+            save_ppo_model(self, "portfolio")
+            logger.info("[MICRO-RETRAIN] Training completed and saved")
+
+            # Validate + rollback if worse
+            if guard_enabled and baseline_score is not None and backup_created:
+                import json as _json
+                post_score = self._validate_portfolio_model(model, new_vec_env, n_steps=guard_val_steps)
+                min_drop = CONFIG.get('PPO_MICRO_RETRAIN_MIN_DROP', 0.0015)   # stricter
+                rel_drop = CONFIG.get('PPO_MICRO_RETRAIN_REL_DROP', 0.15)    # stricter 15%
+                abs_delta = post_score - baseline_score
+                rel_delta = abs_delta / (abs(baseline_score) + 1e-9)
+                degraded = (abs_delta < -min_drop) and (rel_delta < -rel_drop)
+                decision = "ROLLBACK" if degraded else "ACCEPT"
+                logger.info(f"[MICRO-RETRAIN GUARD] Post: {post_score:+.5f} "
+                            f"(base {baseline_score:+.5f}, Δ={abs_delta:+.5f}, "
+                            f"rel={rel_delta:+.2%}) — {decision}")
+                logger.info(_json.dumps({
+                    "event": "micro_retrain_guard_decision",
+                    "baseline_score": baseline_score,
+                    "post_score": post_score,
+                    "abs_delta": abs_delta,
+                    "rel_delta": rel_delta,
+                    "decision": decision,
+                }))
+                result.update({
+                    "baseline_score": baseline_score,
+                    "post_score": post_score,
+                    "decision": decision,
+                    "status": "completed",
+                })
+                if degraded:
+                    logger.warning(f"[MICRO-RETRAIN GUARD] Rolling back — micro-update hurt")
+                    _shutil.copy2(backup_path, model_path)
+                    from .ppo_utils import load_ppo_model
+                    load_ppo_model(self, "portfolio")
+                    if self.portfolio_vec_norm is not None:
+                        self.portfolio_vec_norm.training = False
+                    logger.info(f"[MICRO-RETRAIN GUARD] ✅ Rollback complete")
+                else:
+                    logger.info(f"[MICRO-RETRAIN GUARD] ✅ Accepted")
+            else:
+                result["status"] = "completed_no_guard"
+            return result
+        except Exception as e:
+            logger.error(f"[MICRO-RETRAIN] Failed: {e}", exc_info=True)
+            result.update({"status": "failed", "error": str(e)})
+            if guard_enabled and backup_created:
+                try:
+                    _shutil.copy2(backup_path, model_path)
+                    from .ppo_utils import load_ppo_model
+                    load_ppo_model(self, "portfolio")
+                    logger.info("[MICRO-RETRAIN GUARD] Training failed — restored backup")
+                except Exception as re:
+                    logger.error(f"[MICRO-RETRAIN GUARD] Restore failed: {re}")
+            return result
 
     def initialize_models(self, symbols: list):
         for symbol in symbols:
