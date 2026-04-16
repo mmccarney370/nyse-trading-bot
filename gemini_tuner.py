@@ -393,6 +393,11 @@ GROUP 24: Pre-Market Micro-Retrain (A4) — adapt to overnight news before open
   PPO_MICRO_RETRAIN_MIN_DROP   [0.0005 – 0.005] current: {current_config.get('PPO_MICRO_RETRAIN_MIN_DROP')}
   PPO_MICRO_RETRAIN_REL_DROP   [0.08 – 0.30]    current: {current_config.get('PPO_MICRO_RETRAIN_REL_DROP')}
 
+GROUP 25: Time-Stop — liquidate dead trades
+  TIME_STOP_THRESHOLD_BARS  [48 – 192]    current: {current_config.get('TIME_STOP_THRESHOLD_BARS')}
+  TIME_STOP_MFE_CEILING     [0.002 – 0.015] current: {current_config.get('TIME_STOP_MFE_CEILING')}
+  TIME_STOP_MAE_FLOOR       [-0.015 – -0.002] current: {current_config.get('TIME_STOP_MAE_FLOOR')}
+
 === CONSTRAINTS ===
 1. HEALTHY systems get NO changes or at most 2 minor tweaks. Do NOT fix what is working.
 2. Maximum 6 parameter changes per cycle. Focused, high-conviction changes only.
@@ -536,6 +541,8 @@ GROUP 24: Pre-Market Micro-Retrain (A4) — adapt to overnight news before open
                     'PPO_MICRO_RETRAIN_TIMESTEPS', 'PPO_MICRO_RETRAIN_LR',
                     'PPO_MICRO_RETRAIN_BARS', 'PPO_MICRO_RETRAIN_MIN_DROP',
                     'PPO_MICRO_RETRAIN_REL_DROP',
+                    'TIME_STOP_THRESHOLD_BARS', 'TIME_STOP_MFE_CEILING',
+                    'TIME_STOP_MAE_FLOOR',
                 }
                 if key in risk_params:
                     pct_bound = 0.20
@@ -684,6 +691,10 @@ GROUP 24: Pre-Market Micro-Retrain (A4) — adapt to overnight news before open
                     'PPO_MICRO_RETRAIN_BARS': (200, 1000),
                     'PPO_MICRO_RETRAIN_MIN_DROP': (0.0005, 0.005),
                     'PPO_MICRO_RETRAIN_REL_DROP': (0.08, 0.30),
+                    # NEW — TIME-STOP
+                    'TIME_STOP_THRESHOLD_BARS': (48, 192),
+                    'TIME_STOP_MFE_CEILING': (0.002, 0.015),
+                    'TIME_STOP_MAE_FLOOR': (-0.015, -0.002),
                 }
                 if key in ABSOLUTE_BOUNDS:
                     abs_min, abs_max = ABSOLUTE_BOUNDS[key]

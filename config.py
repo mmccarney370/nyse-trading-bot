@@ -433,6 +433,15 @@ class TradingBotConfig(BaseModel):
     PPO_MICRO_RETRAIN_VALIDATION_STEPS: int = 300  # fewer than nightly — faster
     PPO_MICRO_RETRAIN_MIN_DROP: float = 0.0015  # stricter than nightly
     PPO_MICRO_RETRAIN_REL_DROP: float = 0.15    # stricter 15% relative
+    # ==================== TIME-STOP: Dead Trade Liquidation ====================
+    # Close positions that have been held past THRESHOLD_BARS without meaningful
+    # excursion in EITHER direction (both MFE and MAE stayed small). Such trades
+    # are "dead" — thesis not playing out, capital tied up for nothing.
+    # Frees slot for a better opportunity.
+    TIME_STOP_ENABLED: bool = True
+    TIME_STOP_THRESHOLD_BARS: int = 96           # held ≥96 bars (≈24 RTH hours)
+    TIME_STOP_MFE_CEILING: float = 0.005         # never went +0.5% up
+    TIME_STOP_MAE_FLOOR: float = -0.005          # never went -0.5% down
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty

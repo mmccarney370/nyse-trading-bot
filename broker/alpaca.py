@@ -1040,6 +1040,31 @@ class AlpacaBroker:
             f"held {int(bars_held)} bars (min {min_hold}) | regime={regime}"
         )
 
+        # === TIME-STOP: Liquidate dead trades ===
+        # A position held long past its minimum hold AND with zero meaningful
+        # excursion (MFE tiny, MAE tiny) is a "dead trade" — thesis isn't playing
+        # out either way. Free the capital for a better opportunity.
+        if (self.config.get('TIME_STOP_ENABLED', True)
+                and tracked_group is not None
+                and tracked_group.state == GroupState.OPEN
+                and bars_held >= self.config.get('TIME_STOP_THRESHOLD_BARS', 96)):
+            mfe = float(getattr(tracked_group, 'max_favorable_pct', 0.0))
+            mae = float(getattr(tracked_group, 'max_adverse_pct', 0.0))
+            mfe_ceiling = self.config.get('TIME_STOP_MFE_CEILING', 0.005)   # 0.5%
+            mae_floor = self.config.get('TIME_STOP_MAE_FLOOR', -0.005)       # -0.5%
+            # Dead trade: never went meaningfully green AND never went meaningfully red
+            if abs(mfe) < mfe_ceiling and abs(mae) < abs(mae_floor):
+                logger.warning(
+                    f"[TIME-STOP] {sym} DEAD TRADE — held {int(bars_held)} bars, "
+                    f"MFE={mfe*100:+.2f}%, MAE={mae*100:+.2f}% — liquidating to free capital"
+                )
+                try:
+                    await asyncio.to_thread(self.client.close_position, sym)
+                    logger.info(f"[TIME-STOP] {sym} position closed (dead trade liquidation)")
+                    return  # Skip rest of monitoring for this position — it's closed
+                except Exception as e:
+                    logger.error(f"[TIME-STOP] {sym} close failed: {e}")
+
         # === Recover PENDING_EXIT groups stuck longer than 60s ===
         group = tracked_group  # FIX #8: use local snapshot
         if group and group.state == GroupState.PENDING_EXIT:
