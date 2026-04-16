@@ -375,6 +375,12 @@ GROUP 21: Regime-Conditional Exits (REX) — differentiated TP/trail by alignmen
   REX_MR_TP_MULT       [0.65 – 1.00]  current: {current_config.get('REX_MR_TP_MULT')}
   REX_MR_TRAIL_MULT    [0.75 – 1.05]  current: {current_config.get('REX_MR_TRAIL_MULT')}
 
+GROUP 22: Liquidity Scaling (LIQ) — avoid trading > 1% of ADV
+  LIQUIDITY_WARN_THRESHOLD  [0.0005 – 0.005]  current: {current_config.get('LIQUIDITY_WARN_THRESHOLD')}
+  LIQUIDITY_HARD_THRESHOLD  [0.003 – 0.03]    current: {current_config.get('LIQUIDITY_HARD_THRESHOLD')}
+  LIQUIDITY_MIN_MULT        [0.15 – 0.60]     current: {current_config.get('LIQUIDITY_MIN_MULT')}
+  LIQUIDITY_EH_FACTOR       [2.0 – 10.0]      current: {current_config.get('LIQUIDITY_EH_FACTOR')}
+
 === CONSTRAINTS ===
 1. HEALTHY systems get NO changes or at most 2 minor tweaks. Do NOT fix what is working.
 2. Maximum 6 parameter changes per cycle. Focused, high-conviction changes only.
@@ -511,6 +517,8 @@ GROUP 21: Regime-Conditional Exits (REX) — differentiated TP/trail by alignmen
                     'REX_ALIGN_TP_MULT', 'REX_ALIGN_TRAIL_MULT',
                     'REX_OPPOSE_TP_MULT', 'REX_OPPOSE_TRAIL_MULT',
                     'REX_MR_TP_MULT', 'REX_MR_TRAIL_MULT',
+                    'LIQUIDITY_WARN_THRESHOLD', 'LIQUIDITY_HARD_THRESHOLD',
+                    'LIQUIDITY_MIN_MULT', 'LIQUIDITY_EH_FACTOR',
                 }
                 if key in risk_params:
                     pct_bound = 0.20
@@ -644,6 +652,11 @@ GROUP 21: Regime-Conditional Exits (REX) — differentiated TP/trail by alignmen
                     'REX_OPPOSE_TRAIL_MULT': (0.55, 0.95),
                     'REX_MR_TP_MULT': (0.65, 1.00),
                     'REX_MR_TRAIL_MULT': (0.75, 1.05),
+                    # NEW — LIQ liquidity scaling
+                    'LIQUIDITY_WARN_THRESHOLD': (0.0005, 0.005),
+                    'LIQUIDITY_HARD_THRESHOLD': (0.003, 0.03),
+                    'LIQUIDITY_MIN_MULT': (0.15, 0.60),
+                    'LIQUIDITY_EH_FACTOR': (2.0, 10.0),
                 }
                 if key in ABSOLUTE_BOUNDS:
                     abs_min, abs_max = ABSOLUTE_BOUNDS[key]

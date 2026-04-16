@@ -400,6 +400,15 @@ class TradingBotConfig(BaseModel):
     REX_OPPOSE_TRAIL_MULT: float = 0.75  # Short in uptrend: trail ×0.75 (tight stop)
     REX_MR_TP_MULT: float = 0.85         # Mean-reverting: TP ×0.85 (fast profit)
     REX_MR_TRAIL_MULT: float = 0.92      # Mean-reverting: trail ×0.92 (modest tighten)
+    # ==================== LIQ: Liquidity-Scaled Sizing ====================
+    # Scale down weights when position notional > small % of symbol's ADV.
+    # Prevents market-impact slippage as equity grows or in thin-liquidity tickers.
+    # Extended hours (pre/post market) tightens thresholds by EH_FACTOR.
+    LIQUIDITY_SCALER_ENABLED: bool = True
+    LIQUIDITY_WARN_THRESHOLD: float = 0.001   # 0.1% of ADV → no scaling
+    LIQUIDITY_HARD_THRESHOLD: float = 0.01    # 1.0% of ADV → floor min_mult
+    LIQUIDITY_MIN_MULT: float = 0.3           # floor when hard-threshold breached
+    LIQUIDITY_EH_FACTOR: float = 5.0          # extended-hours thresholds / 5
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty

@@ -1085,6 +1085,31 @@ class SignalGenerator:
                         logger.info(f"[BAYESIAN-SIZE] {' | '.join(bps_parts)}")
                 except Exception as e:
                     logger.debug(f"[BAYESIAN-SIZE] skipped ({e})")
+            # === LIQ: LIQUIDITY-SCALED SIZING ===
+            # Scale weights DOWN if our position notional starts to rival the
+            # symbol's avg daily volume (>1% of ADV → market impact becomes material).
+            # Extended-hours thresholds are 5× tighter since volume is thinner.
+            if self.config.get('LIQUIDITY_SCALER_ENABLED', True):
+                try:
+                    from strategy.liquidity_scaler import (
+                        compute_liquidity_multipliers,
+                        log_summary as _liq_log,
+                    )
+                    liq_mults = compute_liquidity_multipliers(
+                        target_weights,
+                        data_dict,
+                        equity=current_equity,
+                        warn_threshold=self.config.get('LIQUIDITY_WARN_THRESHOLD', 0.001),
+                        hard_threshold=self.config.get('LIQUIDITY_HARD_THRESHOLD', 0.01),
+                        min_mult=self.config.get('LIQUIDITY_MIN_MULT', 0.3),
+                        extended_hours_factor=self.config.get('LIQUIDITY_EH_FACTOR', 5.0),
+                    )
+                    for sym, (mult, _part, _reason) in liq_mults.items():
+                        if mult < 0.995 and sym in target_weights:
+                            target_weights[sym] *= mult
+                    _liq_log(liq_mults)
+                except Exception as e:
+                    logger.debug(f"[LIQ] skipped ({e})")
             # === AC: CROWDING DISCOUNT ===
             # When multiple same-direction positions are highly correlated, the book
             # is effectively one big bet. Discount each position by its average
