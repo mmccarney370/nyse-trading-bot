@@ -1059,11 +1059,17 @@ class AlpacaBroker:
                     f"MFE={mfe*100:+.2f}%, MAE={mae*100:+.2f}% — liquidating to free capital"
                 )
                 try:
-                    await asyncio.to_thread(self.client.close_position, sym)
-                    logger.info(f"[TIME-STOP] {sym} position closed (dead trade liquidation)")
+                    # FIX: Must cancel trailing stop FIRST — client.close_position()
+                    # fails when qty is reserved by an active exit order.
+                    # close_position_safely() handles the cancel-then-close dance.
+                    ok = await self.close_position_safely(sym)
+                    if ok:
+                        logger.info(f"[TIME-STOP] {sym} position closed (dead trade liquidation)")
+                    else:
+                        logger.warning(f"[TIME-STOP] {sym} safe-close returned False — position may remain")
                     return  # Skip rest of monitoring for this position — it's closed
                 except Exception as e:
-                    logger.error(f"[TIME-STOP] {sym} close failed: {e}")
+                    logger.error(f"[TIME-STOP] {sym} safe-close failed: {e}")
 
         # === Recover PENDING_EXIT groups stuck longer than 60s ===
         group = tracked_group  # FIX #8: use local snapshot
