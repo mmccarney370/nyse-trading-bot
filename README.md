@@ -6,18 +6,19 @@
 ![Causal](https://img.shields.io/badge/Causal_AI-GES_%2B_DoWhy-orange)
 ![Meta-Label](https://img.shields.io/badge/Meta--Label-Lopez_de_Prado-9cf)
 ![Bayesian](https://img.shields.io/badge/Bayesian-Per--Symbol_Sizing-ff69b4)
+![Kelly](https://img.shields.io/badge/Kelly-Fractional_¼-4dc0b5)
 ![Self-Tuning](https://img.shields.io/badge/Self--Tuning-Gemini_2.5_Flash-red)
 ![License](https://img.shields.io/badge/License-MIT-brightgreen)
 
-> A self-improving algorithmic trading system that thinks about **why** it should trade, sizes bets from **what it's actually learned per symbol**, detects when it's being **picked off**, **refuses** entries that would eat their own alpha, and rewrites **100+ of its own parameters** every night — all while running unsupervised against a live broker.
+> A self-improving algorithmic trading system that thinks about **why** it should trade, sizes bets by **Kelly-fractional posteriors per symbol**, adjusts exits to the **current regime direction**, scales down when **position size rivals daily volume**, detects when it's being **picked off**, **refuses** entries that would eat their own alpha, and rewrites **100+ of its own parameters** every night — all while running unsupervised against a live broker.
 
-This isn't a moving-average crossover with extra steps. It's a production-grade stack that fuses **deep reinforcement learning**, **causal inference**, **Bayesian posteriors**, **Lopez-de-Prado meta-labeling**, **ensemble regime detection**, **adverse-selection detection**, and **LLM-powered nightly self-tuning** into a single autonomous trader.
+This isn't a moving-average crossover with extra steps. It's a production-grade stack that fuses **deep reinforcement learning**, **causal inference**, **Kelly-fractional Bayesian sizing**, **Lopez-de-Prado meta-labeling**, **ensemble regime detection**, **regime-conditional exits**, **liquidity-scaled sizing**, **adverse-selection detection**, and **LLM-powered nightly self-tuning** into a single autonomous trader.
 
 ---
 
 ## What Makes This Bot Unique
 
-Nine capabilities you **won't find together** in any open-source trading framework. Each one individually takes a research paper to justify; having all sixteen layers stack multiplicatively is what separates signal from noise.
+Eleven capabilities you **won't find together** in any open-source trading framework. Each one individually takes a research paper to justify; having all eighteen layers stack multiplicatively is what separates signal from noise.
 
 ### 🧠 1. It Asks "Is This Actually Causal?" Before Every Trade
 Most bots chase correlations. This one runs **GES causal graph discovery** (Greedy Equivalence Search, pgmpy) over 56 features + action + reward, then asks DoWhy whether there's a genuine directed path from `action → reward` for the current market state. Spurious signals get dampened. **23 causal edges discovered** on the current universe, firing on every cycle — you can literally read which features are causally linked to P&L in `causal_cache_portfolio.pkl`.
@@ -29,14 +30,25 @@ After the PPO emits a trade, a **nightly-trained LightGBM classifier** answers a
 
 Currently trained on 39 closed trades (Brier score 0.088, well-calibrated). Self-refits nightly at 03:30 ET as the trade log grows.
 
-### 💰 3. Bayesian Per-Symbol Sizing — Not Flat Allocation
-Every symbol gets its own **Beta(α, β) posterior on P(win)**, updated after every single closed trade. Winners get scaled up to **1.6×**; bleeders get dampened to **0.4×**. Small-sample shrinkage blends toward 1.0 so two lucky trades don't suddenly triple a position. This directly attacks the "one stock carries the book" failure mode.
+### 💰 3. Kelly-Fractional Bayesian Per-Symbol Sizing
+Every symbol gets its own **Beta(α, β) posterior on P(win)**, updated after every single closed trade. Instead of heuristic "if positive EV, boost" logic, sizing uses the **Kelly Criterion**:
 
-Live example right now:
 ```
-TSLA 1.60×  SOFI 1.53×  SMCI 1.23×  NVDA 0.85×  AMD 0.62×  AAPL 0.62×  JPM 0.59×
+f* = (p · b − q) / b    where b = avg_win / |avg_loss|
+mult = 1 + (¼·f*) / reference_kelly · (max_mult − 1)
 ```
-Capital flows automatically to symbols where the posterior shows real edge.
+
+**¼ Kelly** is the institutional-standard conservative multiplier (Thorp, 1969). Winners get scaled up to **1.6×**; bleeders get dampened to **0.4×**. Small-sample shrinkage blends toward 1.0 so two lucky trades don't suddenly triple a position. This directly attacks the "one stock carries the book" failure mode and is mathematically optimal for compound growth.
+
+Live Kelly analysis from 39 historical trades:
+```
+SOFI  b=3.85  f*=+0.160  → mult 1.26   (big winners relative to small losses)
+TSLA  b=2.95  f*=+0.073  → mult 1.14   (asymmetric payoffs favor holding)
+SMCI  b=1.22  f*=+0.090  → mult 1.06   (balanced W/L with positive edge)
+JPM   b=1.55  f*=-0.098  → mult 0.82   (slight negative edge)
+AAPL  b=1.12  f*=-0.327  → mult 0.62   (poor W/L ratio despite decent WR)
+```
+Capital flows automatically to symbols where the posterior shows real edge, weighted by Kelly's risk-of-ruin calculus.
 
 ### 📡 4. Five-Voter Ensemble Regime Detection (HMM Isn't Enough)
 HMM alone kept labeling every single bar "mean_reverting" at 95%+ persistence — even during clear multi-week rallies. This bot ships an ensemble of **slope + ADX + lag-1 autocorrelation + ATR range-expansion + HMM**, aggregated by direction-consistency voting. The result: `trending_up`, `trending_down`, or `mean_reverting` with a *differentiated* persistence score (0.65–0.90 live, not stuck at ceiling).
@@ -60,10 +72,33 @@ Grouped-mean slippage model over `(symbol, hour-bucket, size-bucket)` learns fro
 
 Opening-hour SMCI? Predicted 42bp slippage. JPM mid-day at normal size? Predicted 5bp. The bot *knows* when market conditions make an entry unprofitable before placing it.
 
-### ⚖️ 8. Asymmetric Trailing Stops (Cut Losers, Let Winners Run)
+### 🎯 8. Regime-Conditional Exits — Hold Winners Longer in Trends, Take MR Profits Fast
+Once the regime ensemble labels the current state as `trending_up`, `trending_down`, or `mean_reverting`, **exit parameters adapt accordingly**:
+
+| Scenario | TP Multiplier | Trail Multiplier | Logic |
+|---|---|---|---|
+| Long in uptrend (aligned) | **× 1.40** | **× 1.25** | Let the trend run — distant TP, wider stop |
+| Short in uptrend (counter) | × 0.70 | × 0.75 | Counter-trend = take quick profit |
+| Short in downtrend (aligned) | **× 1.40** | **× 1.25** | Let the trend run |
+| Long in downtrend (counter) | × 0.70 | × 0.75 | Quick profit, tight stop |
+| Mean-reverting (either direction) | × 0.85 | × 0.92 | Expect reversal — take profits fast |
+
+This directly fixes today's observed leak: the bot was using the **same exit parameters regardless of regime**, hitting trailing stops on normal trend noise and expecting reversals in MR that continued instead. With the 5-voter regime ensemble finally working correctly, these alignment multipliers stack on top of the base ATR-based stops and take-profits.
+
+### ⚖️ 9. Asymmetric Trailing Stops (Cut Losers, Let Winners Run)
 Every position tracks its **Maximum Favorable Excursion (MFE)** and **Maximum Adverse Excursion (MAE)** in real time. The profit-side ratchet tightens as unrealized P&L climbs (classic). But if a position goes underwater **and never went meaningfully green** (MFE ≤ 0.4%), the trail tightens to **55% of its original ATR-based width** — cutting dead losers before they become real ones. Two loss-tightens fired today live: PLTR (trail 2.42% → 1.33%) and SMCI (2.65% → 1.46%).
 
-### 🤖 9. Gemini 2.5 Flash Tunes 100+ Parameters Every Night
+### 📊 10. Liquidity-Scaled Sizing — Never Move the Market
+Every symbol has an **Average Daily Volume (ADV)** in dollars. When our position notional would exceed a threshold share of ADV, the weight gets dampened to avoid market-impact slippage. At current $30k equity everything is safe (<1bp of ADV), but the guard **auto-activates** as the account grows or if the universe picks up thinner names.
+
+Institutional rule of thumb: stay under **1% of ADV** to keep market impact below a few basis points. LIQ enforces this:
+- Participation < 0.1% of ADV → mult 1.0 (safe)
+- Participation > 1.0% of ADV → floor 0.3× (hard limit)
+- **Extended-hours factor ×5:** pre-market/after-hours thresholds are 5× tighter since volume is 10-20× thinner
+
+Ready for when the equity curve grows, or when an aggressive sizing attempt tries to dump 5% of a small-cap's daily volume on the book.
+
+### 🤖 11. Gemini 2.5 Flash Tunes 100+ Parameters Every Night
 At 03:30 AM ET, the bot serializes its full telemetry (Sharpe, Sortino, drawdown, WR, per-symbol P&L, PPO training scalars, regime distribution) and sends it to **Gemini 2.5 Flash** with 19 parameter groups and hard bounds. Gemini proposes changes inside a strict JSON schema. Every value is Pydantic-validated, category-clamped (PPO ±15%, risk ±20%, reward shaping ±25%), anti-oscillation-checked against recent history, and logged as structured JSON.
 
 Every parameter — from `TRAILING_STOP_ATR_TRENDING` to `META_FILTER_MIN_PROB` to `CROWDING_DISCOUNT_STRENGTH` — is eligible for autonomous tuning. The bot genuinely writes its own configuration.

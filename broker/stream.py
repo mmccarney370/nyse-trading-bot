@@ -148,10 +148,13 @@ class TradeStreamHandler:
                 except Exception as e:
                     logger.debug(f"[ADVERSE-SEL] record_fill failed for {symbol}: {e}")
             # ESP: record realized slippage for future prediction
+            # NOTE: NO local `from datetime import datetime` here — Python sees any
+            # assignment in a function and marks the name as local for the entire
+            # function, which UnboundLocalErrors lines 234/432 that use the module-
+            # level datetime. The module-level import at line 8 covers us.
             if (hasattr(self.broker, 'slippage_predictor') and self.broker.slippage_predictor
                     and group.slippage is not None):
                 try:
-                    from datetime import datetime
                     size_usd = float(fill_price) * float(filled_qty)
                     self.broker.slippage_predictor.record(
                         symbol=symbol,
