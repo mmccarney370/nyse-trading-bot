@@ -381,6 +381,11 @@ GROUP 22: Liquidity Scaling (LIQ) — avoid trading > 1% of ADV
   LIQUIDITY_MIN_MULT        [0.15 – 0.60]     current: {current_config.get('LIQUIDITY_MIN_MULT')}
   LIQUIDITY_EH_FACTOR       [2.0 – 10.0]      current: {current_config.get('LIQUIDITY_EH_FACTOR')}
 
+GROUP 23: Retrain-Guard (RG) — rollback if nightly retrain degrades model
+  RETRAIN_GUARD_VALIDATION_STEPS [200 – 1000]   current: {current_config.get('RETRAIN_GUARD_VALIDATION_STEPS')}
+  RETRAIN_GUARD_MIN_DROP         [0.0005 – 0.01] current: {current_config.get('RETRAIN_GUARD_MIN_DROP')}
+  RETRAIN_GUARD_REL_DROP         [0.10 – 0.40]   current: {current_config.get('RETRAIN_GUARD_REL_DROP')}
+
 === CONSTRAINTS ===
 1. HEALTHY systems get NO changes or at most 2 minor tweaks. Do NOT fix what is working.
 2. Maximum 6 parameter changes per cycle. Focused, high-conviction changes only.
@@ -519,6 +524,8 @@ GROUP 22: Liquidity Scaling (LIQ) — avoid trading > 1% of ADV
                     'REX_MR_TP_MULT', 'REX_MR_TRAIL_MULT',
                     'LIQUIDITY_WARN_THRESHOLD', 'LIQUIDITY_HARD_THRESHOLD',
                     'LIQUIDITY_MIN_MULT', 'LIQUIDITY_EH_FACTOR',
+                    'RETRAIN_GUARD_VALIDATION_STEPS', 'RETRAIN_GUARD_MIN_DROP',
+                    'RETRAIN_GUARD_REL_DROP',
                 }
                 if key in risk_params:
                     pct_bound = 0.20
@@ -657,6 +664,10 @@ GROUP 22: Liquidity Scaling (LIQ) — avoid trading > 1% of ADV
                     'LIQUIDITY_HARD_THRESHOLD': (0.003, 0.03),
                     'LIQUIDITY_MIN_MULT': (0.15, 0.60),
                     'LIQUIDITY_EH_FACTOR': (2.0, 10.0),
+                    # NEW — RG Retrain-Guard thresholds
+                    'RETRAIN_GUARD_VALIDATION_STEPS': (200, 1000),
+                    'RETRAIN_GUARD_MIN_DROP': (0.0005, 0.01),
+                    'RETRAIN_GUARD_REL_DROP': (0.10, 0.40),
                 }
                 if key in ABSOLUTE_BOUNDS:
                     abs_min, abs_max = ABSOLUTE_BOUNDS[key]

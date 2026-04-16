@@ -1,6 +1,7 @@
 # models/trainer.py
 # =====================================================================
 import logging
+import os
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple
@@ -578,11 +579,67 @@ class Trainer:
             self.portfolio_ppo_model = None
             self.portfolio_vec_norm = None
 
+    def _validate_portfolio_model(self, model, vec_env, n_steps: int = 500,
+                                   seed: int = 1337) -> float:
+        """RETRAIN-GUARD: Validate a model by rolling it out deterministically on
+        the given vec-normalized env. Returns mean reward per step as a scalar
+        quality metric.
+
+        Deterministic (fixed seed, deterministic=True) so pre/post retrain scores
+        are directly comparable. Stops early on terminal/truncated.
+        Returns 0.0 on any failure — caller should treat unknown scores as neutral.
+        """
+        try:
+            import numpy as _np
+            # vec_env is a VecNormalize wrapping DummyVecEnv([Monitor(PortfolioEnv)])
+            # Fresh reset with fixed seed for reproducibility
+            obs = vec_env.reset()
+            # VecNormalize returns (obs,) tuple for DummyVecEnv
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            total_reward = 0.0
+            steps = 0
+            lstm_state = None
+            # Use model.predict with deterministic=True for reproducibility
+            for _ in range(n_steps):
+                try:
+                    action, lstm_state = model.predict(
+                        obs,
+                        state=lstm_state,
+                        episode_start=_np.array([False]),
+                        deterministic=True,
+                    )
+                except TypeError:
+                    action, _ = model.predict(obs, deterministic=True)
+                    lstm_state = None
+                step_result = vec_env.step(action)
+                # DummyVecEnv returns (obs, rewards, dones, infos)
+                if len(step_result) == 4:
+                    obs, rewards, dones, _infos = step_result
+                else:
+                    obs, rewards, dones, _truncated, _infos = step_result
+                total_reward += float(rewards[0]) if hasattr(rewards, '__len__') else float(rewards)
+                steps += 1
+                if bool(dones[0]) if hasattr(dones, '__len__') else bool(dones):
+                    break
+            mean_reward = total_reward / max(1, steps)
+            return float(mean_reward)
+        except Exception as e:
+            logger.debug(f"[RETRAIN-GUARD] validation rollout failed: {e}")
+            return 0.0
+
     def update_portfolio_weights(self, timesteps: int = None):
         """
         Incremental/online update for the portfolio-level PPO model.
         Recreates environment with latest data, transfers VecNormalize stats if possible,
         continues learning on existing model with low learning rate for safety.
+
+        RETRAIN-GUARD: Before retraining, checkpoints the current model to
+        `ppo_model_prev.zip` and records a baseline validation score. After
+        retraining, re-validates. If the new model scores materially worse
+        (by RETRAIN_GUARD_MIN_DROP mean-reward per step), we restore from
+        the backup — preventing a bad retrain from silently degrading every
+        downstream layer.
         """
         symbols = self.config.get('SYMBOLS', [])
         if not symbols:
@@ -607,6 +664,23 @@ class Trainer:
             logger.error("Not enough common recent history across symbols for portfolio update")
             return
         timesteps = timesteps or self.config.get('PORTFOLIO_ONLINE_TIMESTEPS', 100_000)
+
+        # ========== RETRAIN-GUARD: checkpoint + baseline validation ==========
+        guard_enabled = CONFIG.get('RETRAIN_GUARD_ENABLED', True)
+        model_path = os.path.join("ppo_checkpoints", "portfolio", "ppo_model.zip")
+        backup_path = os.path.join("ppo_checkpoints", "portfolio", "ppo_model_prev.zip")
+        baseline_score = None
+        backup_created = False
+        if guard_enabled and os.path.exists(model_path):
+            try:
+                import shutil as _shutil
+                _shutil.copy2(model_path, backup_path)
+                backup_created = True
+                logger.info(f"[RETRAIN-GUARD] Checkpointed {model_path} → {backup_path}")
+            except Exception as e:
+                logger.warning(f"[RETRAIN-GUARD] Backup failed ({e}) — proceeding without rollback capability")
+        # ========== END RETRAIN-GUARD SETUP ==========
+
         try:
             # Recreate environment with latest data (Monitor for episode tracking)
             env = DummyVecEnv([lambda: Monitor(PortfolioEnv(
@@ -635,6 +709,12 @@ class Trainer:
             online_lr = CONFIG.get('PPO_ONLINE_LEARNING_RATE', 5e-5)
             model.learning_rate = online_lr  # scalar for online fine-tuning
             logger.info(f"Reduced learning rate to {online_lr} for online portfolio update (original type: {type(original_lr).__name__})")
+            # RETRAIN-GUARD: baseline score before training (using OLD policy on new env).
+            # Deterministic rollout with fixed seed → reproducible comparison with post-retrain score.
+            if guard_enabled:
+                guard_val_steps = CONFIG.get('RETRAIN_GUARD_VALIDATION_STEPS', 500)
+                baseline_score = self._validate_portfolio_model(model, new_vec_env, n_steps=guard_val_steps)
+                logger.info(f"[RETRAIN-GUARD] Baseline validation score (pre-retrain): {baseline_score:+.5f} mean-reward/step")
             nan_callback = NaNStopCallback()
             profit_callback = ProfitLoggingCallback()
             aux_callback = AuxVolatilityCallback() if CONFIG.get('PPO_AUX_TASK', True) else None
@@ -694,8 +774,61 @@ class Trainer:
             # Save updated model
             save_ppo_model(self, "portfolio")
             logger.info("Online portfolio PPO update completed and saved")
+
+            # ========== RETRAIN-GUARD: post-training validation + rollback ==========
+            if guard_enabled and baseline_score is not None and backup_created:
+                try:
+                    import json as _json
+                    post_score = self._validate_portfolio_model(model, new_vec_env, n_steps=guard_val_steps)
+                    min_drop = CONFIG.get('RETRAIN_GUARD_MIN_DROP', 0.002)   # min abs drop to trigger
+                    rel_drop = CONFIG.get('RETRAIN_GUARD_REL_DROP', 0.20)    # or 20% relative
+                    abs_delta = post_score - baseline_score
+                    rel_delta = abs_delta / (abs(baseline_score) + 1e-9)
+                    degraded = (abs_delta < -min_drop) and (rel_delta < -rel_drop)
+                    decision = "ROLLBACK" if degraded else "ACCEPT"
+                    logger.info(f"[RETRAIN-GUARD] Post-retrain validation: {post_score:+.5f} "
+                                f"(baseline {baseline_score:+.5f}, Δ={abs_delta:+.5f}, "
+                                f"rel={rel_delta:+.2%}) — {decision}")
+                    # Structured JSON for audit trail
+                    logger.info(_json.dumps({
+                        "event": "retrain_guard_decision",
+                        "baseline_score": baseline_score,
+                        "post_score": post_score,
+                        "abs_delta": abs_delta,
+                        "rel_delta": rel_delta,
+                        "min_drop_threshold": min_drop,
+                        "rel_drop_threshold": rel_drop,
+                        "decision": decision,
+                    }))
+                    if degraded:
+                        logger.warning(f"[RETRAIN-GUARD] New model DEGRADED quality "
+                                       f"({abs_delta:+.5f} drop) — ROLLING BACK to backup")
+                        import shutil as _shutil
+                        _shutil.copy2(backup_path, model_path)
+                        # Reload the restored model into memory
+                        from .ppo_utils import load_ppo_model
+                        load_ppo_model(self, "portfolio")
+                        # Lock VecNormalize to inference mode again
+                        if self.portfolio_vec_norm is not None:
+                            self.portfolio_vec_norm.training = False
+                        logger.info(f"[RETRAIN-GUARD] ✅ Rollback complete — restored previous model weights")
+                    else:
+                        logger.info(f"[RETRAIN-GUARD] ✅ Retrain accepted — new weights kept")
+                except Exception as e:
+                    logger.error(f"[RETRAIN-GUARD] Post-validation/rollback failed: {e} — keeping new weights (fail-open)")
+            # ========== END RETRAIN-GUARD ==========
         except Exception as e:
             logger.error(f"Online portfolio PPO update failed: {e}", exc_info=True)
+            # If training itself failed, attempt to restore from backup
+            if guard_enabled and backup_created:
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(backup_path, model_path)
+                    from .ppo_utils import load_ppo_model
+                    load_ppo_model(self, "portfolio")
+                    logger.info(f"[RETRAIN-GUARD] Training failed — restored previous model from backup")
+                except Exception as restore_err:
+                    logger.error(f"[RETRAIN-GUARD] Backup restore also failed: {restore_err}")
 
     def initialize_models(self, symbols: list):
         for symbol in symbols:

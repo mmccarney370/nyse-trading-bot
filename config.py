@@ -409,6 +409,16 @@ class TradingBotConfig(BaseModel):
     LIQUIDITY_HARD_THRESHOLD: float = 0.01    # 1.0% of ADV → floor min_mult
     LIQUIDITY_MIN_MULT: float = 0.3           # floor when hard-threshold breached
     LIQUIDITY_EH_FACTOR: float = 5.0          # extended-hours thresholds / 5
+    # ==================== RETRAIN-GUARD: PPO Retrain Safety ====================
+    # Before every nightly PPO retrain, checkpoint the current model + compute a
+    # baseline validation score (deterministic rollout on live env). After retrain,
+    # recompute the score. If the new model is materially worse (abs AND rel drop),
+    # ROLLBACK to the checkpoint. Prevents bad retrains from silently degrading
+    # every downstream layer. Runs only on update_portfolio_weights (nightly retrain path).
+    RETRAIN_GUARD_ENABLED: bool = True
+    RETRAIN_GUARD_VALIDATION_STEPS: int = 500   # env steps for deterministic rollout
+    RETRAIN_GUARD_MIN_DROP: float = 0.002       # need >0.002 abs mean-reward/step drop
+    RETRAIN_GUARD_REL_DROP: float = 0.20        # AND >20% relative drop
     # ==================== Broker Architecture ====================
     EXTENDED_HOURS: bool = True                          # Trade pre/post market
     FRACTIONAL_SHARES: bool = True                       # Allow fractional qty
