@@ -100,4 +100,9 @@ async def main():
     bot = TradingBot(CONFIG)
     await bot.run()
 if __name__ == "__main__":
+    # Windows compatibility: Python < 3.12 on Windows defaults to ProactorEventLoop
+    # which doesn't support some asyncio features used by the bot (subprocess pipes,
+    # certain socket operations). Force SelectorEventLoop on Windows for safety.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

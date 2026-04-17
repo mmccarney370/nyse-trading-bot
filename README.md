@@ -162,29 +162,67 @@ trading_bot/
 
 ## Getting Started
 
-**Prerequisites:** Python 3.11+, CUDA GPU (recommended), [Alpaca](https://alpaca.markets/) account, [Redis](https://redis.io/), [Ollama](https://ollama.ai/) with `sentiment-70b` and `llama3.1:8b`. Optional: [Gemini API key](https://ai.google.dev/), [NewsAPI key](https://newsapi.org/).
+### What You Need
+
+- **Python 3.11+** (3.12 recommended)
+- **CUDA GPU** — recommended for PPO training and TFT encoder. CPU works but is slow.
+- **[Alpaca](https://alpaca.markets/) account** — paper trading keys are free and work perfectly.
+- **[Redis](https://redis.io/)** — for data caching. On Windows: use [Memurai](https://www.memurai.com/) or Docker.
+- **[Ollama](https://ollama.ai/)** — for LLM sentiment. Native Windows/macOS/Linux support.
+
+**Optional but recommended:**
+- [Gemini API key](https://ai.google.dev/) — enables nightly self-tuning. Free tier works.
+- [NewsAPI key](https://newsapi.org/) — enables real news headlines for LLM sentiment. Free tier = 100 requests/day.
+
+### Quick Start (Linux / macOS)
 
 ```bash
 git clone https://github.com/mmccarney370/nyse-trading-bot.git
 cd nyse-trading-bot
-python -m venv venv && source venv/bin/activate
+
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+
+# Set up Ollama for sentiment analysis
+ollama pull llama3.1:8b
+
+# Configure your API keys
+cp .env.example .env
+# Edit .env with your Alpaca keys (required) and optional keys
 ```
 
-Create `.env`:
-```env
-ALPACA_API_KEY=your_key
-ALPACA_API_SECRET=your_secret
-GEMINI_API_KEY=your_gemini_key       # optional
-NEWS_API_KEY=your_newsapi_key        # optional
+### Quick Start (Windows)
+
+```powershell
+git clone https://github.com/mmccarney370/nyse-trading-bot.git
+cd nyse-trading-bot
+
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Set up Ollama (download from https://ollama.ai — native Windows installer)
+ollama pull llama3.1:8b
+
+# Configure your API keys
+copy .env.example .env
+# Edit .env with your Alpaca keys (required) and optional keys
 ```
+
+**Windows notes:**
+- Redis: install [Memurai](https://www.memurai.com/) (Redis-compatible for Windows) or run Redis in Docker: `docker run -d -p 6379:6379 redis`
+- GPU: install CUDA Toolkit from [NVIDIA](https://developer.nvidia.com/cuda-downloads) if using GPU training
+- The bot auto-detects Windows and sets the correct asyncio event loop policy
+
+### Running
 
 ```bash
-python __main__.py                   # live paper trading
+python __main__.py                                           # live paper trading
 python run_backtest.py --start 2025-01-01 --end 2025-12-31  # backtest
 ```
 
-First startup takes 5–6 minutes (TFT precompute, stacking training, causal bootstrap, meta-filter fit). Subsequent starts are faster with cached models. Logs: `logs/nyse_bot.log` | Training curves: `tensorboard --logdir ppo_tensorboard`
+First startup takes 5–6 minutes (TFT precompute, stacking training, causal bootstrap, meta-filter fit). Subsequent starts are faster with cached state files. Logs: `logs/nyse_bot.log` | Training curves: `tensorboard --logdir ppo_tensorboard`
 
 ---
 

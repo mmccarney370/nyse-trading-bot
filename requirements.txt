@@ -1,40 +1,65 @@
 # =============================================
-# NYSE Trading Bot — requirements.txt (March 2026)
-# Fully tested & compatible after pgmpy + SB3 + NumPy 2.4 fixes
+# NYSE Trading Bot — Full Dependency List
+# Tested on Python 3.11+ (Linux, macOS, Windows)
+# Install: pip install -r requirements.txt
 # =============================================
 
-# === Reinforcement Learning Core ===
-stable-baselines3[extra]>=2.7.1
-sb3-contrib>=2.7.1
+# === Reinforcement Learning ===
+stable-baselines3[extra]>=2.7.0
+sb3-contrib>=2.7.0
+torch>=2.2.0
+gymnasium>=0.29.1
 
-# === PyTorch (required by SB3 + torch models) ===
-torch>=2.6.0
+# === Data & Scientific Computing ===
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
+pyarrow>=14.0.0
+numba>=0.58.0
+joblib>=1.3.0
 
-# === Data & Scientific Stack (NumPy 2.4+ compatible) ===
-numpy>=2.4.2
-pandas>=3.0.0
-pyarrow>=18.0.0
-scipy>=1.17.1
-numba>=0.64.0
+# === Portfolio Optimization (CVaR) ===
+cvxpy>=1.4.0
 
-# === Causal Discovery & DoWhy ===
-pgmpy>=1.0.0
-dowhy>=0.12
+# === Causal Discovery & Inference ===
+pgmpy>=0.0.16
+dowhy>=0.11
+networkx>=3.2
 
-# === Graph & Utils ===
-networkx>=3.3
-scikit-learn>=1.7.0
+# === Machine Learning (stacking ensemble + meta-filter) ===
+lightgbm>=4.2.0
+optuna>=3.5.0
 
-# === Gymnasium / Environment ===
-gymnasium>=0.29.1,<1.3.0
+# === Broker & Market Data ===
+alpaca-py>=0.28.0
+yfinance>=0.2.36
+newsapi-python>=0.2.7
 
-# === Logging / UI / Helpers ===
-tqdm>=4.66
-rich>=14.0
-psutil>=7.2
+# === Time-Series Storage ===
+arcticdb>=4.5.0
 
-# === Your other trading packages (add any you already had) ===
-# yfinance
-# ta-lib
-# ccxt
-# etc.
+# === Caching ===
+redis>=5.0.0
+
+# === LLM Sentiment (Ollama) ===
+ollama>=0.3.0
+
+# === Gemini Self-Tuning ===
+google-genai>=1.0.0
+
+# === Regime Detection (HMM) ===
+hmmlearn>=0.3.0
+
+# === Deep Learning Features (TFT encoder) ===
+pytorch-forecasting>=1.0.0
+pytorch-lightning>=2.1.0
+
+# === Utilities ===
+python-dotenv>=1.0.0
+python-dateutil>=2.8.0
+holidays>=0.40
+tqdm>=4.66.0
+psutil>=5.9.0
+tensorboard>=2.15.0
+rich>=13.0.0
