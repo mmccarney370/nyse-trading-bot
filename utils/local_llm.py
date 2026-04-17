@@ -52,7 +52,12 @@ class LocalLLMDebate:
     async def debate_sentiment(self, news_texts: list, symbol: str = None) -> float:
         """Async version — serialized via _ollama_lock so 70B model processes one
         debate at a time (prevents timeout from 8 symbols queuing on GPU).
-        Each debate still runs 3 agents (bull/bear/analyst) sequentially."""
+        Each debate still runs 3 agents (bull/bear/analyst) sequentially.
+
+        FIX (Apr 17): Added per-debate timeout. If Ollama hangs (GPU crash, OOM,
+        server freeze), the lock is released after timeout so the next symbol can
+        proceed. Without this, a single hung inference permanently freezes the
+        entire sentiment pipeline and blocks the trading loop."""
         if not news_texts:
             return 0.0
         headlines = " | ".join(news_texts[:15])
@@ -60,24 +65,34 @@ class LocalLLMDebate:
         # Serialize across all symbols — 70B can only do one inference at a time
         if LocalLLMDebate._ollama_lock is None:
             LocalLLMDebate._ollama_lock = asyncio.Lock()
-        async with LocalLLMDebate._ollama_lock:
-            opinions = []
-            for role in ["bull", "bear", "analyst"]:
-                prompt = f"You are a {role} trader. Analyze sentiment of these headlines{stock_desc}: {headlines}\nRespond ONLY with a number from -1 (very negative) to 1 (very positive)."
+        # Per-debate timeout: if one symbol's debate hangs, release lock after N seconds
+        # so remaining symbols aren't permanently blocked. 120s = ~40s/role × 3 roles.
+        # FIX (Apr 17): without this, a hung Ollama call held _ollama_lock forever,
+        # freezing the entire sentiment pipeline and blocking the trading loop for 5+ hours.
+        _debate_timeout = 120
 
-                score = await asyncio.to_thread(self._call_ollama, self.model, prompt)
+        async def _run_debate():
+            async with LocalLLMDebate._ollama_lock:
+                opinions = []
+                for role in ["bull", "bear", "analyst"]:
+                    prompt = f"You are a {role} trader. Analyze sentiment of these headlines{stock_desc}: {headlines}\nRespond ONLY with a number from -1 (very negative) to 1 (very positive)."
+                    score = await asyncio.to_thread(self._call_ollama, self.model, prompt)
+                    if np.isnan(score):
+                        score = await asyncio.to_thread(self._call_ollama, self.fallback, prompt)
+                    if np.isnan(score):
+                        logger.warning(f"Local LLM {role} returned NaN even after fallback — skipping")
+                        continue
+                    opinions.append(score)
+                    logger.debug(f"Local LLM {role} score: {score:.3f}")
+                if not opinions:
+                    logger.warning(f"All LLM opinions were NaN for {symbol} — returning neutral 0.0")
+                    return 0.0
+                final = sum(opinions) / len(opinions)
+                logger.info(f"Local LLM debate final: {final:.3f} ({len(news_texts)} headlines) [{symbol}]")
+                return final
 
-                if np.isnan(score):
-                    score = await asyncio.to_thread(self._call_ollama, self.fallback, prompt)
-
-                if np.isnan(score):
-                    logger.warning(f"Local LLM {role} returned NaN even after fallback — skipping")
-                    continue
-                opinions.append(score)
-                logger.debug(f"Local LLM {role} score: {score:.3f}")
-            if not opinions:
-                logger.warning(f"All LLM opinions were NaN for {symbol} — returning neutral 0.0")
-                return 0.0
-            final = sum(opinions) / len(opinions)
-            logger.info(f"Local LLM debate final: {final:.3f} ({len(news_texts)} headlines) [{symbol}]")
-            return final
+        try:
+            return await asyncio.wait_for(_run_debate(), timeout=_debate_timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(f"[OLLAMA TIMEOUT] {symbol} debate exceeded {_debate_timeout}s — returning 0.0 (lock released)")
+            return 0.0

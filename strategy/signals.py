@@ -1167,7 +1167,20 @@ class SignalGenerator:
                         else:
                             ts = pd.Timestamp.now(tz='UTC')
                     return sym, await self.get_sentiment_score(sym, ts, live_mode=True)
-                sentiment_results = await asyncio.gather(*[_get_sentiment(sym) for sym in symbols])
+                # FIX: Wrap sentiment gather in a timeout. If Ollama hangs (GPU OOM,
+                # CUDA crash, server freeze), the _ollama_lock is held forever and
+                # the entire trading loop freezes — observed 5-hour hang on Apr 17.
+                # Timeout falls back to cached/zero sentiment so trading continues.
+                _sent_timeout = self.config.get('SENTIMENT_GATHER_TIMEOUT_SEC', 300)
+                try:
+                    sentiment_results = await asyncio.wait_for(
+                        asyncio.gather(*[_get_sentiment(sym) for sym in symbols]),
+                        timeout=_sent_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[SENTIMENT TIMEOUT] Gather exceeded {_sent_timeout}s — "
+                                   f"falling back to cached/zero sentiment for all symbols")
+                    sentiment_results = [(sym, 0.0) for sym in symbols]
                 # B4: Also read sentiment VELOCITY for each symbol (Δlevel over past N hours)
                 # Velocity captures information arrival, not steady-state level — a stock going
                 # 0.1 → 0.6 is very different from one sitting at 0.6. Multiplied by direction

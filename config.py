@@ -312,6 +312,10 @@ class TradingBotConfig(BaseModel):
     # and dampens shorts. Weight=0.15 means +0.5 velocity gives ~1.075x boost.
     SENTIMENT_VELOCITY_WEIGHT: float = 0.15
     SENTIMENT_VELOCITY_LOOKBACK_HOURS: int = 4
+    # Max seconds for ALL sentiment calls in one cycle. If Ollama hangs (GPU crash,
+    # OOM, server freeze), this prevents the entire trading loop from freezing.
+    # Observed: 5-hour hang on Apr 17 from a single stuck Ollama call.
+    SENTIMENT_GATHER_TIMEOUT_SEC: int = 300  # 5 min max for all 8 symbols
     # ==================== AC: Correlation-Aware Sizing ====================
     # Discount each position by its average correlation to same-sign peers. Prevents
     # 4 correlated tech longs from becoming one effective mega-position.
