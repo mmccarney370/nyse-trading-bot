@@ -162,13 +162,42 @@ trading_bot/
 
 ## Getting Started
 
-### What You Need
+### System Requirements
 
+The bot runs on anything from a modest desktop to a GPU workstation. Here's what you actually need for each mode:
+
+**GPU Mode (recommended for full capability):**
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| **CPU** | 4 cores / 8 threads | 8+ cores |
+| **RAM** | 8 GB | 16 GB+ |
+| **GPU** | NVIDIA with 6 GB VRAM (e.g. RTX 3060) | 8+ GB VRAM (RTX 3070/4070+) |
+| **CUDA** | 11.8+ | 12.x |
+| **Storage** | 20 GB free | 50 GB+ (ArcticDB + model checkpoints grow over time) |
+| **Network** | Stable broadband | Low-latency connection for WebSocket streaming |
+| **OS** | Linux, Windows 10/11, macOS | Ubuntu 22.04+ or Windows 11 with WSL2 |
+
+GPU handles PPO training (~5 min nightly), TFT encoder precompute (~6 min on first startup), and Ollama LLM inference. Without GPU, all of these fall back to CPU but take 3–10× longer.
+
+**CPU-Only Mode (everything works, just slower):**
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| **CPU** | 4 cores / 8 threads | 8+ cores (PPO training is CPU-bound without GPU) |
+| **RAM** | 8 GB | 16 GB+ (Ollama 8B model uses ~5 GB) |
+| **GPU** | None required | — |
+| **Storage** | 20 GB free | 50 GB+ |
+| **Network** | Stable broadband | Low-latency connection |
+| **OS** | Linux, Windows 10/11, macOS | Any with Python 3.11+ and Docker support |
+
+On CPU-only: nightly PPO retrain takes ~15–30 min instead of ~5 min. TFT precompute takes ~20 min on first startup instead of ~6 min. Ollama sentiment with the 8B model runs fine on CPU (~5–10s per call). Live trading loop is unaffected — signal generation is lightweight.
+
+**Docker mode** handles all dependencies automatically. Without Docker, you'll also need:
 - **Python 3.11+** (3.12 recommended)
-- **CUDA GPU** — recommended for PPO training and TFT encoder. CPU works but is slow.
-- **[Alpaca](https://alpaca.markets/) account** — paper trading keys are free and work perfectly.
 - **[Redis](https://redis.io/)** — for data caching. On Windows: use [Memurai](https://www.memurai.com/) or Docker.
-- **[Ollama](https://ollama.ai/)** — for LLM sentiment. Native Windows/macOS/Linux support.
+- **[Ollama](https://ollama.ai/)** — for LLM sentiment. Native Windows/macOS/Linux installers available.
+- **[Alpaca](https://alpaca.markets/) account** — paper trading keys are free and work out of the box.
 
 **Optional but recommended:**
 - [Gemini API key](https://ai.google.dev/) — enables nightly self-tuning. Free tier works.
