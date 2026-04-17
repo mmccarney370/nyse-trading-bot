@@ -151,11 +151,24 @@ class SlippagePredictor:
         edge_safety_multiple: float = 1.2,
     ) -> Tuple[bool, float, str]:
         """Return (veto, predicted_bps, reason). Veto when predicted slippage
-        exceeds expected alpha by `edge_safety_multiple`. Only vetos when we
-        actually have enough samples — insufficient data → no veto."""
+        exceeds expected alpha by `edge_safety_multiple`.
+
+        FIX (Apr 17): Only SYMBOL-SPECIFIC sources (sym+hour+size, sym+hour,
+        sym) can trigger a veto. Generic buckets (hour, hour+size, global) are
+        too coarse — they pool all symbols together, and a few extreme fills
+        (e.g., 3 opening-chaos fills at 200bp) can pollute the median and veto
+        every symbol for the rest of the day. Generic sources still produce a
+        prediction for logging but won't block the trade.
+
+        Also skips on "prior" (insufficient data)."""
         pred, source = self.predict_bps(symbol, hour, size_usd)
         if source == "prior":
             return False, pred, f"insufficient-data({pred:.1f}bp)"
+        # Only symbol-specific sources have enough resolution to veto.
+        # "hour", "hour+size", "global" are pooled across all symbols —
+        # too coarse, and vulnerable to a few extreme fills biasing the median.
+        if not source.startswith("sym"):
+            return False, pred, f"generic-source({pred:.1f}bp/{source})"
         threshold = expected_alpha_bps * edge_safety_multiple
         if pred > threshold:
             return True, pred, f"pred={pred:.1f}bp > {threshold:.1f}bp ({source})"
