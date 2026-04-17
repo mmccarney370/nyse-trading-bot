@@ -225,8 +225,11 @@ class TradingBotConfig(BaseModel):
     DEBUG_SIGNAL_BLEND: bool = True
     # ==================== Local LLM Settings ====================
     USE_LOCAL_LLM: bool = True
-    LOCAL_LLM_MODEL: str = 'sentiment-70b'
-    LOCAL_LLM_FALLBACK: str = 'llama3.1:8b'
+    # Swapped Apr 17: 70B was causing GPU OOM hangs (5-hour trading halt + repeated
+    # TimeoutErrors). 8B is 10× faster, almost never OOMs, and still produces usable
+    # sentiment. 70B kept as fallback for the rare case 8B fails.
+    LOCAL_LLM_MODEL: str = 'llama3.1:8b'
+    LOCAL_LLM_FALLBACK: str = 'sentiment-70b'
     OLLAMA_HOST: str = 'http://localhost:11434'
     NEWS_LOOKBACK_DAYS: int = 10
     # ==================== Causal RL Settings ====================
