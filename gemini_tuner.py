@@ -838,7 +838,19 @@ Schema:
             logger.info(f"[GEMINI TUNER] Applied {len(applied)} changes")
         return applied
     except Exception as e:
-        logger.error(f"[GEMINI TUNER] Query failed: {e}")
+        # FIX: Transient API errors (503, 429, timeout) must be RE-RAISED so bot.py's
+        # retry loop (3 attempts with exponential backoff) can catch them. Previously
+        # this swallowed ALL exceptions and returned {}, making the retry logic dead code.
+        # Non-transient errors (auth, schema, parse) still return {} (no point retrying).
+        err_str = str(e).lower()
+        transient_indicators = ("503", "429", "500", "502", "unavailable",
+                                "timeout", "timed out", "deadline exceeded",
+                                "rate limit", "resource exhausted", "internal")
+        is_transient = any(indicator in err_str for indicator in transient_indicators)
+        if is_transient:
+            logger.warning(f"[GEMINI TUNER] Transient API error (will retry): {e}")
+            raise  # ← let bot.py's retry loop handle it
+        logger.error(f"[GEMINI TUNER] Non-transient query failed: {e}")
         return {}
 
 # Self-test
