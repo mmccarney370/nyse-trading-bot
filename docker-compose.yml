@@ -1,0 +1,134 @@
+# =============================================
+# NYSE Trading Bot — Docker Compose
+#
+# Quick start:
+#   1. cp .env.example .env && edit .env with your API keys
+#   2. docker compose up -d
+#   3. docker compose logs -f bot     # watch the bot run
+#
+# GPU mode (default):
+#   Requires NVIDIA Container Toolkit:
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+# CPU-only mode (no GPU needed):
+#   docker compose --profile cpu up -d
+#
+# Pull Ollama model (first time only):
+#   docker compose exec ollama ollama pull llama3.1:8b
+#
+# Stop everything:
+#   docker compose down
+# =============================================
+
+services:
+  # --- Redis: data caching ---
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # --- Ollama: LLM sentiment analysis (GPU) ---
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- Ollama: CPU-only variant (no GPU needed) ---
+  ollama-cpu:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    profiles: ["cpu"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- Trading Bot (GPU) ---
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      # Persistent state — survives container rebuilds
+      - ./logs:/app/logs
+      - ./ppo_checkpoints:/app/ppo_checkpoints
+      - ./data_cache:/app/data_cache
+      - ./arcticdb_tickdb:/app/arcticdb_tickdb
+      - ./checkpoints:/app/checkpoints
+      # State files (order tracker, histories, caches)
+      - bot_state:/app/state
+      # Map individual state files into the state volume
+      - ./order_tracker.json:/app/order_tracker.json
+      - ./live_signal_history.json:/app/live_signal_history.json
+      - ./regime_cache.json:/app/regime_cache.json
+      - ./dynamic_config.json:/app/dynamic_config.json
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --- Trading Bot: CPU-only variant ---
+  bot-cpu:
+    build: .
+    restart: unless-stopped
+    profiles: ["cpu"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - OLLAMA_HOST=http://ollama-cpu:11434
+    volumes:
+      - ./logs:/app/logs
+      - ./ppo_checkpoints:/app/ppo_checkpoints
+      - ./data_cache:/app/data_cache
+      - ./arcticdb_tickdb:/app/arcticdb_tickdb
+      - ./checkpoints:/app/checkpoints
+      - bot_state:/app/state
+      - ./order_tracker.json:/app/order_tracker.json
+      - ./live_signal_history.json:/app/live_signal_history.json
+      - ./regime_cache.json:/app/regime_cache.json
+      - ./dynamic_config.json:/app/dynamic_config.json
+
+volumes:
+  redis_data:
+  ollama_data:
+  bot_state:

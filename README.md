@@ -215,7 +215,36 @@ copy .env.example .env
 - GPU: install CUDA Toolkit from [NVIDIA](https://developer.nvidia.com/cuda-downloads) if using GPU training
 - The bot auto-detects Windows and sets the correct asyncio event loop policy
 
-### Running
+### Quick Start (Docker — easiest, any platform)
+
+Docker bundles everything — Redis, Ollama, Python, CUDA — into one command. Works on Linux, macOS, and Windows with Docker Desktop.
+
+```bash
+git clone https://github.com/mmccarney370/nyse-trading-bot.git
+cd nyse-trading-bot
+
+cp .env.example .env
+# Edit .env with your Alpaca API keys (required)
+
+# GPU mode (requires NVIDIA Container Toolkit):
+docker compose up -d
+
+# CPU-only mode (no GPU needed, slower training):
+docker compose --profile cpu up -d
+
+# First time: pull the Ollama model for sentiment
+docker compose exec ollama ollama pull llama3.1:8b
+
+# Watch the bot run:
+docker compose logs -f bot
+
+# Stop:
+docker compose down
+```
+
+All state (models, caches, logs, order tracker) persists in mounted volumes — survives container rebuilds.
+
+### Running (without Docker)
 
 ```bash
 python __main__.py                                           # live paper trading

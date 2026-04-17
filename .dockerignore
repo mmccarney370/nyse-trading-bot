@@ -1,0 +1,53 @@
+# Don't copy these into the Docker image
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — must be passed via .env file, not baked into image
+.env
+*.token
+*.key
+
+# Local state files (mounted as volumes instead)
+*.pkl
+*.json
+!.env.example
+!pyproject.toml
+!pytest.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Claude Code session
+.claude/
+
+# Local data (mounted as volumes)
+logs/
+data_cache/
+arcticdb_tickdb/
+ppo_checkpoints/
+ppo_tensorboard/
+checkpoints/
+TensorBoard Trials/
+ray/
+
+# Test artifacts
+.pytest_cache/
+tests/
+htmlcov/
+.coverage
+
+# Misc
+*.txt
+!requirements.txt
+Modelfile
