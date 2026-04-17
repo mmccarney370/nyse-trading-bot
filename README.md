@@ -4,222 +4,108 @@
 ![Status](https://img.shields.io/badge/Status-Live_Paper_Trading-green)
 ![RL](https://img.shields.io/badge/RL-GTrXL_Recurrent_PPO-purple)
 ![Causal](https://img.shields.io/badge/Causal_AI-GES_%2B_DoWhy-orange)
-![Meta-Label](https://img.shields.io/badge/Meta--Label-Lopez_de_Prado-9cf)
-![Bayesian](https://img.shields.io/badge/Bayesian-Per--Symbol_Sizing-ff69b4)
-![Kelly](https://img.shields.io/badge/Kelly-Fractional_¼-4dc0b5)
 ![Self-Tuning](https://img.shields.io/badge/Self--Tuning-Gemini_2.5_Flash-red)
 ![License](https://img.shields.io/badge/License-MIT-brightgreen)
 
-> A self-improving algorithmic trading system that thinks about **why** it should trade, sizes bets by **Kelly-fractional posteriors per symbol**, adjusts exits to the **current regime direction**, scales down when **position size rivals daily volume**, detects when it's being **picked off**, **refuses** entries that would eat their own alpha, and rewrites **100+ of its own parameters** every night — all while running unsupervised against a live broker.
+A fully autonomous trading system that combines deep reinforcement learning with causal inference, Bayesian statistics, and LLM-powered self-tuning — running unsupervised against a live broker around the clock. It doesn't just predict where prices are going. It asks whether the relationship between its actions and rewards is genuinely causal, sizes each bet by the Kelly-optimal fraction of its per-symbol posterior, adapts its exit strategy to the current market regime, detects when it's being picked off by better-informed counterparties, refuses entries where predicted slippage would eat the alpha, and rewrites its own configuration every night based on what actually worked.
 
-This isn't a moving-average crossover with extra steps. It's a production-grade stack that fuses **deep reinforcement learning**, **causal inference**, **Kelly-fractional Bayesian sizing**, **Lopez-de-Prado meta-labeling**, **ensemble regime detection**, **regime-conditional exits**, **liquidity-scaled sizing**, **adverse-selection detection**, and **LLM-powered nightly self-tuning** into a single autonomous trader.
-
----
-
-## What Makes This Bot Unique
-
-Sixteen capabilities you **won't find together** in any open-source trading framework. Each one individually takes a research paper to justify; having them all stack multiplicatively is what separates signal from noise.
-
-### 🧠 1. It Asks "Is This Actually Causal?" Before Every Trade
-Most bots chase correlations. This one runs **GES causal graph discovery** (Greedy Equivalence Search, pgmpy) over 56 features + action + reward, then asks DoWhy whether there's a genuine directed path from `action → reward` for the current market state. Spurious signals get dampened.
-
-The graph is **bootstrapped from historical PortfolioEnv rollouts with Gaussian exploration noise** (converged PPO is near-deterministic — GES needs treatment variance), rebuilt nightly at 03:30 ET, and firing on every cycle. You can literally read which features are causally linked to P&L in `causal_cache_portfolio.pkl`.
-
-Every cycle logs `✅ [CAUSAL PENALTY APPLIED in generate_portfolio_actions]` or falls back cleanly to neutral.
-
-### 🎯 2. Lopez-de-Prado Meta-Labeling Filter
-After the PPO emits a trade, a **nightly-trained LightGBM classifier** answers a different question: *"given that PPO says go long on AAPL right now, is this actually going to win?"* Probability below `META_FILTER_MIN_PROB` and the trade is **rejected outright**. This is the two-model architecture from *Advances in Financial Machine Learning* (López de Prado, 2018) — the primary model predicts direction, the secondary decides whether to place the bet.
-
-The classifier self-refits nightly at 03:30 ET; Brier calibration improves as the closed-trade log grows. Threshold is a tunable knob (`META_FILTER_MIN_PROB`) that Gemini auto-calibrates based on observed rejection rate vs. live win rate.
-
-### 💰 3. Kelly-Fractional Bayesian Per-Symbol Sizing
-Every symbol gets its own **Beta(α, β) posterior on P(win)**, updated after every single closed trade. Instead of heuristic "if positive EV, boost" logic, sizing uses the **Kelly Criterion**:
-
-```
-f* = (p · b − q) / b    where b = avg_win / |avg_loss|
-mult = 1 + (¼·f*) / reference_kelly · (max_mult − 1)
-```
-
-**¼ Kelly** is the institutional-standard conservative multiplier (Thorp, 1969). Winners get scaled up to **1.6×**; bleeders get dampened to **0.4×**. Small-sample shrinkage blends toward 1.0 so two lucky trades don't suddenly triple a position. This directly attacks the "one stock carries the book" failure mode and is mathematically optimal for compound growth.
-
-Example Kelly profile (live bot state, illustrative):
-```
-Symbol with high W/L ratio (b≈3.85) and positive edge    → boost ~1.26×
-Symbol with balanced W/L and modest positive edge         → boost ~1.06×
-Symbol with decent W/L but negative posterior edge        → dampen ~0.82×
-Symbol with poor W/L and negative edge                    → floor ~0.62×
-```
-Capital flows automatically to symbols where the posterior shows real edge, weighted by Kelly's risk-of-ruin calculus. Posteriors update after every closed trade; behavior gets sharper as sample size grows.
-
-### 📡 4. Five-Voter Ensemble Regime Detection (HMM Isn't Enough)
-HMM alone kept labeling every single bar "mean_reverting" at 95%+ persistence — even during clear multi-week rallies. This bot ships an ensemble of **slope + ADX + lag-1 autocorrelation + ATR range-expansion + HMM**, aggregated by direction-consistency voting. The result: `trending_up`, `trending_down`, or `mean_reverting` with a *differentiated* persistence score (0.65–0.90 live, not stuck at ceiling).
-
-Regime flows into *everything* downstream: trailing stop widths, take-profit distances, ratchet cadence, risk budgets, gate multipliers, and the PPO reward function.
-
-### 🎯 5. Cross-Sectional Momentum Gate — Be Where Today's Alpha Is
-Every cycle, the bot z-scores all 8 symbols on a composite of (5-day return, 20-vs-60-day acceleration, volume momentum, drawdown severity). Top-tercile scorers get their PPO-emitted weights **boosted 1.25×**; bottom-tercile get **dampened 0.50×**. You see lines like this every 60 seconds:
-
-```
-[CS-MOMENTUM] AMD:+1.82×1.25 | SMCI:+1.48×1.25 | NVDA:+0.85×1.25 | PLTR:-3.14×0.50
-```
-
-No retrain required — preserves PPO observation shape.
-
-### 🛡️ 6. Adverse-Selection Detection (The Market Maker's Weapon)
-Every entry fill is timestamped and price-sampled at T+1, T+5, T+15, T+30 minutes. The bot computes **signed post-fill drift** per symbol and rolls the last 20 fills. When recent fills on a symbol are consistently followed by adverse moves (< -20bp drift), that symbol is **toxic** — it gets dampened up to 50%. This is the exact technique sell-side market makers use to manage information asymmetry. Almost no retail bot tracks it.
-
-### 🚨 7. Slippage Prediction Veto — Refuses to Trade Into Chop
-Grouped-mean slippage model over `(symbol, hour-bucket, size-bucket)` learns from real fills. Before every entry, it predicts expected slippage in basis points. If that prediction **exceeds 1.2× expected alpha**, the trade is skipped or dampened. We refuse to pay more in execution cost than we expect to win.
-
-Opening-hour SMCI? Predicted 42bp slippage. JPM mid-day at normal size? Predicted 5bp. The bot *knows* when market conditions make an entry unprofitable before placing it.
-
-### 🎯 8. Regime-Conditional Exits — Hold Winners Longer in Trends, Take MR Profits Fast
-Once the regime ensemble labels the current state as `trending_up`, `trending_down`, or `mean_reverting`, **exit parameters adapt accordingly**:
-
-| Scenario | TP Multiplier | Trail Multiplier | Logic |
-|---|---|---|---|
-| Long in uptrend (aligned) | **× 1.40** | **× 1.25** | Let the trend run — distant TP, wider stop |
-| Short in uptrend (counter) | × 0.70 | × 0.75 | Counter-trend = take quick profit |
-| Short in downtrend (aligned) | **× 1.40** | **× 1.25** | Let the trend run |
-| Long in downtrend (counter) | × 0.70 | × 0.75 | Quick profit, tight stop |
-| Mean-reverting (either direction) | × 0.85 | × 0.92 | Expect reversal — take profits fast |
-
-This directly fixes today's observed leak: the bot was using the **same exit parameters regardless of regime**, hitting trailing stops on normal trend noise and expecting reversals in MR that continued instead. With the 5-voter regime ensemble finally working correctly, these alignment multipliers stack on top of the base ATR-based stops and take-profits.
-
-### ⚖️ 9. Asymmetric Trailing Stops (Cut Losers, Let Winners Run)
-Every position tracks its **Maximum Favorable Excursion (MFE)** and **Maximum Adverse Excursion (MAE)** in real time. The profit-side ratchet tightens as unrealized P&L climbs (classic). But if a position goes underwater **and never went meaningfully green** (MFE ≤ 0.4%), the trail tightens to **55% of its original ATR-based width** — cutting dead losers before they become real ones. Two loss-tightens fired today live: PLTR (trail 2.42% → 1.33%) and SMCI (2.65% → 1.46%).
-
-### 📊 10. Liquidity-Scaled Sizing — Never Move the Market
-Every symbol has an **Average Daily Volume (ADV)** in dollars. When our position notional would exceed a threshold share of ADV, the weight gets dampened to avoid market-impact slippage. At current $30k equity everything is safe (<1bp of ADV), but the guard **auto-activates** as the account grows or if the universe picks up thinner names.
-
-Institutional rule of thumb: stay under **1% of ADV** to keep market impact below a few basis points. LIQ enforces this:
-- Participation < 0.1% of ADV → mult 1.0 (safe)
-- Participation > 1.0% of ADV → floor 0.3× (hard limit)
-- **Extended-hours factor ×5:** pre-market/after-hours thresholds are 5× tighter since volume is 10-20× thinner
-
-Ready for when the equity curve grows, or when an aggressive sizing attempt tries to dump 5% of a small-cap's daily volume on the book.
-
-### 🛡️ 11. RETRAIN-GUARD — PPO Can't Silently Degrade
-Every nightly PPO retrain (100K timesteps at 18:00 ET) is now **checkpointed, validated before and after, and automatically rolled back** if the new weights perform worse. On its very first run, it caught a **-8012% relative degradation** and restored the previous model in under a second. Without this, every downstream layer would have operated on a broken base for 24 hours before anyone noticed.
-
-### ⏰ 12. TIME-STOP — Dead Trades Don't Get a Free Pass
-Positions held too long without meaningful excursion in either direction (MFE < 0.5%, MAE < 0.5%, held > 96 bars) are **"dead trades"** — the thesis isn't playing out. TIME-STOP auto-closes them to free capital. On first live run, it correctly flagged 4 of 6 positions as dead (PLTR at 178 bars with only +0.11% MFE / -0.27% MAE).
-
-### 📊 13. EQ-SCORE — Daily Gate-Activity Scorecard
-At 16:30 ET, the bot emits a structured JSON report answering "what did the 18 gates actually do today?" — per-symbol meta-filter rejects, divergence triggers, slippage vetos, liquidity scaling events, cross-sectional tercile placements, earnings blackouts, regime distribution, entries submitted/filled. Persists to `execution_scorecard_log.jsonl` for historical analysis.
-
-### 📋 14. ALPHA-ATTR — Every Closed Trade Gets an Attribution Record
-When a trade closes (stop, TP, or safe-close), the bot emits a JSON line recording: baseline weight (raw PPO), final weight (post-gates), aggregate transformation multiplier, MFE/MAE, entry/exit prices, held bars, regime at open/close, exit reason. Persists to `alpha_attribution_log.jsonl`. Answers "which layers pushed this trade out of neutral?" for every trade.
-
-### 🧠 15. A4 — Pre-Market PPO Micro-Retrain
-At 08:30 ET (1 hour before market open), a **lighter fine-tune** (5K timesteps, LR=1e-5, last 500 bars only) adapts the PPO to overnight news, earnings reactions, and futures moves — closing the 23.5-hour gap between nightly retrains. Wrapped in its own RETRAIN-GUARD with **stricter thresholds** (rollback at -15% relative vs -20% for nightly).
-
-### 🤖 16. Gemini 2.5 Flash Tunes 100+ Parameters Every Night (v2.1 Prompt)
-At 03:30 AM ET, the bot sends full telemetry + **RETRAIN-GUARD history** (so Gemini sees whether recent retrains were accepted or rolled back) to **Gemini 2.5 Flash** with 25 parameter groups. Gemini now outputs a **200-500 word Chain-of-Thought reasoning block** before its JSON prescription, plus a **confidence self-rating** (low/med/high) that scales step sizes server-side (medium = half step, low = quarter step). This prevents uncertain guesses from moving real parameters.
-
-Every parameter — from `TRAILING_STOP_ATR_TRENDING` to `META_FILTER_MIN_PROB` to `PPO_MICRO_RETRAIN_LR` — is eligible for autonomous tuning. The bot genuinely writes its own configuration.
+This is not a moving-average crossover with extra steps. Thirty-one upgrades across fourteen strategy modules stack multiplicatively before any order hits the wire.
 
 ---
 
-## And That's Just the Headline Layers
+## How It Thinks
 
-Below those nine, sixteen more multiplicative gates stack before any order hits the wire:
+At the core is a **GTrXL Transformer-based PPO agent** (Parisotto 2020) that outputs portfolio weights across 8 symbols every 60 seconds. But raw PPO output is just the starting point — it flows through a pipeline that asks progressively harder questions before risking a dollar.
 
-| Layer | What It Does |
-|---|---|
-| **PPO-Stacking Divergence** | High-conviction disagreement between the transformer and the LightGBM ensemble → ×0.5 |
-| **Crowding Discount** | Correlated same-sign positions (AMD+NVDA+SMCI all long at 0.85 corr) get individually dampened — prevents effective mega-bets |
-| **Anti-Earnings Blackout** | Auto-close 1 day before earnings + zero new entries ±2/1 days (TSLA currently scheduled for Apr 21 auto-close) |
-| **Intraday Risk Pacing** | Down 0.5% today → CVaR budget × 0.5. Down 1.5% → × 0.2. Three consecutive losses → × 0.3. |
-| **Sentiment Level + Velocity** | LLM-debate level (bull/bear/analyst via Ollama 70B) **plus** 4-hour Δsentiment captures information arrival, not just steady state |
-| **Stacking Ensemble Overlay** | 160 LightGBM models (20 per symbol, 8-bar forward labels) provide meta-probability overlay |
-| **VIX / SPX Breadth Gates** | Longs dampened in bear regimes, shorts in bull regimes |
-| **1-Hour Trend Alignment** | 15-min signals must agree with 1-hour trend or get halved |
-| **Anti-Churn Gate** | Repeated stops in same direction decay confidence exponentially (0.5ⁿ) — prevents death spiral |
-| **Defensive Panic Mode** | 3+ correlated stop-outs in 5 minutes → 3-hour lockout on all new entries |
-| **Min Confidence Floor** | Final rejection of anything below the threshold |
-| **Equity-Curve Trader** | Treats the bot's own P&L as a time series — sizes down in drawdowns, up in winning streaks |
-| **CVaR Portfolio Optimization** | Ledoit-Wolf covariance shrinkage + conviction-weighted allocation |
-| **Notional Caps** | Hard safety: never more than 30% of equity in one name |
-| **Buying-Power Clamp** | Real-time Alpaca buying-power check |
-| **Regime-Scaled ATR Stops** | Trailing stop width changes with detected regime — trending = tight, mean-reverting = wide |
+**Is this signal real, or just a correlation?** A GES causal graph (Greedy Equivalence Search, pgmpy) maps the directed relationships between 56 features, the agent's action, and realized reward. If there's no genuine causal path from action to reward for the current market state, the signal gets dampened. The graph is bootstrapped from historical env rollouts with Gaussian exploration noise — because a converged PPO policy is near-deterministic, and GES needs treatment variance to identify edges. Rebuilt nightly.
+
+**Even if it's real, is this a good trade *right now*?** A nightly-trained LightGBM classifier sits after the PPO and asks a different question: "given that the model says go long here, what's the probability this particular trade wins?" This is Lopez de Prado's meta-labeling architecture (*Advances in Financial Machine Learning*, 2018) — separate the directional prediction from the bet-sizing decision. Candidates below threshold get rejected outright. The classifier refits every night as the closed-trade log grows, and its threshold is auto-tuned by Gemini based on observed calibration.
+
+**What regime are we actually in?** The legacy HMM detector labeled every bar "mean_reverting" at 95%+ persistence — even during clear multi-week rallies. It's been replaced by a five-voter ensemble: linear-regression slope, Wilder's ADX, lag-1 return autocorrelation, ATR range-expansion ratio, and HMM as a tiebreaker. Direction-consistency voting produces `trending_up`, `trending_down`, or `mean_reverting` with differentiated persistence (0.65–0.90, not stuck at ceiling). Regime flows into everything downstream — stop widths, take-profit distances, risk budgets, gate multipliers, and the PPO reward function itself.
+
+**What's the sentiment, and is it changing?** A serialized three-agent LLM debate (bull, bear, analyst) via Ollama's 70B model scores recent headlines per symbol. But the raw level (0.2–0.6 most of the time) saturates. What actually matters is the *velocity* — a stock whose sentiment jumped from 0.1 to 0.6 over four hours is a very different signal from one sitting at 0.6 all week. Both level and velocity are applied as direction-aware multipliers, with timeout protection so a hung Ollama inference can never freeze the trading loop.
+
+**Do PPO and the stacking ensemble agree?** 160 LightGBM models (20 per symbol, trained nightly on 8-bar forward labels) provide an independent meta-probability. When the transformer says "go hard long" but the ensemble predicts bearish, that high-conviction disagreement gets dampened to half strength. Agreement passes through.
 
 ---
 
-## How the 25+ Layers Actually Feel in Logs
+## How It Sizes
 
-Every cycle you see things like this scroll by:
+Once the signal pipeline decides *what* to trade, a separate stack decides *how much*.
 
-```
-[REGIME ENSEMBLE+HMM] SOFI | regime=trending_up | persistence=0.802
-[BAYESIAN-SIZE] SOFI:1.53 | TSLA:1.60 | JPM:0.59 | AAPL:0.62
-[CS-MOMENTUM] AMD:+1.82×1.25 | PLTR:-3.14×0.50
-SOFI sentiment blend: raw=0.433 → factor=1.07 | velocity_factor=0.973
-SOFI DIVERGENCE: PPO_dir=1 vs meta_signed=-0.55 — scaling ×0.5
-NVDA META-FILTER: P(win)=0.329 < 0.33 — REJECTED
-[RATCHET LOSS-TIGHTEN] SMCI unrealized -0.78% (MFE +0.00%) — tightening 2.65% → 1.46%
-✅ [CAUSAL PENALTY APPLIED in generate_portfolio_actions] portfolio — causal wrapper used
-[PORTFOLIO GATE] JPM: weight -0.1069 → -0.0534 (gates: 1H_TREND(1))
-[CVaR REGIME] Using Gemini-tuned risk budget: $535 | regime=mean_reverting
-```
+**Kelly-fractional Bayesian sizing.** Every symbol maintains a Beta(α, β) posterior on its win probability, updated after every closed trade. The sizing multiplier isn't a heuristic — it's the ¼-Kelly fraction, mathematically optimal for compound growth (Thorp, 1969). Symbols with strong win/loss ratios get boosted up to 1.6×; symbols that consistently bleed get dampened to 0.4×. Small-sample shrinkage prevents two lucky trades from tripling a position. Capital flows automatically to where the posterior shows real edge.
 
-Every decision is traceable. Every subsystem has a searchable log prefix. If something feels off, you can `grep` your way to exactly which layer did it.
+**Cross-sectional momentum.** Every cycle, the bot z-scores all symbols on a composite of 5-day return, 20-vs-60-day acceleration, volume momentum, and drawdown severity. Top-tercile symbols get boosted 1.25×; bottom-tercile dampened 0.50×. This captures "be where today's alpha is" without requiring a PPO retrain.
+
+**Crowding discount.** When AMD, NVDA, and SMCI are all long at 0.85 pairwise correlation, they're effectively one position — not three independent bets. The bot computes a 60-day return correlation matrix and discounts same-direction positions by their average peer correlation. Prevents a correlated cluster from becoming a single catastrophic bet.
+
+**Liquidity scaling.** Every position is checked against the symbol's average daily dollar volume. Participation above 0.1% of ADV starts getting dampened; above 1% it floors at 0.3×. Extended-hours thresholds are 5× tighter (volume is 10–20× thinner pre/post market). Currently dormant at $30K equity — auto-activates as the account grows.
+
+**CVaR portfolio optimization.** The final allocation uses Conditional Value-at-Risk with Ledoit-Wolf covariance shrinkage, buying-power clamping, and a notional cap of 30% per name. The CVaR budget itself is regime-scaled and Gemini-tuned nightly.
+
+---
+
+## How It Exits
+
+Entry timing gets all the attention, but exit timing is where 40–60% of alpha lives in directional strategies. The bot has four overlapping exit mechanisms.
+
+**Regime-conditional exits.** Now that the ensemble correctly differentiates trending from mean-reverting, exit parameters adapt to alignment. A long position in an uptrend gets a 1.4× wider take-profit and 1.25× wider trailing stop — letting the trend breathe. A counter-trend bet (short in an uptrend) gets tighter everything: take quick profits, accept quick stops. Mean-reverting positions take profits 15% faster than the base.
+
+**Asymmetric trailing stops.** Every position tracks its Maximum Favorable Excursion and Maximum Adverse Excursion in real time. The profit-side ratchet tightens progressively as unrealized P&L climbs. But if a position goes underwater and *never went meaningfully green* (MFE below 0.4%), the trail tightens to 55% of its original width — cutting dead losers before they become real ones.
+
+**TIME-STOP.** Positions held too long without meaningful movement in either direction are "dead trades" — the thesis isn't playing out. After 96 bars (~24 trading hours) with both MFE and MAE below 0.5%, the position is liquidated to free the slot for a better opportunity.
+
+**Software take-profit enforcement.** Alpaca can't hold two closing orders simultaneously, so the take-profit is enforced in software by the monitor loop, with the trailing stop submitted as the native Alpaca order.
+
+---
+
+## How It Protects Itself
+
+The signal pipeline is aggressive by nature — it has to be to find edge. The protection layer is equally aggressive about preventing that edge from being given back.
+
+**Intraday risk pacing.** The CVaR risk budget scales with today's P&L: down 0.5% gets a 50% budget cut, down 1.5% gets 80%, three consecutive losses today floors it at 30%. This is graduated throttling on top of the existing -3% hard daily halt.
+
+**Anti-earnings blackout.** A yfinance earnings calendar (weekly refresh) auto-closes positions one trading day before earnings and blocks new entries in a ±2/1-day window around the event. The single cheapest way to improve win rate — just don't hold through the gap.
+
+**Adverse-selection detection.** Every entry fill is timestamped and price-sampled at T+1, T+5, T+15, and T+30 minutes. The bot computes signed post-fill drift per symbol over a rolling window. When fills are consistently followed by adverse moves, that symbol is toxic — weight gets dampened up to 50%. This is the same technique sell-side market makers use to manage information asymmetry.
+
+**Slippage prediction veto.** A grouped-mean slippage model learns from real fills, bucketed by symbol, hour-of-day, and order size. Before each entry, it predicts expected slippage in basis points. If predicted slippage exceeds 1.2× expected alpha, the trade is skipped. The bot refuses to pay more in execution cost than it expects to earn.
+
+**RETRAIN-GUARD.** Every PPO retrain (nightly 75K timesteps at 18:00 ET) is checkpointed, validated before and after on a deterministic env rollout, and automatically rolled back if the new weights perform worse. On its very first run, it caught a -8012% relative degradation and restored the previous model in under a second. Without this, every downstream layer would have operated on a broken base for 24 hours.
+
+**Sentiment timeout protection.** The Ollama 70B model can hang (GPU OOM, CUDA errors, server crashes). Every individual sentiment debate has a 120-second timeout, and the full sentiment gather has a 300-second timeout. If either fires, the bot falls back to zero sentiment and keeps trading. This prevents a single stuck LLM call from freezing the entire signal pipeline — a failure mode that caused a 5-hour trading halt before the fix was deployed.
+
+---
+
+## How It Improves
+
+The bot doesn't wait for a human to tune it. Nine scheduled tasks run overnight and through the trading day.
+
+**Gemini 2.5 Flash self-tuning** (03:30 AM ET). The bot serializes its full performance profile — Sharpe, Sortino, drawdown, win rate, per-symbol P&L, PPO training scalars, regime distribution, and the history of recent RETRAIN-GUARD decisions — and sends it to Gemini with 25 parameter groups and hard bounds. Gemini writes a Chain-of-Thought reasoning block explaining its analysis, rates its own confidence (which scales step sizes server-side), and proposes changes inside a strict JSON schema. Every value is Pydantic-validated, category-clamped, and anti-oscillation-checked. With retry logic for transient API errors.
+
+**Pre-market micro-retrain** (08:30 AM ET). A lighter PPO fine-tune — 5K timesteps on the last 500 bars at 1e-5 learning rate — adapts the model to overnight news and futures moves before market open. Wrapped in its own RETRAIN-GUARD with stricter thresholds than the nightly run.
+
+**Nightly causal graph rebuild** (03:30 AM ET). GES rediscovers the causal DAG over the latest feature matrix + replay buffer, updating which features genuinely drive rewards.
+
+**Meta-filter refit** (03:30 AM ET). The Lopez-de-Prado classifier retrains on the growing closed-trade log. Brier calibration improves monotonically with sample size.
+
+**Regime precompute** (04:00 AM ET). The five-voter ensemble refreshes across all symbols in parallel.
+
+**EQ-SCORE daily scorecard** (04:30 PM ET). A structured JSON report of what every gate actually did today — per-symbol meta-filter rejects, divergence triggers, slippage vetos, cross-sectional placements, earnings blackouts, entries submitted vs. filled.
+
+**ALPHA-ATTR per-trade attribution** (on every trade close). Records the baseline PPO weight, final post-gate weight, aggregate transformation, MFE/MAE fingerprint, exit reason, and regime at open/close. Answers "which layer pushed this trade out of neutral?" for every single trade.
+
+**Earnings calendar refresh** (weekly via yfinance). Keeps the blackout windows current.
+
+**Universe rotation** (Friday 8 PM ET). Evaluates 34 candidate symbols by liquidity, regime quality, and recent performance. Swaps underperformers and triggers a full retrain on the new roster.
 
 ---
 
 ## It Runs Like a Production System
 
-This isn't a notebook experiment. It connects to a **real Alpaca broker**, streams live bars via WebSocket, places real limit orders with trailing stops and take-profits, handles fill events via an async state machine, persists every piece of learned state atomically across restarts, and self-heals from websocket disconnects. 24/7 uptime in paper trading mode.
+This connects to a real Alpaca broker, streams live bars via WebSocket, places real limit orders with trailing stops and take-profits, handles fill events through an async state machine, manages a full order lifecycle (pending entry → open → pending exit → closed), and persists every piece of learned state atomically across restarts. Currently running 24/7 in paper trading mode.
 
-All state persists across crashes: `meta_filter.pkl`, `bayesian_sizing.pkl`, `slippage_predictor.pkl`, `adverse_selection.pkl`, `earnings_cache.pkl`, `causal_cache_portfolio.pkl`, `replay_buffer_portfolio.pkl`, `order_tracker.json`, `regime_cache.json` (schema-versioned), `live_signal_history.json`. Every learned quantity survives a restart and keeps growing.
-
----
-
-## Nightly Self-Improvement Cycle
-
-While you're asleep, nine things happen on schedule:
-
-| Time (ET) | What Runs |
-|---|---|
-| **03:30 AM** | Full telemetry + RETRAIN-GUARD history → Gemini 2.5 Flash (v2.1 CoT prompt) → parameter adjustments → Pydantic validation → atomic apply + structured audit log |
-| **03:30 AM** | GES causal graph rebuild with latest feature data + replay buffer |
-| **03:30 AM** | Meta-label classifier retrained on updated live_signal_history |
-| **03:30 AM** | yfinance earnings calendar sweep (weekly TTL, uses cache when fresh) |
-| **04:00 AM** | Parallel ensemble regime detection refresh across all symbols |
-| **08:30 AM** | **A4 pre-market micro-retrain** — 5K timesteps on last 500 bars, LR=1e-5, with strict RETRAIN-GUARD |
-| **04:30 PM** | **EQ-SCORE** daily execution-quality scorecard emitted (JSON + one-liner) |
-| **06:00 PM** | Online PPO retrain (~75K timesteps) — **RETRAIN-GUARD** validates + auto-rolls back if degraded |
-| **Friday 8 PM** | Universe rotation — evaluate 34 candidates, swap losers, full retrain on new roster |
-
----
-
-## Core Capabilities (Reference)
-
-| Capability | Implementation |
-|---|---|
-| **Portfolio Optimization** | CVaR with Ledoit-Wolf shrinkage, regime-scaled budgets, intraday pacing, Bayesian per-symbol sizing, buying-power enforcement |
-| **Signal Blend** | 8-layer stack: Portfolio PPO → stacking ensemble → causal penalty → Bayesian sizing → cross-sectional momentum → crowding discount → sentiment (level + velocity) → gate cascade |
-| **56 Input Features** | Bollinger Bands, RSI, MACD, ATR, CCI, Stochastic, OBV z-score, Chaikin flow, VWAP deviation, volume imbalance, divergence detection, SMA(50/200) + golden cross, hourly-refreshed macro (VIX/yield curve/SPX), TFT encoder embeddings, regime flags |
-| **Meta-Labeling Filter** | Lopez-de-Prado-style post-PPO binary classifier (LightGBM); nightly refit |
-| **Bayesian Sizing** | Beta(α, β) posterior per symbol; sizing multiplier ∈ [0.4×, 1.6×] with small-sample shrinkage |
-| **Ensemble Regime Detection** | 5-voter (slope + ADX + autocorr + range + HMM); direction-consistency aggregation |
-| **Cross-Sectional Momentum** | Daily z-score ranking; top tercile × 1.25, bottom × 0.50 |
-| **Correlation-Aware Sizing** | 60-day return correlations → same-sign cluster discount |
-| **Adverse-Selection Detector** | Rolling 20-fill post-fill drift tracker; toxic symbols dampened up to 50% |
-| **Slippage Veto** | Grouped-mean predictor over (symbol, hour, size); veto when predicted > 1.2× alpha |
-| **PPO-Stacking Divergence Gate** | Dampens to × 0.5 on high-conviction disagreement |
-| **Asymmetric Trailing Stops** | MFE/MAE-gated loss-side tightening (trail → 55% of original ATR width) |
-| **Intraday Risk Pacing** | Graduated CVaR throttle: -0.5% → × 0.5, -1.5% → × 0.2, 3 losses → × 0.3 |
-| **Anti-Earnings Filter** | yfinance calendar; auto-close 1 day pre-earnings; blackout ±2/1 days |
-| **Sentiment: Level + Velocity** | Serialized 3-agent LLM debate (Ollama 70B + 8B fallback); Δsentiment over 4h |
-| **Causal RL Overlay** | GES graph + noise-injected bootstrap + column-cap for tractability |
-| **Adaptive Exits** | Alpaca native trailing stops + software take-profit + profit-tier ratchet + loss-tighten |
-| **Walk-Forward Validation** | 6-window walk-forward threshold optimization with IS/OOS gap monitoring and overfitting rejection |
-| **Adaptive Memory** | Real-time anti-churn, cross-asset panic detection, online Bayesian signal-component reweighting |
-| **Self-Tuning** | Gemini 2.5 Flash with 22 parameter groups, Pydantic-validated bounds, anti-oscillation history |
-| **Dynamic Universe Rotation** | Weekly evaluation of 34 candidate symbols; auto retrain on roster changes |
-| **State Persistence** | Atomic writes for every learned quantity; schema-versioned where it matters |
-| **Structured Observability** | Searchable log prefixes for every subsystem + TensorBoard for PPO curves |
+Fourteen state files round-trip across crashes: `order_tracker.json`, `regime_cache.json` (schema-versioned), `meta_filter.pkl`, `bayesian_sizing.pkl`, `slippage_predictor.pkl`, `adverse_selection.pkl`, `earnings_cache.pkl`, `causal_cache_portfolio.pkl`, `replay_buffer_portfolio.pkl`, `live_signal_history.json`, `execution_scorecard_log.jsonl`, `alpha_attribution_log.jsonl`, `dynamic_config.json`, `tuning_history.json`. Every learned quantity survives a restart and keeps growing.
 
 ---
 
@@ -228,82 +114,64 @@ While you're asleep, nine things happen on schedule:
 ```
 trading_bot/
 |
-|-- bot.py                          # Async event loop + orchestration
-|-- config.py                       # 100+ settings, Pydantic-validated
-|-- __main__.py                     # Entry point
-|-- backtest.py                     # Full backtesting engine
-|-- gemini_tuner.py                 # Gemini 2.5 Flash v2.1 (25 parameter groups, CoT reasoning)
+|-- bot.py                          # Async event loop, 9 scheduled tasks, trading loop
+|-- config.py                       # 100+ Pydantic-validated settings
+|-- gemini_tuner.py                 # Gemini 2.5 Flash v2.1 (25 groups, CoT reasoning)
 |
 |-- broker/
-|   |-- alpaca.py                   # Orders + ratchet + asymmetric loss-tighten + reattach qty-drift fix
-|   |-- stream.py                   # WebSocket fills + AVA + slippage + Bayesian posterior update
-|   |-- order_tracker.py            # State machine with MFE/MAE per-position tracking
+|   |-- alpaca.py                   # Orders, ratchet, asymmetric loss-tighten, TIME-STOP
+|   |-- stream.py                   # WebSocket fills, AVA recording, slippage + Bayesian updates
+|   |-- order_tracker.py            # State machine with MFE/MAE per position
 |
 |-- strategy/
-|   |-- signals.py                  # Signal blend + 18-layer gate cascade
+|   |-- signals.py                  # Signal blend + gate cascade (timeout-protected)
 |   |-- regime.py                   # 5-voter ensemble (slope + ADX + autocorr + range + HMM)
 |   |-- risk.py                     # CVaR + intraday pacing + Kelly sizing
-|   |-- portfolio_rebalancer.py     # Portfolio-level rebalance + causal final scaling
-|   |-- universe.py                 # Weekly universe rotation
 |   |-- meta_filter.py              # Lopez-de-Prado P(win) classifier
-|   |-- bayesian_sizing.py          # Per-symbol Beta posteriors
-|   |-- cross_sectional.py          # Daily z-score momentum ranker
+|   |-- bayesian_sizing.py          # Per-symbol Beta posteriors + Kelly fraction
+|   |-- cross_sectional.py          # Daily z-score momentum ranking
 |   |-- correlation_discount.py     # Crowding-aware position sizing
 |   |-- earnings_filter.py          # Anti-earnings blackout + auto-close
-|   |-- slippage_predictor.py       # Grouped-mean slippage predictor
+|   |-- slippage_predictor.py       # Grouped-mean slippage predictor + veto
 |   |-- adverse_selection.py        # Post-fill toxicity detector
-|   |-- cognitive.py                # Equity curve trader + profit velocity + autopsy
-|   |-- execution_scorecard.py      # [NEW] EQ-SCORE daily gate-activity summary
-|   |-- alpha_attribution.py        # [NEW] Per-trade alpha attribution logger
+|   |-- execution_scorecard.py      # EQ-SCORE daily gate-activity summary
+|   |-- alpha_attribution.py        # Per-trade alpha attribution logger
+|   |-- cognitive.py                # Equity-curve trader + profit velocity + autopsy
+|   |-- portfolio_rebalancer.py     # Portfolio-level rebalance + causal scaling
+|   |-- universe.py                 # Weekly universe rotation
 |
 |-- models/
-|   |-- trainer.py                  # PPO/RecurrentPPO training
-|   |-- env.py                      # Per-symbol Gym env
-|   |-- portfolio_env.py            # Multi-asset portfolio Gym env
+|   |-- trainer.py                  # PPO training + RETRAIN-GUARD + micro-retrain
+|   |-- env.py / portfolio_env.py   # Gym environments (per-symbol + multi-asset)
 |   |-- features.py                 # 56-feature generator (hourly macro refresh)
-|   |-- policies.py                 # Custom AuxGTrXL policy (Parisotto 2020 + aux vol head)
+|   |-- policies.py                 # AuxGTrXL policy (gated transformer + aux vol head)
 |   |-- stacking_ensemble.py        # 20-model LightGBM bootstrap ensemble
 |   |-- causal_signal_manager.py    # GES + noise-injected bootstrap + column cap
-|   |-- causal_rl_manager.py        # Causal buffer persistence
-|   |-- bot_initializer.py          # Startup orchestration
-|   |-- ppo_utils.py                # PPO save/load
 |
 |-- data/
-|   |-- handler.py                  # ArcticDB + Redis + Polygon/Alpaca fetch
-|   |-- ingestion.py                # Real-time stream + backfill
+|   |-- handler.py                  # ArcticDB + Redis + Polygon/Alpaca/yfinance
+|   |-- ingestion.py                # Real-time bar stream + historical backfill
 |
 |-- utils/
-|   |-- helpers.py                  # Market hours, holiday calendar
-|   |-- local_llm.py                # Serialized Ollama multi-agent debate
-|   |-- log_setup.py                # Logging configuration
+|   |-- local_llm.py                # Serialized Ollama debate (timeout-protected)
+|   |-- helpers.py                  # Market hours, holidays
+|   |-- log_setup.py                # Logging config
 ```
 
 ---
 
 ## Getting Started
 
-### Prerequisites
-
-- Python 3.11+
-- CUDA-capable GPU (recommended for PPO + TFT)
-- [Alpaca](https://alpaca.markets/) account (paper trading keys work fine)
-- [Redis](https://redis.io/) (caching)
-- [Ollama](https://ollama.ai/) with `sentiment-70b` and `llama3.1:8b` (sentiment)
-- [Gemini API key](https://ai.google.dev/) (optional, for self-tuning)
-- [NewsAPI key](https://newsapi.org/) (optional, for news sentiment)
-
-### Setup
+**Prerequisites:** Python 3.11+, CUDA GPU (recommended), [Alpaca](https://alpaca.markets/) account, [Redis](https://redis.io/), [Ollama](https://ollama.ai/) with `sentiment-70b` and `llama3.1:8b`. Optional: [Gemini API key](https://ai.google.dev/), [NewsAPI key](https://newsapi.org/).
 
 ```bash
 git clone https://github.com/mmccarney370/nyse-trading-bot.git
 cd nyse-trading-bot
-
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`.env`:
+Create `.env`:
 ```env
 ALPACA_API_KEY=your_key
 ALPACA_API_SECRET=your_secret
@@ -311,105 +179,49 @@ GEMINI_API_KEY=your_gemini_key       # optional
 NEWS_API_KEY=your_newsapi_key        # optional
 ```
 
-Ollama models:
 ```bash
-ollama pull llama3.1:8b
-ollama pull sentiment-70b   # optional; 8B is used as fallback
+python __main__.py                   # live paper trading
+python run_backtest.py --start 2025-01-01 --end 2025-12-31  # backtest
 ```
 
-### Running
-
-```bash
-# Live paper trading
-python __main__.py
-
-# Backtest
-python run_backtest.py --start 2025-01-01 --end 2025-12-31
-```
-
-First startup takes **5–6 minutes** (TFT precompute, stacking ensemble training, causal bootstrap, meta-filter fit, earnings calendar refresh). Subsequent starts are faster with cached models and state files.
-
-Logs: `logs/nyse_bot.log` + `nyse_bot.log` (root) | Training curves: `tensorboard --logdir ppo_tensorboard`
+First startup takes 5–6 minutes (TFT precompute, stacking training, causal bootstrap, meta-filter fit). Subsequent starts are faster with cached models. Logs: `logs/nyse_bot.log` | Training curves: `tensorboard --logdir ppo_tensorboard`
 
 ---
 
 ## Configuration
 
-Everything lives in `config.py` with Pydantic validation. **100+ tunable parameters** across 22 groups — every one of them eligible for autonomous nightly tuning by Gemini inside clamped safety bounds.
-
-| Group | Example Parameters |
-|---|---|
-| **Risk** | `RISK_PER_TRADE_*`, `MAX_LEVERAGE`, `KELLY_FRACTION`, `MAX_POSITIONS` |
-| **Intraday Pacing** | `RISK_PACING_TIER1_LOSS`, `TIER2_LOSS`, `CONSECUTIVE_LOSSES` |
-| **Regime Ensemble** | `REGIME_SLOPE_THRESHOLD`, `REGIME_ADX_*`, `REGIME_AUTOCORR_*`, `REGIME_RANGE_*` |
-| **Execution** | `TRAILING_STOP_ATR_*`, `TAKE_PROFIT_ATR_*`, `RATCHET_*` |
-| **Asymmetric Trailing** | `RATCHET_LOSS_TIGHTEN_THRESHOLD`, `_FACTOR`, `_MFE_MAX` |
-| **PPO** | `PPO_LEARNING_RATE`, `PPO_ENTROPY_COEFF`, `GTRXL_*`, `SORTINO_WEIGHT` |
-| **Signal Blend** | `PORTFOLIO_META_WEIGHT`, `SENTIMENT_WEIGHT`, `SENTIMENT_VELOCITY_WEIGHT`, `MIN_CONFIDENCE` |
-| **Meta-Filter** | `META_FILTER_MIN_PROB`, `META_FILTER_MIN_TRAIN` |
-| **Bayesian Sizing** | `BAYESIAN_SIZING_MIN_MULT`, `_MAX_MULT`, `_REFERENCE_EV`, `_SHRINKAGE_N` |
-| **Cross-Sectional** | `CROSS_SECTIONAL_WEIGHT`, `_MAX_MULT`, `_MIN_MULT` |
-| **Crowding** | `CROWDING_DISCOUNT_THRESHOLD`, `_STRENGTH`, `_MIN_FACTOR` |
-| **Earnings** | `EARNINGS_BLACKOUT_PRE_DAYS`, `_POST_DAYS`, `_CLOSE_PRE_DAYS` |
-| **Slippage** | `SLIPPAGE_VETO_MULTIPLE`, `_SCALE` |
-| **Divergence** | `DIVERGENCE_GATE_SCALE`, `_MIN_WEIGHT`, `_MIN_META` |
-| **Adverse Selection** | `ADVERSE_SELECTION_THRESHOLD`, `_MAX_PENALTY` |
-| **Causal** | `CAUSAL_PENALTY_WEIGHT`, `CAUSAL_MAX_FEATURES`, `CAUSAL_BOOTSTRAP_*` |
-| **Reward Shaping** | `DD_PENALTY_COEF`, `VOL_PENALTY_COEF`, `TURNOVER_COST_MULT`, `SORTINO_WEIGHT` |
-| **Universe** | `UNIVERSE_CANDIDATES`, `MAX_UNIVERSE_SIZE` |
-| **Tuning** | Gemini schedule, safety bounds |
+Everything lives in `config.py` with Pydantic validation — 100+ tunable parameters across 25 groups, all eligible for autonomous nightly tuning by Gemini inside safety-clamped bounds. Key groups: Risk, Intraday Pacing, Regime Ensemble, Execution, Asymmetric Trailing, PPO, Signal Blend, Meta-Filter, Bayesian Sizing, Cross-Sectional, Crowding, Earnings, Slippage, Divergence, Adverse Selection, Causal, Reward Shaping, Universe, Tuning, RETRAIN-GUARD, Micro-Retrain, TIME-STOP, Liquidity, Kelly, REX.
 
 ---
 
 ## Monitoring
 
-Every subsystem logs with a searchable ripgrep-friendly prefix:
+Every subsystem logs with a searchable prefix — `rg '[BAYESIAN-SIZE]'` or `rg '[RETRAIN-GUARD]'` instantly filters to the layer you care about. Key prefixes: `[CVaR]`, `[RISK PACING]`, `[REGIME ENSEMBLE+HMM]`, `[CAUSAL PENALTY APPLIED]`, `[RATCHET LOSS-TIGHTEN]`, `[META-FILTER]`, `[BAYESIAN-SIZE]`, `[CS-MOMENTUM]`, `[CROWDING-DISCOUNT]`, `[EARNINGS BLACKOUT]`, `[ADVERSE-SEL]`, `[SLIPPAGE-VETO]`, `[DIVERGENCE]`, `[TIME-STOP]`, `[RETRAIN-GUARD]`, `[MICRO-RETRAIN]`, `[EQ-SCORE]`, `[ALPHA-ATTR]`, `[GEMINI REASONING]`, `[SENTIMENT TIMEOUT]`.
 
-| Prefix | Subsystem |
-|---|---|
-| `[CVaR]` / `[RISK PACING]` | Position sizing + intraday throttling |
-| `[REGIME ENSEMBLE+HMM]` / `[REGIME CACHE]` | 5-voter regime detection |
-| `[CAUSAL BUILD SUCCESS]` / `[CAUSAL PENALTY APPLIED]` / `[CAUSAL BOOTSTRAP]` | Causal graph lifecycle |
-| `[TRACKER]` / `[RATCHET]` / `[RATCHET LOSS-TIGHTEN]` | Order state + trailing stops |
-| `[META-FILTER]` | Meta-label classifier fit + gate decisions |
-| `[BAYESIAN-SIZE]` | Per-symbol posterior + multiplier |
-| `[CS-MOMENTUM]` | Cross-sectional daily ranking |
-| `[CROWDING-DISCOUNT]` | Correlation-aware sizing |
-| `[EARNINGS]` / `[EARNINGS BLACKOUT]` / `[EARNINGS AUTO-CLOSE]` | Anti-earnings events |
-| `[ADVERSE-SEL]` / `SLIPPAGE-VETO` | Execution quality gates |
-| `[DIVERGENCE]` | PPO-stacking disagreement |
-| `[STREAM]` / `[TP HIT]` / `[STOP HIT]` | Fills + OCO logic |
-| `[PORTFOLIO GATE]` | Multi-layer confidence cascade |
-| `[CHURN]` / `[PANIC DETECT]` / `[DEFENSIVE]` | Adaptive memory state |
-| `[GEMINI]` | Nightly self-tuning events |
-
-TensorBoard at `tensorboard --logdir ppo_tensorboard` shows reward curves, clip fraction, explained variance, policy entropy.
-
-`order_tracker.json` holds live position state with MFE/MAE per symbol — watch it in real time.
+TensorBoard at `tensorboard --logdir ppo_tensorboard`. Live position state in `order_tracker.json` with MFE/MAE per symbol. Daily gate-activity scorecard in `execution_scorecard_log.jsonl`. Per-trade attribution in `alpha_attribution_log.jsonl`.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| "Insufficient features for stacking" | Not enough bars | Wait for cache fill (~300 bars) |
-| "CVaR fell back to parity" | Sparse overlapping returns | Need 50+ bars per symbol |
-| "HMM ensemble failed" | Flat data | Normal — ensemble's 4 other voters still fire |
-| `GES discovered 0 edges` | Deterministic PPO | Fixed v2.0 — bootstrap injects `CAUSAL_BOOTSTRAP_NOISE_SIGMA=0.4` |
-| Meta-filter rejecting everything | Threshold > model's mean pred | Lower `META_FILTER_MIN_PROB` (default 0.33) |
-| BPS mult stuck at 1.0 | < `SHRINKAGE_N` closed trades | Normal — shrinks to neutral on small samples |
-| News API `rateLimited` | NewsAPI free tier = 100/day | Sentiment falls back to 0.0; upgrade tier for more |
-| `[PANIC DETECT]` triggering | 3+ symbols stopped in 5 min | Working as intended — defensive mode during crashes |
-| Alpaca websocket reconnects | Stream blip | Auto-reconnects |
-| `insufficient qty available` on reattach | Tracker/Alpaca qty drift | Fixed v2.0 — reattach re-queries live qty |
-| TFT features all zero | Cache rebuild needed | Delete `ppo_checkpoints/tft_cache/` |
+| Symptom | Fix |
+|---|---|
+| "CVaR fell back to parity" | Need 50+ overlapping bars per symbol |
+| `GES discovered 0 edges` | Fixed — bootstrap injects noise (`CAUSAL_BOOTSTRAP_NOISE_SIGMA=0.4`) |
+| Meta-filter rejecting everything | Lower `META_FILTER_MIN_PROB` (default 0.33) |
+| BPS multiplier stuck at 1.0 | Normal — shrinkage blends toward neutral with < 8 closed trades |
+| News API `rateLimited` | Sentiment falls back to 0.0; upgrade NewsAPI tier for more |
+| `[SENTIMENT TIMEOUT]` firing | Ollama 70B hung — sentiment returns 0.0, trading continues normally |
+| `[RETRAIN-GUARD] ROLLBACK` | Working as intended — bad retrain caught and reverted |
+| `[TIME-STOP]` close failed | Fixed — now uses `close_position_safely` (cancels stop before close) |
+| `insufficient qty available` on reattach | Fixed — reattach re-queries live Alpaca qty before submitting |
+| Alpaca websocket reconnects | Auto-recovers; check API keys if persistent |
 
 ---
 
-## Documentation
+## Technical Deep-Dive
 
-See [**`WHITEPAPER.md`**](./WHITEPAPER.md) for the detailed technical design: mathematical formulations, architectural rationale, algorithmic choices, and research-paper citations behind every subsystem.
+See [**`WHITEPAPER.md`**](./WHITEPAPER.md) for mathematical formulations, architectural rationale, algorithm derivations, and research citations behind every subsystem.
 
 ---
 
