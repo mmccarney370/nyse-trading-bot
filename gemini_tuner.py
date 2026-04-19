@@ -511,11 +511,38 @@ Schema:
   "confidence": "low | medium | high   (self-assessed confidence that these changes improve performance; default medium unless triage=HEALTHY→low or you have strong evidence→high)"
 }}"""
     try:
-        # M11 FIX: Add timeout to prevent indefinite blocking if Gemini API hangs
-        response = client.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt,
-            config={"httpOptions": {"timeout": 120_000}}  # timeout in milliseconds
-        )
+        # M11 FIX: Add timeout to prevent indefinite blocking if Gemini API hangs.
+        # Apr-19: exponential backoff on transient failures (503 UNAVAILABLE,
+        # timeouts, DEADLINE_EXCEEDED) — the Apr-17 503 silently skipped a full
+        # tuning cycle with no retry.
+        import time as _time
+        response = None
+        _last_err = None
+        _retry_delays = [5, 15, 45]  # seconds; total ~1min of retries before giving up
+        _transient_markers = ("503", "unavailable", "deadline", "timeout",
+                              "temporarily", "resourceexhausted", "429")
+        for _attempt in range(len(_retry_delays) + 1):
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash", contents=prompt,
+                    config={"httpOptions": {"timeout": 120_000}}
+                )
+                break
+            except Exception as _api_err:
+                _last_err = _api_err
+                _msg = str(_api_err).lower()
+                _is_transient = any(m in _msg for m in _transient_markers)
+                if not _is_transient or _attempt >= len(_retry_delays):
+                    raise
+                _delay = _retry_delays[_attempt]
+                logger.warning(
+                    f"[GEMINI TUNER] transient API error ({type(_api_err).__name__}): "
+                    f"{str(_api_err)[:160]} — retrying in {_delay}s "
+                    f"(attempt {_attempt + 1}/{len(_retry_delays)})"
+                )
+                _time.sleep(_delay)
+        if response is None:
+            raise _last_err if _last_err else RuntimeError("Gemini call failed with no response")
         content = response.text.strip()
         # FIX: Use regex for robust fence stripping (was fragile with trailing whitespace)
         import re as _re

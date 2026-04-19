@@ -670,6 +670,10 @@ class TradingBot:
                 except Exception as e:
                     logger.error(f"Portfolio PPO inference/rebalance failed: {e}", exc_info=True)
             else:
+                # Apr-19 FIX: reset per-cycle BP reservation so sequential
+                # per-symbol sizing calls correctly decrement a shared budget.
+                if hasattr(self.risk_manager, 'reset_bp_budget'):
+                    self.risk_manager.reset_bp_budget()
                 for symbol in self.config['SYMBOLS']:
                     signal_data = self.data_ingestion.get_latest_data(symbol, timeframe='15Min')
                     if len(signal_data) < 200:

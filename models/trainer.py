@@ -290,11 +290,21 @@ class Trainer:
             )
             if gap_ratio > 0.50 and is_oos_gap > 2.0:
                 logger.warning(f"{symbol} window {w+1} shows significant overfitting — gap {is_oos_gap:.2f} ({gap_ratio:.0%} of IS)")
-            # Only accept if OOS is non-negative (prevents accepting money-losing thresholds)
-            if oos_sharpe > 0.0:
+            # Accept unless OOS is clearly destructive. Previous gate `oos > 0.0`
+            # silently rejected windows with small negative OOS (e.g. -0.2 to 0)
+            # even when IS was modest and the absolute gap was small. Relax to
+            # a two-part gate: allow slightly-negative OOS when (a) the IS→OOS
+            # gap is small AND (b) OOS is above an absolute floor. This keeps
+            # truly overfit windows out but stops throwing away borderline
+            # noise (the Apr-19 pattern where 6/8 symbols had 6–9% gaps).
+            oos_floor = self.config.get('OOS_SHARPE_ACCEPT_FLOOR', -0.25)
+            gap_cap = self.config.get('OOS_ACCEPT_MAX_GAP_RATIO', 0.35)
+            accept = (oos_sharpe > 0.0) or (
+                oos_sharpe > oos_floor and gap_ratio < gap_cap
+            )
+            if accept:
                 final_long_thresh = best.params['long_thresh']
                 final_short_thresh = best.params['short_thresh']
-                # Small safety clamp
                 final_long_thresh = max(0.50, min(0.85, final_long_thresh))
                 final_short_thresh = max(0.15, min(0.50, final_short_thresh))
                 chunk_start_time = df.index[chunk_start]
@@ -306,7 +316,6 @@ class Trainer:
                     'sharpe_is': is_sharpe,
                     'sharpe_oos': oos_sharpe
                 })
-                # Prune to last 12 entries inline to prevent memory bloat
                 if len(thresh_list) > 12:
                     self.confidence_thresholds[symbol] = thresh_list[-12:]
                 logger.info(
@@ -314,7 +323,10 @@ class Trainer:
                     f"long>{final_long_thresh:.3f}, short<{final_short_thresh:.3f} (IS {is_sharpe:.2f} | OOS {oos_sharpe:.2f})"
                 )
             else:
-                logger.warning(f"{symbol} window {w+1} rejected — poor OOS performance")
+                logger.warning(
+                    f"{symbol} window {w+1} rejected — "
+                    f"OOS={oos_sharpe:.3f} (floor={oos_floor}) gap_ratio={gap_ratio:.0%} (cap={gap_cap:.0%})"
+                )
         if not self.confidence_thresholds.get(symbol):
             fallback_time = data.index[-1]
             self.confidence_thresholds[symbol] = [{

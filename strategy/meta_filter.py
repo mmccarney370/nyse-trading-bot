@@ -275,14 +275,26 @@ class MetaLabeler:
         min_prob: float,
         **kwargs,
     ) -> Tuple[bool, float]:
-        """Return (accept, prob). accept=True if prob >= min_prob OR model
-        not yet fitted (pass-through)."""
+        """Return (accept, prob). accept=True if prob >= (Brier-adjusted min_prob)
+        OR model not yet fitted (pass-through)."""
         prob = self.predict_prob(symbol=symbol, direction=direction, **kwargs)
         with self._lock:
             fitted = self.model is not None
+            brier = float(self.train_stats.get("brier", 0.30))
         if not fitted:
             return True, 0.5
-        return prob >= min_prob, prob
+        # Brier-calibrated threshold: tighten when the model is well-calibrated
+        # (brier < 0.30), loosen when poorly calibrated. Clipped to [0.35, 0.55]
+        # so the threshold can never collapse below a sane floor.
+        adjusted_min = min_prob * (1.0 + (0.30 - brier) * 2.0)
+        adjusted_min = float(np.clip(adjusted_min, 0.35, 0.55))
+        return prob >= adjusted_min, prob
+
+    def is_fitted(self) -> bool:
+        """Used by callers that want to apply a pre-fit dampener rather than
+        treating `should_enter` pass-through as genuine acceptance."""
+        with self._lock:
+            return self.model is not None
 
     # ------------------------------------------------------------------
     # Persistence

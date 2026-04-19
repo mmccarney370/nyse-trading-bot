@@ -168,6 +168,8 @@ class CausalSignalManager:
 
     def _background_graph_build(self):
         """Runs the expensive graph build in a background thread (H20 FIX)."""
+        _t0 = time.time()
+        _status = "deferred"
         try:
             _regime_cache = {}
             try:
@@ -182,6 +184,7 @@ class CausalSignalManager:
             if self.symbol == "portfolio":
                 if self.data_ingestion is None:
                     logger.warning("[CAUSAL LAZY] Portfolio — no data_ingestion reference — cannot build graph")
+                    _status = "no_data_ingestion"
                     return
                 all_features = []
                 symbol_list = CONFIG.get('SYMBOLS', [])
@@ -196,29 +199,50 @@ class CausalSignalManager:
                             all_features.append(features)
                 if not all_features:
                     logger.warning("[CAUSAL LAZY] Portfolio — no valid symbol data — deferring")
+                    _status = "no_features"
                     return
                 full_matrix = np.vstack(all_features)
                 features_df = pd.DataFrame(full_matrix, columns=[f'feat_{i}' for i in range(full_matrix.shape[1])])
             else:
                 if self.data_ingestion is None:
+                    _status = "no_data_ingestion"
                     return
                 data = self.data_ingestion.get_latest_data(self.symbol, timeframe='15Min')
                 if len(data) < 200:
+                    _status = "insufficient_bars"
                     return
                 sym_regime = _regime_cache.get(self.symbol, 'mean_reverting')
                 if isinstance(sym_regime, list):
                     sym_regime = sym_regime[0]
                 features = generate_features(data, sym_regime, self.symbol, data)
                 if features is None or features.shape[0] == 0:
+                    _status = "no_features"
                     return
                 features_df = pd.DataFrame(features, columns=[f'feat_{i}' for i in range(features.shape[1])])
 
             self.build_causal_graph(features_df)
+            edges = 0
+            try:
+                if getattr(self, 'causal_graph', None) is not None:
+                    edges = self.causal_graph.number_of_edges()
+            except Exception:
+                pass
+            _status = "built"
+            logger.info(
+                f"[CAUSAL LAZY BUILD] {self.symbol} — graph build complete "
+                f"(edges={edges}, elapsed={time.time() - _t0:.1f}s)"
+            )
         except Exception as e:
             logger.warning(f"[CAUSAL BG BUILD] Failed for {self.symbol}: {e}")
             self._last_build_fail = time.time()
+            _status = "failed"
         finally:
             self._build_in_progress = False
+            if _status not in ("built", "failed"):
+                logger.info(
+                    f"[CAUSAL LAZY BUILD] {self.symbol} — exited without building "
+                    f"(reason={_status}, elapsed={time.time() - _t0:.1f}s)"
+                )
 
     def build_causal_graph(self, features_df: pd.DataFrame):
         """Robust causal graph build with downsampling to max 8000 rows + disk caching.

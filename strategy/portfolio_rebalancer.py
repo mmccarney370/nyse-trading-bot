@@ -151,20 +151,21 @@ class PortfolioRebalancer:
                 target_weights_dict[sym] *= (1.0 + (persistence - 0.7) * 0.6)
                 logger.debug(f"[REGIME PERSISTENCE] {sym} boosted by persistence {persistence:.3f}")
 
-        # 2. Causal penalty (multiplicative)
-        # HIGH-21 FIX: Generate per-symbol observations instead of using full portfolio obs for all
+        # 2. Causal penalty — Apr-19 audit fix: DEFERRED to the very end of the
+        # rebalance pipeline (applied AFTER min-hold, just before final renorm)
+        # so that any upstream gate reading |weight| as confidence does not see
+        # a causal-damped value and mis-calibrate itself. We compute the
+        # penalties here (needs per-symbol features) but apply them later.
+        causal_penalty_by_sym: Dict[str, float] = {}
+        defer_causal = bool(self.config.get('CAUSAL_PENALTY_AFTER_GATES', True))
         if hasattr(self.signal_gen, 'portfolio_causal_manager') and self.signal_gen.portfolio_causal_manager is not None:
             try:
                 from models.features import generate_features as _gen_feat
                 for i, sym in enumerate(symbols):
-                    # Build per-symbol observation for causal penalty
                     sym_data = data_dict.get(sym)
                     if sym_data is not None and len(sym_data) >= 50:
                         regime_tuple = regimes.get(sym, ('mean_reverting', 0.5))
                         regime_str = regime_tuple[0] if isinstance(regime_tuple, (list, tuple)) else regime_tuple
-                        # FIX #38: Pass full historical data from ingestion as full_hist_df
-                        # instead of reusing sym_data (which may be a truncated window).
-                        # TFT encoder and long-lookback features benefit from full history.
                         full_hist = None
                         if hasattr(self.risk_manager, 'data_ingestion') and self.risk_manager.data_ingestion is not None:
                             try:
@@ -175,14 +176,11 @@ class PortfolioRebalancer:
                         if sym_features is not None and sym_features.shape[0] > 0:
                             sym_obs = sym_features[-1:].reshape(1, -1)
                         else:
-                            # FIX #13: Skip causal penalty instead of using wrong-dimension portfolio obs
                             logger.debug(f"[CAUSAL DIM GUARD] {sym}: per-symbol features empty, skipping causal penalty (factor=1.0)")
                             continue
                     else:
-                        # FIX #13: Skip causal penalty instead of using wrong-dimension portfolio obs
                         logger.debug(f"[CAUSAL DIM GUARD] {sym}: insufficient data ({len(sym_data) if sym_data is not None else 0} bars), skipping causal penalty (factor=1.0)")
                         continue
-                    # FIX #44: Dimension sanity check — causal manager expects 2D input [1, n_features]
                     if hasattr(sym_obs, 'ndim'):
                         if sym_obs.ndim == 1:
                             sym_obs = sym_obs.reshape(1, -1)
@@ -192,13 +190,19 @@ class PortfolioRebalancer:
                         sym_obs,
                         target_weights_dict.get(sym, 0.0)
                     )
-                    old_weight = target_weights_dict[sym]
-                    target_weights_dict[sym] *= penalty_factor
-                    if penalty_factor != 1.0:
-                        logger.debug(f"[CAUSAL ADJUST] {sym}: {old_weight:.4f} * {penalty_factor:.4f} = {target_weights_dict[sym]:.4f}")
-                logger.info(f"[CAUSAL FINAL SCALING] Applied as multiplicative adjustment to CVaR weights")
+                    causal_penalty_by_sym[sym] = float(penalty_factor)
+                    if not defer_causal:
+                        # Legacy path — apply inline (kept for safety toggle).
+                        old_weight = target_weights_dict[sym]
+                        target_weights_dict[sym] *= penalty_factor
+                        if penalty_factor != 1.0:
+                            logger.debug(f"[CAUSAL ADJUST] {sym}: {old_weight:.4f} * {penalty_factor:.4f} = {target_weights_dict[sym]:.4f}")
+                if defer_causal:
+                    logger.debug("[CAUSAL DEFER] per-symbol penalties computed; will apply after min-hold")
+                else:
+                    logger.info("[CAUSAL FINAL SCALING] Applied as multiplicative adjustment to CVaR weights")
             except Exception as e:
-                logger.debug(f"Final causal scaling skipped: {e}")
+                logger.debug(f"Causal scaling compute skipped: {e}")
 
         # 3. Min-hold enforcement: preserve current position weight for symbols within min-hold
         # FIX #24/#25: Actually override target weight with current position weight to prevent rebalance
@@ -238,6 +242,23 @@ class PortfolioRebalancer:
                                      f"{old_weight:.4f} with current position weight {current_weight:.4f} "
                                      f"({bars_since:.1f}/{min_hold} bars)")
 
+        # ==================== DEFERRED CAUSAL PENALTY (Apr-19 audit) ===========
+        # Apply the per-symbol causal penalty as the LAST multiplier before the
+        # final renormalization. This ensures every upstream gate's use of
+        # |weight| as confidence sees a non-causal-damped value, keeping gate
+        # calibration honest. Min-hold was already applied above, so causal can
+        # still override a min-held-held weight toward zero if the causal signal
+        # deteriorates mid-hold (desirable — causal failure should unwind even
+        # inside min-hold protection).
+        if defer_causal and causal_penalty_by_sym:
+            for sym, factor in causal_penalty_by_sym.items():
+                if sym in target_weights_dict and abs(factor - 1.0) > 1e-6:
+                    old_w = target_weights_dict[sym]
+                    target_weights_dict[sym] *= factor
+                    if factor != 1.0:
+                        logger.debug(f"[CAUSAL POST-GATE] {sym}: {old_w:.4f} × {factor:.4f} = {target_weights_dict[sym]:.4f}")
+            logger.info("[CAUSAL POST-GATE] Deferred causal penalty applied as final multiplier")
+
         # ==================== SINGLE FINAL RENORMALIZATION ====================
         # Re-apply notional cap after all adjustments
         for sym in target_weights_dict:
@@ -246,8 +267,27 @@ class PortfolioRebalancer:
                 target_weights_dict[sym] *= max_notional_per_symbol / proposed_notional
 
         # H15+H16 FIX: Only scale DOWN when gross exposure exceeds MAX_LEVERAGE.
+        # Apr-19 audit: allow the leverage cap to flex up when the portfolio's
+        # average regime persistence is high (the previous uniform scale-down
+        # erased the persistence boost we just applied). Flex grows linearly
+        # with avg_persistence above 0.7 up to +20% at persistence=1.0.
         total_abs = sum(abs(v) for v in target_weights_dict.values())
-        target_leverage = self.config.get('MAX_LEVERAGE', 2.0)
+        base_leverage = self.config.get('MAX_LEVERAGE', 2.0)
+        pers_values = []
+        for _sym in symbols:
+            _rt = regimes.get(_sym, ('mean_reverting', 0.5))
+            pers_values.append(float(_rt[1]) if isinstance(_rt, (list, tuple)) and len(_rt) == 2 else 0.5)
+        avg_persistence = float(sum(pers_values) / len(pers_values)) if pers_values else 0.5
+        flex_max = float(self.config.get('LEVERAGE_PERSISTENCE_FLEX_MAX', 0.20))
+        flex_start = float(self.config.get('LEVERAGE_PERSISTENCE_FLEX_START', 0.70))
+        if avg_persistence > flex_start:
+            flex = min(flex_max, (avg_persistence - flex_start) / (1.0 - flex_start) * flex_max)
+            target_leverage = base_leverage * (1.0 + flex)
+            if flex > 0:
+                logger.debug(f"[LEVERAGE FLEX] avg_persistence={avg_persistence:.2f} → "
+                             f"cap flexed {base_leverage:.2f} → {target_leverage:.2f}")
+        else:
+            target_leverage = base_leverage
         if total_abs > target_leverage and total_abs > 1e-8:
             scale = target_leverage / total_abs
             for sym in target_weights_dict:

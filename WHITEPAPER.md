@@ -1,8 +1,25 @@
 # NYSE Trading Bot — Technical Whitepaper
 
 **Author:** Matthew McCartney
-**Version:** 2.8 (April 2026)
+**Version:** 2.9 (April 19 2026 — audit patch)
 **Status:** Live paper trading
+
+---
+
+## Revision Notes (v2.9 — 2026-04-19)
+
+This revision documents the fixes merged from the Apr-19 four-agent audit. None of the signal-pipeline topology changed; the fixes correct ordering, gating invariants, and resource-budget accounting bugs that were silently leaking alpha under the old baseline.
+
+- **§ 2 Signal Pipeline** — sentiment blend is now deferred to after the gate + equity-curve stage; the alpha-attribution baseline is snapshotted just before the gating loop; gate cascade short-circuits below 1 % cumulative `gate_mult` with earliest-veto logging; meta-filter applies a 0.8× dampener during its pre-fit window and dynamically adjusts `min_prob` by the nightly Brier score; equity-curve drawdown scale is now direction + regime aware.
+- **§ 3.3 Causal Penalty** — application moved to the last multiplier before final renormalisation, so upstream confidence-based gates never read a causal-damped `|weight|`.
+- **§ 3.5 Bayesian Sizing** — unlocks a 2.0× cap for "proven winners" (n ≥ 20, p_win ≥ 0.60, regime persistence ≥ 0.85); shrinkage schedule unchanged.
+- **§ 3.6 CVaR Allocation** — partitions qualified (≥ 100 bars) vs insufficient-data symbols instead of bailing to uniform; insufficient symbols receive a 15 % conviction-weighted residual; `MAX_LEVERAGE` flexes up +20 % with avg regime persistence.
+- **§ 3.9 Trailing-Stop Ratchet** — loss-side tightening has its own 45 s throttle; `_ratchet_pending` discard now in `finally:`; MFE/MAE update hoisted to the top of `_monitor_one_position` so TIME-STOP sees accurate peaks under TP contention.
+- **§ 3.10 Order Lifecycle** — fractional remainders from partial exit fills are actively swept via `_pending_fractional_close`; monitor branches re-read tracker state after the initial snapshot.
+- **§ 3.11 Risk Sizing** — per-cycle buying-power budget threaded through sequential per-symbol sizing (eliminates the 2–3× over-leverage bug).
+- **Infrastructure hardening (earlier Apr-19):** slippage veto tuning (2.0× edge, min_samples=5), PPO walk-forward OOS acceptance floor (-0.25) + gap cap (35 %), hard-to-borrow symbol auto-fallback (DAY TIF), whole-share preference on entry qty when ≥ 1 share, Gemini tuner exponential-backoff retry, causal lazy-build completion logging, alpha-attribution restart-safe persistence.
+
+Section numbering below is unchanged; inline `(Apr-19)` markers appear where the behaviour shifted.
 
 ---
 

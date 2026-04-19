@@ -964,12 +964,12 @@ class SignalGenerator:
                 action = action / abs_sum * max_leverage
             action = np.clip(action, -2.0, 2.0)
             target_weights = {sym: float(weight) for sym, weight in zip(symbols, action)}
-            # ALPHA-ATTR: snapshot baseline weights (post-PPO-post-causal) BEFORE any
-            # downstream layers. We record the transformation chain after each layer
-            # so we can attribute the final weight back to each multiplier.
-            baseline_weights = dict(target_weights)
             # accumulated layer multipliers: {sym: {layer_name: mult}}
             _attr_layers: Dict[str, Dict[str, float]] = {s: {} for s in target_weights}
+            # NOTE (Apr-19): baseline_weights snapshot moved DOWN to just before the
+            # gating loop. All "positive contributor" layers (stacking, cross-sectional,
+            # bayesian, liquidity, crowding) are now part of the baseline so the
+            # aggregate_multiplier attributes only the sentiment + gates + equity scale.
             # === STACKING ENSEMBLE OVERLAY (per-symbol meta_prob) ===
             # The stacking ensemble (LightGBM) is trained nightly but was otherwise
             # unused in portfolio mode. Apply it as a per-symbol multiplier:
@@ -1087,11 +1087,21 @@ class SignalGenerator:
                     for sym in list(target_weights.keys()):
                         if target_weights[sym] == 0.0:
                             continue
+                        # Apr-19: pass regime persistence so the sizer can unlock
+                        # the "proven winner" wider cap (2.0× vs 1.6×) when the
+                        # posterior + regime tailwind both justify more exposure.
+                        cached_reg = self.regime_cache.get(sym)
+                        sym_persistence = float(cached_reg[1]) if isinstance(cached_reg, (list, tuple)) and len(cached_reg) == 2 else 0.5
                         mult, reason = self.bayesian_sizer.size_multiplier(
                             sym, min_mult=bps_min, max_mult=bps_max,
                             reference_ev=bps_ref_ev, shrinkage_n=bps_shrink_n,
                             method=bps_method, kelly_fraction=bps_kelly_frac,
                             reference_kelly=bps_ref_kelly,
+                            persistence=sym_persistence,
+                            proven_n=self.config.get('BAYESIAN_PROVEN_N', 20),
+                            proven_p_win=self.config.get('BAYESIAN_PROVEN_P_WIN', 0.60),
+                            proven_persistence=self.config.get('BAYESIAN_PROVEN_PERSISTENCE', 0.85),
+                            proven_max_mult=self.config.get('BAYESIAN_PROVEN_MAX_MULT', 2.0),
                         )
                         if abs(mult - 1.0) > 0.01:
                             target_weights[sym] *= mult
@@ -1154,6 +1164,8 @@ class SignalGenerator:
                 except Exception as e:
                     logger.debug(f"[CROWDING] skipped ({e})")
             sentiment_blend_weight = self.config.get('PORTFOLIO_SENTIMENT_WEIGHT', 0.3)
+            sentiment_results = []
+            sentiment_multipliers: Dict[str, float] = {}  # FIX Apr-19: fetch now, apply AFTER gates
             if sentiment_blend_weight > 0:
                 # Parallelize sentiment calls — cuts cycle time from ~4 min to ~25s
                 async def _get_sentiment(sym):
@@ -1181,16 +1193,17 @@ class SignalGenerator:
                     logger.warning(f"[SENTIMENT TIMEOUT] Gather exceeded {_sent_timeout}s — "
                                    f"falling back to cached/zero sentiment for all symbols")
                     sentiment_results = [(sym, 0.0) for sym in symbols]
-                # B4: Also read sentiment VELOCITY for each symbol (Δlevel over past N hours)
-                # Velocity captures information arrival, not steady-state level — a stock going
-                # 0.1 → 0.6 is very different from one sitting at 0.6. Multiplied by direction
-                # so positive velocity boosts longs and dampens shorts (matches the "good news
-                # → prefer longs" intuition).
+                # B4: Sentiment VELOCITY (Δlevel over past N hours) — direction-aware.
+                # Apr-19 FIX: we NO LONGER apply the multiplier here. We only compute it
+                # and stash into `sentiment_multipliers`; gates below still see sentiment
+                # as a *feature* (via sentiment_by_sym) to filter entries, but the weight
+                # boost/damp is applied AFTER gating + equity scale. This prevents a
+                # downstream gate from silently erasing sentiment's contribution and
+                # keeps alpha_attribution honest.
                 sent_vel_weight = self.config.get('SENTIMENT_VELOCITY_WEIGHT', 0.15)
                 sent_vel_lookback = self.config.get('SENTIMENT_VELOCITY_LOOKBACK_HOURS', 4)
                 for sym, sentiment in sentiment_results:
                     sentiment_factor = 1.0 + sentiment_blend_weight * sentiment
-                    # Velocity factor — direction-aware
                     velocity_factor = 1.0
                     if sent_vel_weight > 0:
                         try:
@@ -1204,15 +1217,9 @@ class SignalGenerator:
                                                                  1.0 + sent_vel_weight))
                         except Exception as e:
                             logger.debug(f"{sym} sentiment velocity failed: {e}")
-                    old_weight = target_weights[sym]
-                    target_weights[sym] *= sentiment_factor * velocity_factor
-                    logger.info(f"{sym} sentiment blend: raw={sentiment:.3f} → factor={sentiment_factor:.2f} "
-                                f"| velocity_factor={velocity_factor:.3f} (weight {old_weight:.3f} → {target_weights[sym]:.3f})")
-                abs_sum = np.sum(np.abs(list(target_weights.values())))
-                if abs_sum > max_leverage:
-                    scale = max_leverage / abs_sum
-                    target_weights = {sym: w * scale for sym, w in target_weights.items()}
-                    logger.info(f"Re-normalized weights after sentiment blend (scale {scale:.3f})")
+                    sentiment_multipliers[sym] = float(sentiment_factor * velocity_factor)
+                    logger.debug(f"{sym} sentiment deferred: raw={sentiment:.3f} factor={sentiment_factor:.2f} "
+                                 f"velocity={velocity_factor:.3f} (will apply post-gate)")
             # === PORTFOLIO-LEVEL GATES ===
             # Same gates as per-symbol path, applied to portfolio weights.
             # These were missing — portfolio mode bypassed all confidence filtering.
@@ -1232,16 +1239,25 @@ class SignalGenerator:
                     sentiment_by_sym = {sym: s for sym, s in sentiment_results}
                 except Exception:
                     sentiment_by_sym = {}
+            # ALPHA-ATTR: snapshot baseline weights RIGHT BEFORE the gating loop.
+            # All "positive contributor" layers (stacking, cross-sectional, Bayesian,
+            # liquidity, crowding) have already modified target_weights, so the
+            # aggregate_multiplier captured below will now attribute only the
+            # gates + equity scale + sentiment — which is what we actually care
+            # about for risk/performance accounting.
+            baseline_weights = dict(target_weights)
+            gate_short_circuit = self.config.get('GATE_SHORT_CIRCUIT_THRESHOLD', 0.01)
             gated_weights = {}
             for sym, weight in target_weights.items():
                 direction = 1 if weight > 0 else (-1 if weight < 0 else 0)
                 gate_mult = 1.0
                 gate_reasons = []
+                first_veto = None  # track the earliest gate that pushed us below short-circuit
                 # === ESP: SLIPPAGE-PREDICTION VETO ===
                 # If predicted slippage on this symbol+hour+size exceeds our edge
                 # by a safety multiple, skip the entry. Protects against "entries
                 # in chop" where the act of entering eats the alpha.
-                if (direction != 0
+                if (direction != 0 and gate_mult > gate_short_circuit
                         and self.config.get('SLIPPAGE_VETO_ENABLED', True)
                         and getattr(self, 'slippage_predictor', None) is not None):
                     try:
@@ -1254,7 +1270,8 @@ class SignalGenerator:
                         veto, pred_bps, slip_reason = self.slippage_predictor.should_veto(
                             sym, expected_alpha_bps, hour=_dt.now().hour,
                             size_usd=est_size_usd,
-                            edge_safety_multiple=self.config.get('SLIPPAGE_VETO_MULTIPLE', 1.2),
+                            edge_safety_multiple=self.config.get('SLIPPAGE_VETO_MULTIPLE', 2.0),
+                            min_samples=self.config.get('SLIPPAGE_VETO_MIN_SAMPLES', 5),
                         )
                         if veto:
                             gate_mult *= self.config.get('SLIPPAGE_VETO_SCALE', 0.3)
@@ -1272,7 +1289,7 @@ class SignalGenerator:
                 # OPPOSITE direction is likely, that's strong disagreement. Historically
                 # we rarely win these; dampen. Tracks only high-conviction disagreement
                 # to avoid over-penalizing normal noise.
-                if (direction != 0
+                if (direction != 0 and gate_mult > gate_short_circuit
                         and self.config.get('DIVERGENCE_GATE_ENABLED', True)
                         and hasattr(self.trainer, 'stacking_models')):
                     try:
@@ -1318,7 +1335,7 @@ class SignalGenerator:
                 # === B2: ADVERSE-SELECTION (FILL TOXICITY) GATE ===
                 # If recent fills on this symbol were consistently followed by adverse
                 # price drift, we're being picked off. Dampen the weight accordingly.
-                if (direction != 0
+                if (direction != 0 and gate_mult > gate_short_circuit
                         and self.config.get('ADVERSE_SELECTION_ENABLED', True)
                         and getattr(self, 'adverse_selection', None) is not None):
                     try:
@@ -1336,7 +1353,7 @@ class SignalGenerator:
                 # === B5: ANTI-EARNINGS GATE ===
                 # Block new entries during pre/post-earnings blackout windows. Open
                 # positions are flagged for close by the trading loop separately.
-                if (direction != 0
+                if (direction != 0 and gate_mult > gate_short_circuit
                         and self.config.get('EARNINGS_FILTER_ENABLED', True)
                         and getattr(self, 'earnings_calendar', None) is not None):
                     try:
@@ -1362,7 +1379,7 @@ class SignalGenerator:
                 # Pass-through when model isn't fitted yet (insufficient history).
                 meta_min_prob = self.config.get('META_FILTER_MIN_PROB', 0.40)
                 meta_zero_mode = self.config.get('META_FILTER_MODE', 'zero')  # 'zero' or 'scale'
-                if (direction != 0
+                if (direction != 0 and gate_mult > gate_short_circuit
                         and self.config.get('META_FILTER_ENABLED', True)
                         and getattr(self, 'meta_labeler', None) is not None):
                     try:
@@ -1384,6 +1401,16 @@ class SignalGenerator:
                             vix=float(vix),
                             size_rel=float(abs(weight)),  # weight is equity-relative already
                         )
+                        # Apr-19 FIX: when the meta-labeler is still pre-fit (needs
+                        # ~2 weeks of closed trades), `should_enter` returns
+                        # (True, 0.5) unconditionally. That silently disables the
+                        # filter during the most dangerous startup period. Apply a
+                        # conservative dampener instead of a free pass.
+                        if not self.meta_labeler.is_fitted():
+                            prefit_damp = float(self.config.get('META_FILTER_PREFIT_DAMPENER', 0.8))
+                            if prefit_damp < 1.0:
+                                gate_mult *= prefit_damp
+                                gate_reasons.append(f"META-PREFIT×{prefit_damp:.2f}")
                         if not accept:
                             if meta_zero_mode == 'scale':
                                 gate_mult *= 0.2
@@ -1403,10 +1430,11 @@ class SignalGenerator:
                             logger.debug(f"{sym} META-FILTER: P(win)={mprob:.3f} ≥ {meta_min_prob:.2f} — accept")
                     except Exception as e:
                         logger.debug(f"{sym} META-FILTER error ({e}) — pass-through")
-                if direction != 0:
+                # Resolve regime once for this symbol (used by multiple gates + equity scale)
+                cached = self.regime_cache.get(sym)
+                sym_regime = cached[0] if isinstance(cached, (list, tuple)) and len(cached) == 2 else (cached if isinstance(cached, str) else 'mean_reverting')
+                if direction != 0 and gate_mult > gate_short_circuit:
                     # Regime gate
-                    cached = self.regime_cache.get(sym)
-                    sym_regime = cached[0] if isinstance(cached, (list, tuple)) and len(cached) == 2 else (cached if isinstance(cached, str) else 'mean_reverting')
                     if is_bearish(sym_regime) and direction == 1:
                         gate_mult *= 0.4
                         gate_reasons.append(f"REGIME(trending_down)")
@@ -1414,59 +1442,107 @@ class SignalGenerator:
                         gate_mult *= 0.4
                         gate_reasons.append(f"REGIME(trending_up)")
                     # VIX gate
-                    if vix > 28 and direction == 1:
+                    if vix > 28 and direction == 1 and gate_mult > gate_short_circuit:
                         vix_scale = max(0.3, 1.0 - (vix - 28) / 20)
                         gate_mult *= vix_scale
                         gate_reasons.append(f"VIX({vix:.0f})")
                     # SPX breadth gate
-                    if direction == 1 and spx_bear:
+                    if direction == 1 and spx_bear and gate_mult > gate_short_circuit:
                         gate_mult *= 0.3
                         gate_reasons.append("SPX<200SMA")
                     # 1H trend gate
-                    try:
-                        hourly = self.data_ingestion.get_latest_data(sym, timeframe='1H')
-                        if hourly is not None and len(hourly) >= 20:
-                            sma_20h = hourly['close'].rolling(20).mean().iloc[-1]
-                            hourly_trend = 1 if hourly['close'].iloc[-1] > sma_20h else -1
-                            if direction != hourly_trend:
-                                gate_mult *= 0.5
-                                gate_reasons.append(f"1H_TREND({hourly_trend})")
-                    except Exception:
-                        pass
+                    if gate_mult > gate_short_circuit:
+                        try:
+                            hourly = self.data_ingestion.get_latest_data(sym, timeframe='1H')
+                            if hourly is not None and len(hourly) >= 20:
+                                sma_20h = hourly['close'].rolling(20).mean().iloc[-1]
+                                hourly_trend = 1 if hourly['close'].iloc[-1] > sma_20h else -1
+                                if direction != hourly_trend:
+                                    gate_mult *= 0.5
+                                    gate_reasons.append(f"1H_TREND({hourly_trend})")
+                        except Exception:
+                            pass
                     # Anti-churn gate
-                    churn_penalty = self.memory.get_churn_penalty(sym, direction, ts)
-                    if churn_penalty < 1.0:
-                        gate_mult *= churn_penalty
-                        gate_reasons.append(f"CHURN({churn_penalty:.2f})")
-                    # Defensive mode
+                    if gate_mult > gate_short_circuit:
+                        churn_penalty = self.memory.get_churn_penalty(sym, direction, ts)
+                        if churn_penalty < 1.0:
+                            gate_mult *= churn_penalty
+                            gate_reasons.append(f"CHURN({churn_penalty:.2f})")
+                    # Defensive mode (hard kill regardless of prior gate_mult)
                     if self.memory.is_defensive(ts):
                         gate_mult = 0.0
                         gate_reasons.append("DEFENSIVE")
-                    # Trade autopsy gate: suppress entries matching historically losing patterns
-                    suppress, reason, _ = self.autopsy_engine.should_suppress_entry(
-                        sym, direction, sym_regime, vix, 0.0)
-                    if suppress:
-                        gate_mult *= 0.2
-                        gate_reasons.append(f"AUTOPSY({reason})")
+                    # Trade autopsy gate (only if we haven't short-circuited yet)
+                    if gate_mult > gate_short_circuit:
+                        suppress, reason, _ = self.autopsy_engine.should_suppress_entry(
+                            sym, direction, sym_regime, vix, 0.0)
+                        if suppress:
+                            gate_mult *= 0.2
+                            gate_reasons.append(f"AUTOPSY({reason})")
                 gated_weights[sym] = weight * gate_mult
-                if gate_mult < 1.0 and direction != 0:
+                # Record first veto reason for concise logging
+                if gate_mult < gate_short_circuit and direction != 0 and gate_reasons:
+                    first_veto = gate_reasons[0]
+                    logger.info(f"[PORTFOLIO GATE] {sym}: weight {weight:.4f} → 0 "
+                                f"(first veto: {first_veto}; cascaded: {', '.join(gate_reasons[1:]) or 'none'})")
+                elif gate_mult < 1.0 and direction != 0:
                     logger.info(f"[PORTFOLIO GATE] {sym}: weight {weight:.4f} → {gated_weights[sym]:.4f} (gates: {', '.join(gate_reasons)})")
             target_weights = gated_weights
-            # === EQUITY CURVE POSITION SCALING ===
-            # Scale ALL weights by the equity curve trader's assessment of our own performance
+            # === EQUITY CURVE POSITION SCALING (direction+regime aware, Apr-19) ===
+            # Previously this scaled ALL weights uniformly by eq_scale, which was
+            # regime-blind: in a trending-down regime drawdown, shorts were the
+            # best-performing sleeve but got scaled down equally with longs. Now
+            # we skip the downscale for positions whose direction matches the
+            # dominant regime (shorts in trending_down, longs in trending_up);
+            # upscales still apply uniformly.
             self.equity_curve_trader.record_equity(current_equity, ts)
             eq_scale = self.equity_curve_trader.get_position_scale()
             if eq_scale != 1.0:
-                target_weights = {sym: w * eq_scale for sym, w in target_weights.items()}
-                logger.info(f"[EQ CURVE] Scaling all weights by {eq_scale:.3f} "
-                           f"(fast={self.equity_curve_trader._fast_ema:.0f} "
-                           f"slow={self.equity_curve_trader._slow_ema:.0f})")
-            # Re-normalize after gating + equity scaling
+                eq_direction_aware = bool(self.config.get('EQ_SCALE_DIRECTION_AWARE', True))
+                scaled = {}
+                skipped_syms = []
+                for sym, w in target_weights.items():
+                    if w == 0.0:
+                        scaled[sym] = 0.0
+                        continue
+                    cached = self.regime_cache.get(sym)
+                    sym_reg = cached[0] if isinstance(cached, (list, tuple)) and len(cached) == 2 else (cached if isinstance(cached, str) else 'mean_reverting')
+                    direction_aligns_with_regime = (
+                        (is_bullish(sym_reg) and w > 0) or
+                        (is_bearish(sym_reg) and w < 0)
+                    )
+                    # Downscale in drawdown: skip if direction matches the regime tailwind
+                    if eq_scale < 1.0 and eq_direction_aware and direction_aligns_with_regime:
+                        scaled[sym] = w
+                        skipped_syms.append(sym)
+                    else:
+                        scaled[sym] = w * eq_scale
+                target_weights = scaled
+                _fema = self.equity_curve_trader._fast_ema or 0.0
+                _sema = self.equity_curve_trader._slow_ema or 0.0
+                if skipped_syms:
+                    logger.info(f"[EQ CURVE] Scaling by {eq_scale:.3f} (fast={_fema:.0f} slow={_sema:.0f}) — "
+                                f"regime-aligned skipped: {', '.join(skipped_syms)}")
+                else:
+                    logger.info(f"[EQ CURVE] Scaling all weights by {eq_scale:.3f} (fast={_fema:.0f} slow={_sema:.0f})")
+            # === SENTIMENT APPLY (deferred from earlier fetch; Apr-19) ===
+            # Sentiment is applied AFTER gates + equity scale so that a gate
+            # veto cannot be partially undone by a sentiment tailwind, and so
+            # alpha_attribution's aggregate_multiplier reflects the sentiment
+            # contribution faithfully.
+            if sentiment_multipliers:
+                for sym, mult in sentiment_multipliers.items():
+                    if sym in target_weights and abs(mult - 1.0) > 1e-6:
+                        old_w = target_weights[sym]
+                        target_weights[sym] = old_w * mult
+                        if abs(target_weights[sym]) > 1e-9:
+                            logger.debug(f"{sym} sentiment applied post-gate: {old_w:.4f} × {mult:.3f} = {target_weights[sym]:.4f}")
+            # Re-normalize after gating + equity scaling + sentiment
             abs_sum = np.sum(np.abs(list(target_weights.values())))
             if abs_sum > max_leverage:
                 scale = max_leverage / abs_sum
                 target_weights = {sym: w * scale for sym, w in target_weights.items()}
-            logger.info(f"Portfolio PPO actions (post-gate): {target_weights}")
+            logger.info(f"Portfolio PPO actions (post-gate+sentiment): {target_weights}")
             # EQ-SCORE: record this cycle + regimes for daily scorecard
             if getattr(self, 'execution_scorecard', None):
                 try:

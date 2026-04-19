@@ -53,12 +53,17 @@ class AlphaAttribution:
         self,
         persist_path: str = "alpha_attribution_log.jsonl",
         max_pending: int = 500,
+        pending_path: str = "alpha_attribution_pending.json",
     ):
         self.persist_path = persist_path
-        # pending attributions: list of dicts, appended at entry, popped at close
+        self.pending_path = pending_path
+        # pending attributions: list of dicts, appended at entry, popped at close.
+        # Persisted to disk so a restart during an open position doesn't orphan
+        # the entry-side attribution (exit would otherwise log as exit_only).
         self._pending: List[Dict[str, Any]] = []
         self._max_pending = max_pending
         self._lock = threading.RLock()
+        self._load_pending()
 
     # ------------------------------------------------------------------
     # Entry-side recording
@@ -107,6 +112,7 @@ class AlphaAttribution:
             # Cap in-memory pending list to avoid unbounded growth
             if len(self._pending) > self._max_pending:
                 self._pending = self._pending[-self._max_pending :]
+            self._save_pending()
 
     # ------------------------------------------------------------------
     # Exit-side emission
@@ -134,6 +140,8 @@ class AlphaAttribution:
                 if self._pending[i]["symbol"] == symbol:
                     entry_attr = self._pending.pop(i)
                     break
+            if entry_attr is not None:
+                self._save_pending()
 
         if entry_attr is None:
             # No matching entry (trade may have been opened before logger started
@@ -199,3 +207,33 @@ class AlphaAttribution:
         """For testing — drop all pending attributions."""
         with self._lock:
             self._pending.clear()
+            self._save_pending()
+
+    # ------------------------------------------------------------------
+    # Pending-list persistence (restart-safe)
+    # ------------------------------------------------------------------
+    def _save_pending(self) -> None:
+        try:
+            import tempfile, shutil
+            dir_name = os.path.dirname(self.pending_path) or "."
+            with tempfile.NamedTemporaryFile(mode="w", delete=False,
+                                             dir=dir_name, suffix=".tmp") as tmp:
+                json.dump(self._pending, tmp)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            shutil.move(tmp.name, self.pending_path)
+        except Exception as e:
+            logger.debug(f"[ALPHA-ATTR] pending save failed: {e}")
+
+    def _load_pending(self) -> None:
+        if not os.path.exists(self.pending_path):
+            return
+        try:
+            with open(self.pending_path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                with self._lock:
+                    self._pending = data[-self._max_pending:]
+                logger.info(f"[ALPHA-ATTR] Restored {len(self._pending)} pending attributions from disk")
+        except Exception as e:
+            logger.debug(f"[ALPHA-ATTR] pending load failed: {e}")

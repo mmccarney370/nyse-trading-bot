@@ -149,30 +149,37 @@ class SlippagePredictor:
         hour: Optional[int] = None,
         size_usd: Optional[float] = None,
         edge_safety_multiple: float = 1.2,
+        min_samples: int = 5,
     ) -> Tuple[bool, float, str]:
         """Return (veto, predicted_bps, reason). Veto when predicted slippage
         exceeds expected alpha by `edge_safety_multiple`.
 
-        FIX (Apr 17): Only SYMBOL-SPECIFIC sources (sym+hour+size, sym+hour,
-        sym) can trigger a veto. Generic buckets (hour, hour+size, global) are
-        too coarse — they pool all symbols together, and a few extreme fills
-        (e.g., 3 opening-chaos fills at 200bp) can pollute the median and veto
-        every symbol for the rest of the day. Generic sources still produce a
-        prediction for logging but won't block the trade.
-
-        Also skips on "prior" (insufficient data)."""
-        pred, source = self.predict_bps(symbol, hour, size_usd)
-        if source == "prior":
-            return False, pred, f"insufficient-data({pred:.1f}bp)"
-        # Only symbol-specific sources have enough resolution to veto.
-        # "hour", "hour+size", "global" are pooled across all symbols —
-        # too coarse, and vulnerable to a few extreme fills biasing the median.
-        if not source.startswith("sym"):
-            return False, pred, f"generic-source({pred:.1f}bp/{source})"
+        Only SYMBOL-SPECIFIC sources can veto (Apr 17 fix). Additionally,
+        Apr 19: require ≥ min_samples in the winning bucket — a single-fill
+        outlier should not permanently block entries."""
+        h = hour if hour is not None else datetime.now().hour
+        sz = size_usd if size_usd is not None else 0.0
+        hb = _hour_bucket(h)
+        sb = _size_bucket(sz)
+        with self._lock:
+            picked = None
+            for key, src in (
+                ((symbol, hb, sb), "sym+hour+size"),
+                ((symbol, hb, None), "sym+hour"),
+                ((symbol, None, None), "sym"),
+            ):
+                hit = self._groups.get(key)
+                if hit is not None and hit[1] >= min_samples:
+                    picked = (float(hit[0]), src, int(hit[1]))
+                    break
+        if picked is None:
+            pred_for_log, src_for_log = self.predict_bps(symbol, hour, size_usd)
+            return False, pred_for_log, f"insufficient-sym-data({pred_for_log:.1f}bp/{src_for_log})"
+        pred, source, n = picked
         threshold = expected_alpha_bps * edge_safety_multiple
         if pred > threshold:
-            return True, pred, f"pred={pred:.1f}bp > {threshold:.1f}bp ({source})"
-        return False, pred, f"pred={pred:.1f}bp ≤ {threshold:.1f}bp ({source})"
+            return True, pred, f"pred={pred:.1f}bp > {threshold:.1f}bp ({source}, n={n})"
+        return False, pred, f"pred={pred:.1f}bp ≤ {threshold:.1f}bp ({source}, n={n})"
 
     # ------------------------------------------------------------------
     # Internal — group mean computation

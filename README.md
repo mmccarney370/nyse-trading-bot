@@ -101,6 +101,43 @@ The bot doesn't wait for a human to tune it. Nine scheduled tasks run overnight 
 
 ---
 
+## Recent Upgrades (Apr 2026 audit cycle)
+
+A four-agent deep audit on 2026-04-19 surfaced 22 concrete profit leaks across the signal, risk, training, and data layers. The prioritised batch is now live:
+
+**Signal-layer (Agent A)**
+- Sentiment blend now applies **after** all gates + equity-curve scale so a gate veto can no longer be silently half-erased by a sentiment tailwind.
+- Alpha-attribution `baseline_weights` snapshot moved to just before the gating loop — the aggregate multiplier now reports only the gate+sentiment+eq-scale transformation, keeping per-layer attribution honest.
+- Meta-filter now applies a conservative **0.8× pre-fit dampener** during its first ~2 weeks of live trades (previously this window silently returned pass-through for every entry).
+- Meta-filter's nightly **Brier score is now consumed** — the `min_prob` threshold tightens when the model is well-calibrated (Brier < 0.30) and loosens otherwise (clipped to [0.35, 0.55]).
+- Gate cascade **short-circuits below 1%** cumulative `gate_mult`; skips redundant downstream checks and logs the earliest veto reason instead of the full cascade.
+- Equity-curve drawdown scale is now **direction + regime aware**: shorts in a `trending_down` regime (and longs in `trending_up`) are no longer scaled down during bot drawdowns, since they are the best-performing sleeve.
+- Causal penalty deferred to the **last multiplier before final renorm** so upstream gates can never read a causal-damped `|weight|` as confidence.
+
+**Risk / exits (Agent B)**
+- Ratchet `_ratchet_pending` discard moved to **`finally:`** — a malformed `replace_order` response can no longer strand a symbol's ratchet forever.
+- Loss-side tightening has its **own 45 s throttle** (profit ratchet stays 180–540 s); a failing thesis is now cut within one monitor cycle instead of waiting for the profit cooldown.
+- Per-cycle **buying-power budget** is now decremented per sized symbol via `reset_bp_budget()` at cycle start — eliminates the 2–3× over-leverage from 5 sequential symbols each claiming full BP.
+- CVaR no longer collapses to uniform when a single symbol has short history. It **partitions** into qualified (≥ 100 bars) and insufficient symbols, runs the optimiser on the qualified subset, and gives the insufficient symbols a conviction-weighted 15 % residual slice.
+- Bayesian sizer unlocks a **2.0× cap** for "proven winners" (n ≥ 20 closed trades AND p_win ≥ 0.60 AND regime persistence ≥ 0.85) — previously proven high-edge symbols were still capped at 1.6×.
+- `MAX_LEVERAGE` **flexes up to +20%** with average regime persistence so the persistence boost is not erased by the uniform gross-exposure rescale.
+- MFE / MAE updates **hoisted to the top of `_monitor_one_position`** — TIME-STOP and loss-tighten now see accurate peak excursion even when TP enforcement blocks the ratchet.
+- Fractional remainder after a partial exit fill is **actively swept** on the next monitor cycle via a new `_pending_fractional_close` queue (previously left unprotected until the next reconcile).
+- Monitor re-reads `tracker.groups.get(sym)` inside the TIME-STOP and PENDING_EXIT branches so it never acts on a state the stream handler has since transitioned.
+
+**Earlier the same day (Apr 19 morning audit):**
+- Slippage-veto tuned to `2.0× edge` with a `min_samples=5` gate (was firing ×45 per fill).
+- PPO walk-forward OOS acceptance relaxed with a `-0.25` floor + 35 % gap cap (no longer silently rejecting borderline-noise windows alongside genuinely broken ones).
+- Hard-to-borrow symbols auto-detected; trailing stops retry with DAY TIF on GTC rejection.
+- Entry qty rounds down to whole shares when size ≥ 1 so native trailing stops cover the full position.
+- Gemini tuner wrapped in exponential-backoff retry for 503 / timeout errors.
+- Causal lazy build now logs explicit completion (`edges=N, elapsed=Ns`).
+- Alpha-attribution pending list persisted across restarts (no more orphan `exit_only` records).
+
+Full audit report at [`MEGATRON_AUDIT_2026-04-19.md`](./MEGATRON_AUDIT_2026-04-19.md).
+
+---
+
 ## It Runs Like a Production System
 
 This connects to a real Alpaca broker, streams live bars via WebSocket, places real limit orders with trailing stops and take-profits, handles fill events through an async state machine, manages a full order lifecycle (pending entry → open → pending exit → closed), and persists every piece of learned state atomically across restarts. Currently running 24/7 in paper trading mode.

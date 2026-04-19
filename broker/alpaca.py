@@ -3,6 +3,7 @@
 import logging
 import asyncio
 import threading
+from typing import Optional, Dict
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -68,6 +69,16 @@ class AlpacaBroker:
         self._entry_times_lock = threading.Lock()  # FIX #11: Thread safety for last_entry_times access
         self._symbol_locks = {}  # Per-symbol threading locks to prevent TOCTOU races between monitor and stream
         self._symbol_locks_lock = threading.Lock()  # Protects lazy creation of per-symbol locks
+        # HTB (hard-to-borrow) symbols: GTC orders are rejected by Alpaca on these;
+        # we discover them dynamically by inspecting rejection reasons and then
+        # fall back to DAY TIF on future submissions for the same symbol.
+        self._htb_symbols = set(config.get('HTB_SYMBOLS', ['PLTR']))
+        self._htb_lock = threading.Lock()
+        # Apr-19 FIX: symbols with a fractional remainder after a partial exit
+        # fill need to be actively swept on the next monitor cycle — native
+        # trailing stops don't cover fractional qty.
+        self._pending_fractional_close: Dict[str, float] = {}
+        self._fractional_close_lock = threading.Lock()
         # Positions cache with TTL
         self._positions_cache = {}
         self._positions_cache_time = None
@@ -423,11 +434,9 @@ class AlpacaBroker:
             qty = whole_qty
 
         try:
-            trail_req = TrailingStopOrderRequest(
-                symbol=symbol, qty=qty, side=close_side,
-                time_in_force=self._tif_for_qty(qty), trail_percent=trail_pct,
+            resp = self._submit_trailing_stop_with_htb_fallback(
+                symbol=symbol, qty=qty, side=close_side, trail_percent=trail_pct,
             )
-            resp = self.client.submit_order(trail_req)
             trailing_stop_id = str(resp.id)
             logger.info(f"[RECONCILE] {symbol} trailing stop submitted @ {trail_pct}% | id={trailing_stop_id}")
 
@@ -601,11 +610,47 @@ class AlpacaBroker:
         # Clamp: at least 0.5%, at most 35%
         return round(max(0.5, min(35.0, trail_pct)), 2)
 
-    def _tif_for_qty(self, qty: float) -> TimeInForce:
-        """Fractional orders MUST use DAY; whole-share orders use GTC."""
+    def _tif_for_qty(self, qty: float, symbol: Optional[str] = None) -> TimeInForce:
+        """Fractional qty → DAY. Hard-to-borrow symbols → DAY (Alpaca rejects
+        GTC on HTB). Whole shares on normal symbols → GTC."""
         if qty != int(qty):
             return TimeInForce.DAY
+        if symbol is not None:
+            with self._htb_lock:
+                if symbol in self._htb_symbols:
+                    return TimeInForce.DAY
         return TimeInForce.GTC
+
+    def _is_htb_rejection(self, err: Exception) -> bool:
+        msg = str(err).lower()
+        return ("hard-to-borrow" in msg or "hard to borrow" in msg
+                or "only day orders are allowed" in msg)
+
+    def _mark_htb(self, symbol: str) -> None:
+        with self._htb_lock:
+            newly_added = symbol not in self._htb_symbols
+            self._htb_symbols.add(symbol)
+        if newly_added:
+            logger.warning(f"[HTB] {symbol} flagged hard-to-borrow — future trailing stops will use DAY TIF")
+
+    def _submit_trailing_stop_with_htb_fallback(self, symbol: str, qty: float,
+                                                 side: OrderSide, trail_percent: float,
+                                                 position_intent=None):
+        """Submit a trailing stop; on hard-to-borrow rejection, retry with DAY TIF
+        and remember the symbol so subsequent submissions skip the GTC attempt."""
+        tif = self._tif_for_qty(qty, symbol)
+        kwargs = dict(symbol=symbol, qty=qty, side=side,
+                      time_in_force=tif, trail_percent=trail_percent)
+        if position_intent is not None:
+            kwargs['position_intent'] = position_intent
+        try:
+            return self.client.submit_order(TrailingStopOrderRequest(**kwargs))
+        except Exception as e:
+            if tif == TimeInForce.GTC and self._is_htb_rejection(e):
+                self._mark_htb(symbol)
+                kwargs['time_in_force'] = TimeInForce.DAY
+                return self.client.submit_order(TrailingStopOrderRequest(**kwargs))
+            raise
 
     def _get_tp_price(self, current_price: float, atr: float, regime: str, direction: int) -> float:
         """Compute take-profit limit price.
@@ -652,11 +697,18 @@ class AlpacaBroker:
 
         # Fractional shares: allow float qty, but enforce minimum notional
         # NOTE: Alpaca does NOT allow fractional shares for short sells
+        # Apr-19: Alpaca also rejects trailing stops on fractional qty. When the
+        # requested size is ≥ 1 share, round DOWN to whole shares so the native
+        # trailing stop covers the full position. Only keep fractional when size
+        # is strictly < 1 (those positions fall back to the software TP monitor).
         if self.use_fractional and direction > 0:
             if size * current_price < 1.0:
                 logger.info(f"Skipping {symbol} — notional ${size * current_price:.2f} below $1 minimum")
                 return None
-            qty = round(size, 4)  # Alpaca supports up to 9 decimal places for fractional
+            if self.config.get('PREFER_WHOLE_SHARES_FOR_TS', True) and size >= 1.0:
+                qty = float(int(size))
+            else:
+                qty = round(size, 4)
         else:
             size = int(size)
             if size < 1:
@@ -785,15 +837,10 @@ class AlpacaBroker:
                 trail_qty = whole_qty
         if trail_qty >= 1:
             try:
-                trail_req = TrailingStopOrderRequest(
-                    symbol=symbol,
-                    qty=trail_qty,
-                    side=close_side,
-                    time_in_force=self._tif_for_qty(trail_qty),
-                    trail_percent=trail_pct,
-                    position_intent=position_intent,
+                trail_resp = await asyncio.to_thread(
+                    self._submit_trailing_stop_with_htb_fallback,
+                    symbol, trail_qty, close_side, trail_pct, position_intent,
                 )
-                trail_resp = await asyncio.to_thread(self.client.submit_order, trail_req)
                 trailing_stop_id = str(trail_resp.id)
                 logger.info(f"[EXIT] {symbol} trailing stop: {trail_pct}% trail | id={trailing_stop_id}")
             except Exception as e:
@@ -841,7 +888,10 @@ class AlpacaBroker:
             if symbol in self._ratchet_pending:
                 logger.debug(f"[RATCHET] {symbol} skipped — replace PATCH already in-flight")
                 return
-        # Read all group fields under lock to prevent stale reads from concurrent stream handler
+        # Read all group fields under lock to prevent stale reads from concurrent stream handler.
+        # Apr-19: MFE/MAE updates moved to the top of _monitor_one_position so that
+        # TP-block / cooldown paths also record peak excursion. Keep original_trail
+        # initialization here (it's cheap and needs to run on the first ratchet).
         with self.tracker._lock:
             group = self.tracker.groups.get(symbol)
             if not group or group.state != GroupState.OPEN or not group.trailing_stop_id:
@@ -852,13 +902,7 @@ class AlpacaBroker:
             entry_price = group.entry_price or current_price
             trailing_stop_id = group.trailing_stop_id
             old_trail = group.trail_percent or 99.0
-            # NEW — update MFE/MAE on every ratchet tick so meta-labeling and the
-            # asymmetric loss-side branch below have fresh numbers.
             live_unrealized = (current_price - entry_price) / entry_price * direction if entry_price else 0.0
-            if live_unrealized > group.max_favorable_pct:
-                group.max_favorable_pct = float(live_unrealized)
-            if live_unrealized < group.max_adverse_pct:
-                group.max_adverse_pct = float(live_unrealized)
             if group.original_trail_percent is None and group.trail_percent:
                 group.original_trail_percent = float(group.trail_percent)
             mfe = group.max_favorable_pct
@@ -887,11 +931,15 @@ class AlpacaBroker:
         loss_tighten_thresh = self.config.get('RATCHET_LOSS_TIGHTEN_THRESHOLD', -0.007)  # -0.7%
         loss_tighten_factor = self.config.get('RATCHET_LOSS_TIGHTEN_FACTOR', 0.55)
         mfe_disqualify = self.config.get('RATCHET_LOSS_TIGHTEN_MFE_MAX', 0.004)  # 0.4% MFE
+        # Apr-19 FIX: loss-side tightening uses its own short throttle so a
+        # trade turning bad at t+30s can have its stop cut immediately instead
+        # of waiting 180-540s for the profit-ratchet cooldown.
+        loss_tighten_interval = self.config.get('RATCHET_LOSS_TIGHTEN_MIN_INTERVAL_SEC', 45)
         if unrealized_pct <= 0:
             if (loss_tighten_enabled
                     and unrealized_pct <= loss_tighten_thresh
                     and mfe <= mfe_disqualify
-                    and elapsed >= min_interval):
+                    and elapsed >= loss_tighten_interval):
                 tight_trail = round(max(0.5, original_trail * loss_tighten_factor), 2)
                 if tight_trail < old_trail:
                     logger.warning(f"[RATCHET LOSS-TIGHTEN] {symbol} unrealized "
@@ -990,8 +1038,6 @@ class AlpacaBroker:
                     else:
                         logger.warning(f"[RATCHET] {symbol} group changed during PATCH — skipping tracker update")
                 logger.debug(f"[RATCHET] {symbol} trailing stop ID updated: {old_id} → {new_order_id}")
-            with self._sets_lock:
-                self._ratchet_pending.discard(symbol)
             self.last_ratchet_time[symbol] = now
             # H7 FIX: update_trail is now redundant (persisted above), but keep for non-PATCH paths
             self.tracker.update_trail(symbol, new_trail_pct)
@@ -1002,7 +1048,12 @@ class AlpacaBroker:
             )
         except Exception as e:
             logger.warning(f"[RATCHET] Failed PATCH for {symbol}: {e} — will retry next cycle")
-            # HIGH-6 FIX: Clear in-flight flag on failure so next cycle can retry
+        finally:
+            # Apr-19 FIX: discard the in-flight flag in finally so a malformed
+            # replace_order response (e.g. object without .id) or any exception
+            # between add() and discard() cannot leave the symbol permanently
+            # stuck in _ratchet_pending — which would silently disable all
+            # future ratcheting for that symbol.
             with self._sets_lock:
                 self._ratchet_pending.discard(symbol)
 
@@ -1024,6 +1075,28 @@ class AlpacaBroker:
         current_price = float(data['close'].iloc[-1])
         atr = self._compute_current_atr(data)
 
+        # Apr-19 FIX: hoist MFE/MAE update to the START of monitor so that even
+        # when the ratchet is skipped (TP in progress, cooldown, etc.) the peak
+        # excursion is still recorded. Previously TIME-STOP saw MFE≈0 on trades
+        # that had spiked +2% and settled flat, incorrectly flagging them as
+        # dead. Updates happen under tracker lock against the LIVE group pointer.
+        if tracked_group is not None:
+            with self.tracker._lock:
+                live_group = self.tracker.groups.get(sym)
+                if live_group and live_group.state == GroupState.OPEN and live_group.entry_price:
+                    live_unrealized = (current_price - live_group.entry_price) / live_group.entry_price * live_group.direction
+                    updated = False
+                    if live_unrealized > live_group.max_favorable_pct:
+                        live_group.max_favorable_pct = float(live_unrealized)
+                        updated = True
+                    if live_unrealized < live_group.max_adverse_pct:
+                        live_group.max_adverse_pct = float(live_unrealized)
+                        updated = True
+                    if updated:
+                        self.tracker._save()
+                    # Rebind snapshot so downstream checks see the fresh MFE/MAE
+                    tracked_group = live_group
+
         # Log position status
         last_entry = self.last_entry_times.get(sym)
         # FIX: Use configured trading interval instead of hardcoded 15 min
@@ -1044,6 +1117,10 @@ class AlpacaBroker:
         # A position held long past its minimum hold AND with zero meaningful
         # excursion (MFE tiny, MAE tiny) is a "dead trade" — thesis isn't playing
         # out either way. Free the capital for a better opportunity.
+        # Apr-19 FIX: re-read tracker.groups here — stream may have transitioned
+        # this group to CLOSED/PENDING_EXIT since our initial snapshot.
+        with self.tracker._lock:
+            tracked_group = self.tracker.groups.get(sym)
         if (self.config.get('TIME_STOP_ENABLED', True)
                 and tracked_group is not None
                 and tracked_group.state == GroupState.OPEN
@@ -1072,7 +1149,9 @@ class AlpacaBroker:
                     logger.error(f"[TIME-STOP] {sym} safe-close failed: {e}")
 
         # === Recover PENDING_EXIT groups stuck longer than 60s ===
-        group = tracked_group  # FIX #8: use local snapshot
+        # Apr-19 FIX: re-read snapshot — state may have transitioned.
+        with self.tracker._lock:
+            group = self.tracker.groups.get(sym)
         if group and group.state == GroupState.PENDING_EXIT:
             try:
                 # HIGH-8 FIX: Use exit_initiated_at (when exit was submitted) not filled_at (entry fill)
@@ -1275,11 +1354,10 @@ class AlpacaBroker:
                 close_side = OrderSide.SELL if group.direction > 0 else OrderSide.BUY
                 trail_qty = int(abs(qty))
                 try:
-                    trail_req = TrailingStopOrderRequest(
-                        symbol=sym, qty=trail_qty, side=close_side,
-                        time_in_force=self._tif_for_qty(trail_qty), trail_percent=trail_pct,
+                    resp = await asyncio.to_thread(
+                        self._submit_trailing_stop_with_htb_fallback,
+                        sym, trail_qty, close_side, trail_pct,
                     )
-                    resp = await asyncio.to_thread(self.client.submit_order, trail_req)
                     with self.tracker._lock:
                         group.trailing_stop_id = str(resp.id)
                         group.stop_price = round(current_price * (1 - group.direction * trail_pct / 100), 2)
@@ -1340,6 +1418,27 @@ class AlpacaBroker:
 
             except Exception as e:
                 logger.error(f"Monitor per-position error: {e}", exc_info=True)
+
+            # === Apr-19 FIX: fractional-remainder sweep ===
+            # Exit fills that left a fractional remainder (< 1 share) are
+            # flagged by stream.py into _pending_fractional_close. Native
+            # trailing stops can't cover them, so we close them here on the
+            # next monitor tick. Skip when the market is closed — close orders
+            # won't route.
+            if is_market_open():
+                with self._fractional_close_lock:
+                    pending_syms = list(self._pending_fractional_close.keys())
+                for _sym in pending_syms:
+                    try:
+                        ok = await self.close_position_safely(_sym)
+                        if ok:
+                            logger.info(f"[FRAC-SWEEP] {_sym} fractional remainder closed")
+                            with self._fractional_close_lock:
+                                self._pending_fractional_close.pop(_sym, None)
+                        else:
+                            logger.debug(f"[FRAC-SWEEP] {_sym} sweep returned False — retry next cycle")
+                    except Exception as _frac_e:
+                        logger.debug(f"[FRAC-SWEEP] {_sym} sweep failed: {_frac_e} — retry next cycle")
 
             # === Slippage adaptation from recent fills ===
             await asyncio.to_thread(self._adapt_slippage)
@@ -1429,11 +1528,10 @@ class AlpacaBroker:
                 logger.info(f"[REATTACH] {symbol} rounding qty {abs_qty} → {trail_qty} for trailing stop")
         if trail_qty >= 1:
             try:
-                trail_req = TrailingStopOrderRequest(
-                    symbol=symbol, qty=trail_qty, side=close_side,
-                    time_in_force=self._tif_for_qty(trail_qty), trail_percent=trail_pct,
+                resp = await asyncio.to_thread(
+                    self._submit_trailing_stop_with_htb_fallback,
+                    symbol, trail_qty, close_side, trail_pct,
                 )
-                resp = await asyncio.to_thread(self.client.submit_order, trail_req)
                 trailing_stop_id = str(resp.id)
                 logger.info(f"[REATTACH] {symbol} trailing stop @ {trail_pct}%")
             except Exception as e:

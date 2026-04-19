@@ -352,8 +352,53 @@ class TradingBotConfig(BaseModel):
     # Learn realized slippage per (symbol, hour, size). At entry, predict expected
     # slippage; if > edge × safety multiple → skip or dampen.
     SLIPPAGE_VETO_ENABLED: bool = True
-    SLIPPAGE_VETO_MULTIPLE: float = 1.2    # pred_bps > edge × this → veto
-    SLIPPAGE_VETO_SCALE: float = 0.3       # dampen to 30% when vetoed
+    SLIPPAGE_VETO_MULTIPLE: float = 2.0    # pred_bps > edge × this → veto (raised from 1.2 Apr-19 after 136 vetoes/3 fills)
+    SLIPPAGE_VETO_SCALE: float = 0.5       # dampen to 50% when vetoed (was 0.3 — too punitive given calibration noise)
+    SLIPPAGE_VETO_MIN_SAMPLES: int = 5     # require ≥N fills in the specific bucket before veto fires
+    # ==================== Walk-forward OOS acceptance ====================
+    # Pre-Apr-19 the accept-gate was `oos > 0.0` which silently rejected windows
+    # with small negative OOS even when IS was modest and the gap was tight.
+    OOS_SHARPE_ACCEPT_FLOOR: float = -0.25     # allow slightly-negative OOS …
+    OOS_ACCEPT_MAX_GAP_RATIO: float = 0.35     # …only when IS→OOS gap ratio is below this
+    # ==================== Broker trailing-stop compatibility ====================
+    # Alpaca rejects trailing stops on fractional qty. Round DOWN to whole shares
+    # when the requested size ≥ 1 so the native trailing stop covers the full
+    # position. Only genuine sub-1-share positions fall back to software TP.
+    PREFER_WHOLE_SHARES_FOR_TS: bool = True
+    # Hard-to-borrow symbols where Alpaca only accepts DAY TIF on trailing stops.
+    # The broker dynamically adds to this set when it sees an HTB rejection.
+    HTB_SYMBOLS: List[str] = Field(default_factory=lambda: ["PLTR"])
+    # ==================== Signal-layer audit fixes (Apr-19) ====================
+    # Gate cascade short-circuit: below this gate_mult, skip remaining gates
+    # and log only the earliest veto reason (stops silent 0.3 × 0.5 × 0.3 cascade).
+    GATE_SHORT_CIRCUIT_THRESHOLD: float = 0.01
+    # Meta-filter is pre-fit until ~2 weeks of closed trades exist. Apply this
+    # dampener during the pre-fit window rather than a silent free pass.
+    META_FILTER_PREFIT_DAMPENER: float = 0.8
+    # Equity-curve drawdown scale: skip downscale for positions aligned with
+    # the dominant regime (shorts in trending_down / longs in trending_up).
+    EQ_SCALE_DIRECTION_AWARE: bool = True
+    # Apply the portfolio_rebalancer causal penalty AFTER min-hold / as the last
+    # multiplier before final renorm (Apr-19 audit).
+    CAUSAL_PENALTY_AFTER_GATES: bool = True
+    # ==================== Risk/Exit audit fixes (Apr-19) ====================
+    # Loss-tighten has its own short throttle so a failing thesis is cut
+    # quickly, not held 180-540s for the profit-ratchet cooldown.
+    RATCHET_LOSS_TIGHTEN_MIN_INTERVAL_SEC: int = 45
+    # Bayesian sizer "proven winner" unlock: when all three thresholds are met
+    # the max multiplier is raised from 1.6 to 2.0.
+    BAYESIAN_PROVEN_N: int = 20
+    BAYESIAN_PROVEN_P_WIN: float = 0.60
+    BAYESIAN_PROVEN_PERSISTENCE: float = 0.85
+    BAYESIAN_PROVEN_MAX_MULT: float = 2.0
+    # CVaR: partition insufficient-data symbols out of the optimization instead
+    # of falling back to uniform for everyone.
+    CVAR_MIN_QUALIFIED_SYMBOLS: int = 3
+    CVAR_INSUFFICIENT_BUDGET_SHARE: float = 0.15
+    # Leverage cap flex: allow up to +20% gross exposure when average regime
+    # persistence is high, so the persistence boost isn't erased by rescale.
+    LEVERAGE_PERSISTENCE_FLEX_MAX: float = 0.20
+    LEVERAGE_PERSISTENCE_FLEX_START: float = 0.70
     # ==================== PSD: PPO–Stacking Divergence Gate ====================
     # If PPO says go hard in one direction but stacking ensemble predicts the
     # OPPOSITE direction, that's high-conviction disagreement — historically

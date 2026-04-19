@@ -278,15 +278,25 @@ class TradeStreamHandler:
                     tracker._save()
                     logger.info(f"[TRACKER] {symbol} CLOSED and removed (single save)")
 
-                # FIX #10: Log fractional remainder warning — monitor will clean up in ~20s
+                # FIX #10 / Apr-19: When the exit fill leaves a fractional remainder,
+                # flag it for active close on the next monitor cycle instead of
+                # just logging the gap. The position is NOT protected by a
+                # trailing stop for that remainder (Alpaca doesn't support native
+                # stops on fractional qty), so we actively sweep it.
                 filled_qty = float(order.filled_qty) if order.filled_qty else 0.0
                 orig_qty = float(order.qty) if hasattr(order, 'qty') and order.qty else filled_qty
                 if filled_qty > 0 and orig_qty > filled_qty:
                     remainder = orig_qty - filled_qty
                     logger.warning(
                         f"[STREAM] {symbol} exit filled {filled_qty} of {orig_qty} — "
-                        f"fractional remainder {remainder:.4f} shares unprotected until next monitor cycle"
+                        f"fractional remainder {remainder:.4f} shares flagged for active close"
                     )
+                    try:
+                        if hasattr(self.broker, '_pending_fractional_close'):
+                            with self.broker._fractional_close_lock:
+                                self.broker._pending_fractional_close[symbol] = float(remainder)
+                    except Exception as e:
+                        logger.debug(f"[STREAM] Failed to flag fractional remainder for {symbol}: {e}")
 
                 # Mark symbol as recently closed before sync
                 import time as _time

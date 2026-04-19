@@ -171,6 +171,11 @@ class BayesianSymbolSizer:
         method: str = "kelly",          # NEW: "kelly" (default) or "ev" (legacy)
         kelly_fraction: float = 0.25,    # ¼ Kelly is institutional-standard safety
         reference_kelly: float = 0.08,   # raw f* of 0.08 → full boost at max_mult
+        persistence: float = 0.5,        # Apr-19: high-persistence regimes unlock wider cap
+        proven_n: int = 20,              # Apr-19: n threshold for "proven" upsize
+        proven_p_win: float = 0.60,      # Apr-19: p_win threshold for proven upsize
+        proven_persistence: float = 0.85,  # Apr-19: regime persistence threshold
+        proven_max_mult: float = 2.0,    # Apr-19: cap when proven criteria all met
     ) -> Tuple[float, str]:
         """Convert per-symbol edge into a weight multiplier ∈ [min_mult, max_mult].
 
@@ -193,22 +198,29 @@ class BayesianSymbolSizer:
             # Fractional Kelly as signed edge, then remap around 1.0
             f_raw = self.kelly_fraction(symbol)             # ∈ roughly [-0.5, +0.5]
             f_scaled = f_raw * kelly_fraction                # ¼-Kelly typically
+            p = self.p_win(symbol)
+            # Apr-19: "Proven winner" upsize — when we have enough closed trades
+            # to trust the posterior (n ≥ proven_n), the win rate is genuinely
+            # positive (p_win ≥ proven_p_win), and the regime is persistent
+            # enough to not whipsaw (persistence ≥ proven_persistence), expand
+            # the upside cap from max_mult (1.6) to proven_max_mult (2.0).
+            dynamic_max = float(max_mult)
+            proven = (n >= proven_n and p >= proven_p_win and persistence >= proven_persistence)
+            if proven:
+                dynamic_max = float(max(dynamic_max, proven_max_mult))
             # Map scaled fraction → multiplier.
-            # f_scaled == 0          → mult = 1.0 (neutral)
-            # f_scaled == +reference_kelly → mult = max_mult
-            # f_scaled == -reference_kelly → mult = min_mult
             if f_scaled >= 0:
-                raw = 1.0 + (f_scaled / max(reference_kelly, 1e-9)) * (max_mult - 1.0)
+                raw = 1.0 + (f_scaled / max(reference_kelly, 1e-9)) * (dynamic_max - 1.0)
             else:
                 raw = 1.0 + (f_scaled / max(reference_kelly, 1e-9)) * (1.0 - min_mult)
-            raw = max(min_mult, min(max_mult, raw))
+            raw = max(min_mult, min(dynamic_max, raw))
             # Shrinkage toward 1.0 for small n (avoid overreacting to lucky streaks)
             shrink = min(1.0, n / max(1, shrinkage_n))
             mult = 1.0 + shrink * (raw - 1.0)
-            mult = max(min_mult, min(max_mult, mult))
-            p = self.p_win(symbol)
+            mult = max(min_mult, min(dynamic_max, mult))
             reason = (f"kelly_f*={f_raw:+.3f} scaled(¼)={f_scaled:+.3f} "
-                      f"p={p:.2f} n={n} shrink={shrink:.2f}")
+                      f"p={p:.2f} n={n} shrink={shrink:.2f}"
+                      f"{' proven-upsize' if proven else ''}")
             return float(mult), reason
         # --- legacy EV method ---
         ev = self.expected_return(symbol)

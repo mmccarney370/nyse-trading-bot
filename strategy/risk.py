@@ -162,23 +162,43 @@ class RiskManager:
         # M-5 FIX: Real-time buying power safety cap — prevents sizing beyond available cash/margin
         # CRIT-7 FIX: Use pre-fetched buying_power from _cached_buying_power (set by caller in bot.py)
         # instead of making a blocking sync API call here. Falls back to equity cap if not set.
+        # Apr-19 AUDIT FIX: previously every per-symbol sizing call read the same
+        # static _cached_buying_power — 5 symbols each reserved the full BP,
+        # leading to 2-3× overleverage. Now we maintain `_bp_reserved_this_cycle`
+        # and subtract it from the cached BP for each call. Caller should call
+        # `reset_bp_budget()` at the start of each rebalance cycle to clear.
         buying_power = getattr(self, '_cached_buying_power', None)
         if buying_power is not None and buying_power > 0:
+            reserved = float(getattr(self, '_bp_reserved_this_cycle', 0.0))
+            effective_bp = max(0.0, float(buying_power) - reserved)
             safety_factor = self.config.get('MAX_ORDER_NOTIONAL_PCT', 0.85)
             if self.config.get('FRACTIONAL_SHARES', True):
-                max_affordable = round(buying_power * safety_factor / price, 4) if price > 0 else 0
+                max_affordable = round(effective_bp * safety_factor / price, 4) if price > 0 else 0
             else:
-                max_affordable = int(buying_power * safety_factor / price) if price > 0 else 0
+                max_affordable = int(effective_bp * safety_factor / price) if price > 0 else 0
             if shares > max_affordable:
                 logger.warning(f"[M-5 BUYING POWER CAP] {symbol}: requested {shares} shares → reduced to {max_affordable} "
-                               f"(buying_power=${buying_power:,.0f}, safety_factor={safety_factor})")
+                               f"(effective_bp=${effective_bp:,.0f}, total_bp=${buying_power:,.0f}, "
+                               f"reserved_this_cycle=${reserved:,.0f}, safety_factor={safety_factor})")
                 shares = max_affordable
+            # Decrement the per-cycle budget by the notional we just reserved so
+            # the next symbol sees a shrunken BP pool.
+            notional_reserved = float(shares) * float(price)
+            if notional_reserved > 0:
+                self._bp_reserved_this_cycle = reserved + notional_reserved
         else:
             logger.debug(f"[M-5] No cached buying power — using equity cap only for {symbol}")
 
         logger.info(f"[SIZE CALC] {symbol} — base_shares={base_shares:.2f} | conviction={conviction:.2f} | "
                     f"scaled_shares={scaled_shares:.2f} | final_shares={shares}")
         return max(shares, 0)
+
+    def reset_bp_budget(self) -> None:
+        """Reset the per-cycle buying-power reservation tracker. Call at the
+        START of each rebalance cycle, after refreshing `_cached_buying_power`,
+        so that sequential per-symbol `calculate_position_size` calls correctly
+        decrement against a shared budget instead of all seeing full BP."""
+        self._bp_reserved_this_cycle = 0.0
 
     def allocate_portfolio_risk(self, equity: float, symbols: list,
                                 confidences: list = None,
@@ -247,25 +267,71 @@ class RiskManager:
                     f"regime={regime} | base_risk_pct={base_risk_pct:.4f} | equity=${equity:,.0f} | "
                     f"multiplier={self.config.get('RISK_BUDGET_MULTIPLIER', 1.8):.2f}")
         # Prepare returns for CVaR
+        # Apr-19 audit: previously a SINGLE short-history symbol collapsed the
+        # whole portfolio to a uniform-weight fallback, erasing regime / conviction
+        # differentiation. Now we partition: qualified symbols (≥100 bars) go into
+        # the CVaR optimization, insufficient symbols get a conviction-proportional
+        # share of the residual budget, and we only trigger the global fallback
+        # when fewer than CVAR_MIN_QUALIFIED_SYMBOLS (default 3) qualify.
+        qualified_syms = []
+        insufficient_syms = []
         returns_list = []
         min_len = float('inf')
         for sym in symbols:
             data = self.data_ingestion.get_latest_data(sym)
             if len(data) < 100:
-                logger.debug(f"Insufficient data for CVaR on {sym} — using parity fallback")
-                min_len = 0
-                break
+                insufficient_syms.append(sym)
+                continue
             ret = data['close'].pct_change().dropna().tail(500)
+            if len(ret) < 50:
+                insufficient_syms.append(sym)
+                continue
+            qualified_syms.append(sym)
             returns_list.append(ret.values)
             min_len = min(min_len, len(ret))
-        if min_len < 50:
-            logger.debug("Insufficient overlapping returns for CVaR — using conviction-weighted fallback")
+        min_qualified = int(self.config.get('CVAR_MIN_QUALIFIED_SYMBOLS', 3))
+        if len(qualified_syms) < min_qualified:
+            logger.info(f"[CVaR] Only {len(qualified_syms)} symbols have sufficient data "
+                        f"(need ≥{min_qualified}) — using conviction-weighted fallback for all")
             if confidences is not None and len(confidences) == n and np.sum(np.abs(confidences)) > 0:
                 weights = np.array(confidences) / np.sum(np.abs(confidences))
             else:
                 weights = np.ones(n) / n
             alloc = {sym: total_risk_budget * weights[i] for i, sym in enumerate(symbols)}
             return alloc
+        # Compute conviction-proportional residual for insufficient symbols so
+        # they still get an allocation (otherwise a short-history symbol gets
+        # zero dollars even when PPO ranks it high).
+        residual_alloc: dict = {}
+        if insufficient_syms:
+            insuff_share = float(self.config.get('CVAR_INSUFFICIENT_BUDGET_SHARE', 0.15))
+            insuff_budget = total_risk_budget * insuff_share
+            # Conviction-weighted inside the insufficient group
+            insuff_conf = []
+            for s in insufficient_syms:
+                idx = symbols.index(s)
+                if confidences is not None and idx < len(confidences):
+                    insuff_conf.append(float(confidences[idx]))
+                else:
+                    insuff_conf.append(0.0)
+            insuff_abs_sum = float(sum(abs(c) for c in insuff_conf))
+            if insuff_abs_sum > 1e-9:
+                for s, c in zip(insufficient_syms, insuff_conf):
+                    residual_alloc[s] = insuff_budget * (c / insuff_abs_sum)
+            else:
+                for s in insufficient_syms:
+                    residual_alloc[s] = insuff_budget / len(insufficient_syms)
+            # Shrink main budget by the residual allocation (preserves total)
+            total_risk_budget = max(0.0, total_risk_budget - sum(abs(v) for v in residual_alloc.values()))
+            logger.info(f"[CVaR] Insufficient-data symbols {insufficient_syms} → "
+                        f"${sum(abs(v) for v in residual_alloc.values()):,.0f} residual; "
+                        f"CVaR budget adjusted to ${total_risk_budget:,.0f}")
+        # Rebuild per-CVaR-symbol state
+        n = len(qualified_syms)
+        symbols_cvar = qualified_syms
+        confidences_cvar = None
+        if confidences is not None:
+            confidences_cvar = [confidences[symbols.index(s)] for s in qualified_syms]
         R = np.column_stack([r[-min_len:] for r in returns_list])
         if np.any(np.isnan(R)) or np.any(np.isinf(R)):
             # HIGH-8 FIX: Explicitly replace inf with 0.0 instead of default 1.7e308
@@ -276,8 +342,8 @@ class RiskManager:
         # This keeps mu in the same units as the return matrix R, so the optimizer's
         # risk-return tradeoff is meaningful instead of using arbitrary synthetic scale.
         mean_returns = np.mean(R, axis=0)  # historical mean daily returns per symbol
-        if confidences is not None and len(confidences) == n:
-            conf_arr = np.array(confidences)
+        if confidences_cvar is not None and len(confidences_cvar) == n:
+            conf_arr = np.array(confidences_cvar)
             # HIGH-9 FIX: Use raw confidence values clamped to [-1, 1] instead of
             # normalizing by max. The old approach (conf_arr / max_abs) lost magnitude:
             # a portfolio where all signals are 0.01 got the same tilt as one where all
@@ -333,7 +399,10 @@ class RiskManager:
                 total_abs = np.sum(np.abs(weights))
                 if total_abs > 1.0:
                     weights = weights / total_abs
-                alloc = {sym: total_risk_budget * weights[i] for i, sym in enumerate(symbols)}
+                alloc = {sym: total_risk_budget * weights[i] for i, sym in enumerate(symbols_cvar)}
+                # Merge residual allocations for insufficient-data symbols
+                if residual_alloc:
+                    alloc.update(residual_alloc)
                 # === FINAL HARD SAFETY CLAMP (this stops insufficient buying power) ===
                 # NOTE (FIX #25): alloc[sym] is risk-dollar allocation, max_per_symbol_dollar is
                 # notional cap. This is intentionally conservative: risk dollars should never
@@ -362,12 +431,17 @@ class RiskManager:
                 return alloc
         except Exception as e:
             logger.debug(f"CVaR optimization exception ({e}) — using fallback")
-        # Robust fallback
-        if confidences is not None and len(confidences) == n and np.sum(np.abs(confidences)) > 0:
-            weights = np.array(confidences) / np.sum(np.abs(confidences))
+        # Robust fallback (CVaR solver failed) — use ALL input symbols, not just qualified,
+        # because the partition is only meaningful on the optimization path.
+        fallback_syms = symbols
+        fallback_confs = confidences
+        fb_n = len(fallback_syms)
+        if fallback_confs is not None and len(fallback_confs) == fb_n and np.sum(np.abs(fallback_confs)) > 0:
+            weights = np.array(fallback_confs) / np.sum(np.abs(fallback_confs))
         else:
-            weights = np.ones(n) / n
-        alloc = {sym: total_risk_budget * weights[i] for i, sym in enumerate(symbols)}
+            weights = np.ones(fb_n) / fb_n
+        alloc = {sym: (total_risk_budget + sum(abs(v) for v in (residual_alloc or {}).values())) * weights[i]
+                 for i, sym in enumerate(fallback_syms)}
         # Apply safety caps even in fallback mode
         max_per_symbol_frac = self.config.get('MAX_POSITION_VALUE_FRACTION', 0.20)
         max_total_risk = self.config.get('MAX_TOTAL_RISK_PCT', 0.12) * equity
