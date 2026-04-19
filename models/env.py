@@ -156,6 +156,16 @@ class TradingEnv(gym.Env):
         drawdown = (self.equity - self.cummax_equity) / self.cummax_equity if self.cummax_equity > 0 else 0
         reward -= CONFIG.get('DD_PENALTY_COEF', 2.0) * max(-drawdown, 0.0)
 
+        # ─── Opportunity cost (Apr-19 audit fix) ───
+        # Idling at |position|≈0 is strictly rewarded relative to small,
+        # turnover-penalised rebalances. Small penalty for being flat breaks
+        # the asymmetry so the policy cannot learn to sit out calm regimes
+        # without tradeoff.
+        opp_cost_coef = CONFIG.get('OPPORTUNITY_COST_COEF', 0.0001)
+        if opp_cost_coef > 0:
+            idle_fraction = max(0.0, 1.0 - abs(self.position))
+            reward -= opp_cost_coef * idle_fraction
+
         # ─── Causal penalty: counterfactual reward adjustment ───
         # Features are computed for causal penalty but NOT cached for _get_observation(),
         # because current_step will be incremented before _get_observation() runs,

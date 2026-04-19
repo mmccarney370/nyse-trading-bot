@@ -264,6 +264,19 @@ class PortfolioEnv(gym.Env):
         # ─── Drawdown penalty ───
         reward -= CONFIG.get('DD_PENALTY_COEF', 2.0) * max(-drawdown, 0.0)
 
+        # ─── Opportunity cost (Apr-19 audit fix) ───
+        # Holding a near-zero position is NOT free. Without this term the
+        # policy learns to idle in calm regimes because every non-zero
+        # rebalance costs turnover while inaction costs nothing. A small
+        # per-step penalty proportional to (1 - |gross exposure|) breaks the
+        # asymmetry: inaction carries its own cost, so the agent has to
+        # genuinely outperform neutrality to justify idling.
+        opp_cost_coef = CONFIG.get('OPPORTUNITY_COST_COEF', 0.0001)
+        if opp_cost_coef > 0:
+            gross_exposure = float(np.sum(np.abs(target_weights)))
+            idle_fraction = max(0.0, 1.0 - gross_exposure)
+            reward -= opp_cost_coef * idle_fraction
+
         reward = np.clip(reward, -10.0, 10.0)
 
         self.current_step += 1

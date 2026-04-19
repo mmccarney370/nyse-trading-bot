@@ -18,6 +18,15 @@ This revision documents the fixes merged from the Apr-19 four-agent audit. None 
 - **§ 3.10 Order Lifecycle** — fractional remainders from partial exit fills are actively swept via `_pending_fractional_close`; monitor branches re-read tracker state after the initial snapshot.
 - **§ 3.11 Risk Sizing** — per-cycle buying-power budget threaded through sequential per-symbol sizing (eliminates the 2–3× over-leverage bug).
 - **Infrastructure hardening (earlier Apr-19):** slippage veto tuning (2.0× edge, min_samples=5), PPO walk-forward OOS acceptance floor (-0.25) + gap cap (35 %), hard-to-borrow symbol auto-fallback (DAY TIF), whole-share preference on entry qty when ≥ 1 share, Gemini tuner exponential-backoff retry, causal lazy-build completion logging, alpha-attribution restart-safe persistence.
+- **§ 4 Training & Learning (Agent C, Apr-19 afternoon):**
+  - Threshold walk-forward restricted to the last 30 % (`STACKING_HOLDOUT_FRAC`) of the dataframe so evaluation is truly out-of-sample against the stacking ensemble's train/val split.
+  - Stacking labels shifted by `LABEL_HORIZON_LAG_BARS = 1` to eliminate same-bar lookback.
+  - Walk-forward OOS acceptance adds an `OOS_ACCEPT_MAX_ABS_GAP = 0.5` cap in addition to the ratio cap.
+  - Optuna objective replaced with Sharpe-sustainability: auto-accept when IS > 2.0 AND gap_ratio < 15 %, otherwise discount IS by `0.1 × gap_ratio` (capped at 50 %).
+  - Opportunity-cost term added to both env reward functions: `OPPORTUNITY_COST_COEF × (1 - |position|)`, removes the "idle is free" asymmetry vs turnover-penalised rebalances.
+  - PPO auxiliary volatility head disabled (`PPO_AUX_TASK = False`) — the SB3 rollout-buffer / info-dict alignment was undefined and the aux loss was effectively random noise.
+  - GTrXL inference now maintains a rolling **32-token** self-attention window (`GTRXL_INFERENCE_WINDOW`) so train and inference both see chunked causal attention — closes the 2-token-approximation distribution shift on the value function.
+  - Gemini tuner clamps every tunable to `_PERSISTED_ABSOLUTE_BOUNDS` on both save and load of `dynamic_config.json`, preventing monotonic de-aggression drift through manual edits or future bypassed apply paths.
 
 Section numbering below is unchanged; inline `(Apr-19)` markers appear where the behaviour shifted.
 

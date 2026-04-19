@@ -151,8 +151,15 @@ class TradingBotConfig(BaseModel):
     # === Reward shaping: lighter penalties so profitable actions dominate the signal ===
     VOL_PENALTY_COEF: float = 0.01                     # Was 0.02 — too heavy kills profitable vol strategies
     DD_PENALTY_COEF: float = 1.0                       # Was 2.0 — DD penalty was 2x the base return, drowning profit signal
-    PPO_AUX_TASK: bool = True
-    PPO_AUX_LOSS_WEIGHT: float = 0.10                  # Was 0.25 — aux loss is a known no-op (SB3 buffer lacks infos); minimize interference
+    # Apr-19 audit: the aux volatility head trains on misaligned targets —
+    # AuxVolatilityCallback captures vol_target per env step, but SB3's
+    # RolloutBuffer subsamples/reorders observations before train(), so the
+    # i-th target does not match the i-th buffer row. This made the aux loss
+    # effectively random noise. Disabled by default. The env still emits
+    # `volatility_target` in info so a future observation-feature-style
+    # re-introduction is easy (add vol_target to the obs vector instead).
+    PPO_AUX_TASK: bool = False
+    PPO_AUX_LOSS_WEIGHT: float = 0.10                  # Irrelevant while PPO_AUX_TASK=False; kept for rollback
     LABEL_HORIZON_BARS: int = 8                        # Forward return horizon for LightGBM labels (matches MIN_HOLD_BARS_TRENDING)
     NUM_BASE_MODELS: int = 20                          # LightGBM ensemble size
     PPO_ONLINE_UPDATE_TIMESTEPS: int = 75_000
@@ -399,6 +406,26 @@ class TradingBotConfig(BaseModel):
     # persistence is high, so the persistence boost isn't erased by rescale.
     LEVERAGE_PERSISTENCE_FLEX_MAX: float = 0.20
     LEVERAGE_PERSISTENCE_FLEX_START: float = 0.70
+    # ==================== Training audit fixes (Apr-19) ====================
+    # Walk-forward OOS absolute-gap cap (in addition to the ratio cap). A
+    # large absolute IS→OOS Sharpe gap is a red flag even when the ratio
+    # is small, because live-money losses scale with absolute Sharpe drop.
+    OOS_ACCEPT_MAX_ABS_GAP: float = 0.5
+    # Opportunity-cost reward term — breaks the "idle is strictly rewarded"
+    # bias under calm regimes by penalising low |position| lightly.
+    OPPORTUNITY_COST_COEF: float = 0.0001
+    # Stacking ensemble label lag (bars shifted beyond horizon) to avoid the
+    # same-bar lookback leak where indicators computed on bar t are scored
+    # against bar t's own forward return.
+    LABEL_HORIZON_LAG_BARS: int = 1
+    # Threshold walk-forward runs over the stacking-holdout tail only, since
+    # stacking ensemble is trained on the earlier portion of the dataframe.
+    STACKING_HOLDOUT_FRAC: float = 0.30
+    # Walk-forward window count when operating over the holdout tail.
+    WALK_FORWARD_N_WINDOWS: int = 3
+    # GTrXL inference rolling-window size — tokens of self-attention during
+    # single-step inference (matches training chunk length semantics).
+    GTRXL_INFERENCE_WINDOW: int = 32
     # ==================== PSD: PPO–Stacking Divergence Gate ====================
     # If PPO says go hard in one direction but stacking ensemble predicts the
     # OPPOSITE direction, that's high-conviction disagreement — historically

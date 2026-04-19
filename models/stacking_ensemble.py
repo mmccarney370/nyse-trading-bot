@@ -67,19 +67,26 @@ def train_stacking(
     # Multi-bar forward labels: predict direction over the actual holding horizon.
     # 1-bar labels have SNR ~0.005 (coin flip). 8-bar labels have ~2.8x higher SNR
     # and align with MIN_HOLD_BARS_TRENDING (8), matching actual trading behavior.
+    # Apr-19 audit: shift forward returns by an additional 1 bar so the label
+    # for feature row t uses returns from t+1 to t+1+horizon (avoids the
+    # same-bar lookback where indicators computed through bar t's close are
+    # scored against bar t's own forward return).
     horizon = CONFIG.get('LABEL_HORIZON_BARS', 8)
-    forward_returns = data['close'].pct_change(horizon).shift(-horizon)
-    labels_full = (forward_returns > 0).astype(int).values  # last `horizon` elements are NaN → 0
+    label_lag = int(CONFIG.get('LABEL_HORIZON_LAG_BARS', 1))
+    forward_returns = data['close'].pct_change(horizon).shift(-horizon - label_lag)
+    labels_full = (forward_returns > 0).astype(int).values  # last (horizon+label_lag) elements are NaN → 0
 
-    # Align: features are tail-aligned to data. Drop last `horizon` feature rows (no complete forward return).
-    n_feat = len(features) - horizon
+    # Align: features are tail-aligned to data. Drop last (horizon+label_lag)
+    # feature rows (no complete forward return for those rows).
+    drop_tail = horizon + label_lag
+    n_feat = len(features) - drop_tail
     if n_feat < 200:
-        logger.warning(f"[STACKING] {symbol}: only {n_feat} usable rows after {horizon}-bar horizon — too few for training")
+        logger.warning(f"[STACKING] {symbol}: only {n_feat} usable rows after {drop_tail}-bar horizon+lag — too few for training")
         return []
     features = features[:n_feat]
 
-    # Labels for the same data rows: tail slice of length n_feat, excluding last `horizon` data rows
-    labels = labels_full[-(n_feat + horizon):-horizon]
+    # Labels for the same data rows: tail slice of length n_feat, excluding last drop_tail rows.
+    labels = labels_full[-(n_feat + drop_tail):-drop_tail]
 
     # Final safety: truncate to shorter of the two
     min_len = min(len(features), len(labels))

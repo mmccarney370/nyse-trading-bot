@@ -234,12 +234,27 @@ class Trainer:
             'meta_prob': ensemble_prob[:len(aligned_returns)],
             'return': aligned_returns.values
         }, index=aligned_returns.index)
-        n_windows = 6
+        # Apr-19 audit: threshold walk-forward was evaluating over the FULL
+        # dataframe, but stacking_ensemble trains on the first ~70% — so
+        # windows 1-4 of 6 were evaluating against predictions the stacking
+        # model had already memorised. To restore true out-of-sample
+        # properties without the 3-5× cost of per-fold stacking retrains,
+        # we restrict the walk-forward to the tail `STACKING_HOLDOUT_FRAC`
+        # of the dataframe, which matches the unseen portion of the
+        # stacking training split.
+        holdout_frac = float(self.config.get('STACKING_HOLDOUT_FRAC', 0.30))
+        if len(df) > 200 and 0.1 <= holdout_frac <= 0.5:
+            tail_cut = int(len(df) * (1.0 - holdout_frac))
+            full_df = df
+            df = df.iloc[tail_cut:].copy()
+            logger.info(
+                f"{symbol} walk-forward restricted to stacking-holdout tail "
+                f"({len(df)}/{len(full_df)} bars; holdout_frac={holdout_frac})"
+            )
+        n_windows = int(self.config.get('WALK_FORWARD_N_WINDOWS', 3))
         # HIGH FIX: Increased embargo from 1 to 20 bars to reduce look-ahead bias.
-        # The stacking models were trained on the full dataset before this function,
-        # so ensemble_prob contains predictions from a model that saw future data.
-        # A larger embargo creates a buffer zone between train/OOS splits, reducing
-        # the information leakage from model training on the full dataset.
+        # Still useful: even inside the stacking-holdout tail, the first few
+        # bars share auto-correlation with the final training bars.
         embargo = 20
         window_size = len(df) // n_windows
         for w in range(n_windows):
@@ -257,13 +272,36 @@ class Trainer:
             def objective(trial):
                 long_thresh = trial.suggest_float('long_thresh', 0.55, 0.85)
                 short_thresh = trial.suggest_float('short_thresh', 0.15, 0.45)
-                penalty_weight = self.config.get('THRESHOLD_PENALTY_WEIGHT', 0.70)
+                # Apr-19 audit: replace the static "distance from 0.65/0.35"
+                # penalty with a Sharpe-sustainability objective. The old
+                # penalty (0.70×|long-0.65| + |short-0.35|) subtracted up to
+                # -0.14 from legitimately aggressive thresholds, pulling the
+                # optimiser back to arbitrary midpoints. The new objective
+                # rewards robust IS/OOS consistency: very strong IS with
+                # small cross-validated gap gets accepted verbatim, otherwise
+                # IS is discounted by gap ratio.
                 signals = np.where(train_df['meta_prob'] > long_thresh, 1,
                                    np.where(train_df['meta_prob'] < short_thresh, -1, 0))
                 strat_returns = signals * train_df['return']
-                sharpe = strat_returns.mean() / (strat_returns.std() + 1e-8) * np.sqrt(252 * 26)
-                penalty = penalty_weight * (abs(long_thresh - 0.65) + abs(short_thresh - 0.35))
-                return sharpe - penalty
+                is_sharpe_trial = strat_returns.mean() / (strat_returns.std() + 1e-8) * np.sqrt(252 * 26)
+                # Cheap pseudo-OOS: last 20% of train window
+                cv_cut = max(1, int(len(train_df) * 0.8))
+                cv_oos_df = train_df.iloc[cv_cut:]
+                if len(cv_oos_df) >= 5:
+                    cv_signals = np.where(cv_oos_df['meta_prob'] > long_thresh, 1,
+                                          np.where(cv_oos_df['meta_prob'] < short_thresh, -1, 0))
+                    cv_rets = cv_signals * cv_oos_df['return']
+                    cv_sharpe = cv_rets.mean() / (cv_rets.std() + 1e-8) * np.sqrt(252 * 26)
+                    gap = is_sharpe_trial - cv_sharpe
+                    gap_ratio_trial = abs(gap) / (abs(is_sharpe_trial) + 1e-8)
+                else:
+                    gap_ratio_trial = 0.0
+                # Auto-accept aggressive: very strong IS with small gap
+                if is_sharpe_trial > 2.0 and gap_ratio_trial < 0.15:
+                    return float(is_sharpe_trial)
+                # Otherwise discount IS by gap severity (never more than -50%)
+                discount = min(0.5, 0.1 * gap_ratio_trial)
+                return float(is_sharpe_trial * (1.0 - discount))
             # Scale trials to window size — prevents overfitting small samples
             max_trials = min(self.config.get('OPTUNA_TRIALS', 350), max(50, len(train_df) // 5))
             study = optuna.create_study(direction='maximize', sampler=TPESampler())
@@ -299,8 +337,15 @@ class Trainer:
             # noise (the Apr-19 pattern where 6/8 symbols had 6–9% gaps).
             oos_floor = self.config.get('OOS_SHARPE_ACCEPT_FLOOR', -0.25)
             gap_cap = self.config.get('OOS_ACCEPT_MAX_GAP_RATIO', 0.35)
-            accept = (oos_sharpe > 0.0) or (
-                oos_sharpe > oos_floor and gap_ratio < gap_cap
+            # Apr-19 audit: add an ABSOLUTE Sharpe gap cap. A window with
+            # IS=3.0 / OOS=0.6 has gap_ratio≈27% (passes the ratio gate)
+            # but an 80bps absolute gap is a large live-money hit. Reject
+            # windows whose absolute gap is too wide regardless of ratio.
+            abs_gap_cap = self.config.get('OOS_ACCEPT_MAX_ABS_GAP', 0.5)
+            absolute_gap_ok = is_oos_gap < abs_gap_cap
+            accept = (
+                (oos_sharpe > 0.0 and absolute_gap_ok)
+                or (oos_sharpe > oos_floor and gap_ratio < gap_cap and absolute_gap_ok)
             )
             if accept:
                 final_long_thresh = best.params['long_thresh']
@@ -325,7 +370,8 @@ class Trainer:
             else:
                 logger.warning(
                     f"{symbol} window {w+1} rejected — "
-                    f"OOS={oos_sharpe:.3f} (floor={oos_floor}) gap_ratio={gap_ratio:.0%} (cap={gap_cap:.0%})"
+                    f"OOS={oos_sharpe:.3f} (floor={oos_floor}) gap_ratio={gap_ratio:.0%} (cap={gap_cap:.0%}) "
+                    f"abs_gap={is_oos_gap:.2f} (cap={abs_gap_cap:.2f})"
                 )
         if not self.confidence_thresholds.get(symbol):
             fallback_time = data.index[-1]

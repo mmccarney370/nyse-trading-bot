@@ -252,6 +252,16 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         self.num_layers = num_layers
         self.memory_length = CONFIG.get('GTRXL_MEMORY_LENGTH', 64)
         self.eval_chunk_size = CONFIG.get('GTRXL_EVAL_CHUNK_SIZE', 64)
+        # Apr-19 audit: inference window size — number of recent projected
+        # observations (plus current) that _single_step_forward attends over.
+        # Training uses 64-step chunks with XL memory; previous inference
+        # approximation used only 2 tokens (summary + current), which caused
+        # a distribution shift on the value head. Matching inference's
+        # attended sequence to the training chunk length closes that gap.
+        self.inference_window_size = CONFIG.get('GTRXL_INFERENCE_WINDOW', 32)
+        # Rolling buffer of (episode-scoped) projected features used as context
+        # during single-step inference. Reset on episode_starts.
+        self._inference_window = []
 
         # GTrXL layers with per-layer GRU gating
         self.gtrxl_layers = nn.ModuleList([
@@ -411,14 +421,12 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
                 and predict_values() are called on the SAME observation during SB3 rollout
                 collection, so they must NOT increment to avoid double-counting.
 
-        KNOWN ARCHITECTURAL MISMATCH (train vs inference):
-        Training (evaluate_actions) processes full chunks through _gtrxl_forward with
-        XL-style segment memory across chunks. Inference here uses a 2-token approach
-        (memory_token + current_obs) without true XL memory. This means the transformer
-        sees different sequence structures at train vs inference time. Fixing this would
-        require storing per-layer XL memories across inference steps, which is a
-        fundamental architecture change. The memory-token approach provides a reasonable
-        approximation by compressing history into a single summary vector.
+        Apr-19 audit: inference now maintains a rolling window of the last
+        `inference_window_size` projected observations and attends over the
+        full window (plus the LSTM-derived summary as token 0). This matches
+        training's chunked self-attention far more closely than the previous
+        2-token approximation, collapsing the train/inference distribution
+        shift on the value function. The window is reset on episode_starts.
         """
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
@@ -429,55 +437,68 @@ class AuxGTrXLPolicy(RecurrentActorCriticPolicy):
         features = self.obs_projection(obs).unsqueeze(1)  # [B, 1, H]
         memory = self._extract_memory(lstm_states, B, obs.device)
 
-        # Reset memory and step counter on episode boundaries.
-        # SB3 RecurrentPPO requires n_envs=1 for recurrent policies, so episode_starts
-        # is always shape [1]. We assert this and reset per-env for safety.
-        # CRIT-2 FIX: _inference_step is a scalar shared across envs — unsafe for n_envs>1.
         assert B == 1, (
             f"GTrXLPolicy._inference_step is a scalar — n_envs must be 1, got batch size {B}. "
             "Use RecurrentPPO with n_envs=1 for correct positional encoding."
         )
         if episode_starts is not None and episode_starts.any():
             memory = memory * (1 - episode_starts.float().unsqueeze(-1))
-            # Reset step counter for any env that starts a new episode
-            # (With n_envs=1 this is equivalent to the old .all() check, but safe for n_envs>1)
             if episode_starts.any():
                 self._inference_step = 0
+                self._inference_window = []
 
-        # Prepend memory as context token — transformer attends to [memory, current]
-        # Robust dimension handling: ensure both are exactly 3D [B, 1, H]
+        # Dimensional hygiene on memory token
         if memory.dim() == 1:
-            memory = memory.unsqueeze(0)  # [H] → [1, H]
+            memory = memory.unsqueeze(0)
         if memory.dim() == 2:
-            mem_token = memory.unsqueeze(1)  # [B, H] → [B, 1, H]
+            mem_token = memory.unsqueeze(1)
         elif memory.dim() == 3:
-            mem_token = memory  # already [B, 1, H]
+            mem_token = memory
         else:
-            # 4D+ from stacked states — collapse to [B, H] then unsqueeze
             mem_token = memory.reshape(memory.shape[0], -1)[:, :self.hidden_size].unsqueeze(1)
         if features.dim() == 2:
-            features = features.unsqueeze(1)  # [B, H] → [B, 1, H]
-        combined = torch.cat([mem_token, features], dim=1)  # [B, 2, H]
+            features = features.unsqueeze(1)
 
-        # Add positional encoding ONLY to the observation token (index 1), NOT the memory token.
-        # In training (_gtrxl_forward), PE is added only to current segment tokens, not memory.
-        # Applying PE to the memory token here would create a train/inference inconsistency.
+        # Build the rolling inference sequence:
+        # [mem_token, ...last K-1 prior obs features, current obs features]
+        win = self.inference_window_size
+        # Detach prior features to prevent gradient flow through history
+        # (we don't want .backward() to trace into past steps during any
+        # inadvertent training-mode call on single-step fn).
+        history = [h.detach() for h in self._inference_window[-max(0, win - 1):]]
+        seq_tokens = [mem_token] + history + [features]
+        combined = torch.cat(seq_tokens, dim=1)  # [B, L, H]
+        L = combined.shape[1]
+
+        # Add sinusoidal PE to every observation token (not the memory token).
+        # Each history token gets its prior PE offset; current token gets offset=_inference_step.
         max_pe = self.sinusoidal_pe.shape[1] - 1
-        pos = self._inference_step % max_pe if max_pe > 0 else 0
-        pe_for_obs = self.sinusoidal_pe[:, pos:pos + 1, :self.hidden_size]  # [1, 1, H]
-        combined[:, 1:2, :] = combined[:, 1:2, :] + pe_for_obs  # Only observation token gets PE
+        if L > 1 and max_pe > 0:
+            hist_count = len(history)
+            current_pos = self._inference_step % (max_pe + 1)
+            # Positions: history tokens are earliest..current-1; current token is current_pos
+            for i in range(hist_count):
+                hist_pos = (current_pos - (hist_count - i)) % (max_pe + 1)
+                if hist_pos < 0:
+                    hist_pos = 0
+                combined[:, 1 + i:2 + i, :] = combined[:, 1 + i:2 + i, :] + \
+                    self.sinusoidal_pe[:, hist_pos:hist_pos + 1, :self.hidden_size]
+            # Current observation token is at index L-1
+            combined[:, L - 1:L, :] = combined[:, L - 1:L, :] + \
+                self.sinusoidal_pe[:, current_pos:current_pos + 1, :self.hidden_size]
 
-        # Apply causal mask (matches training) — token 0 attends to [0], token 1 attends to [0,1]
-        causal_mask = self._make_causal_mask(2, 0, combined.device)
+        causal_mask = self._make_causal_mask(L, 0, combined.device)
         for layer in self.gtrxl_layers:
             combined = layer(combined, attn_mask=causal_mask)
         combined = self.output_norm(combined)
 
-        # HIGH-1 FIX: Only increment step counter when caller requests it.
-        # During SB3 rollout, get_distribution() and predict_values() are both called
-        # on the same observation — only forward() should increment to avoid double-counting.
         if increment_step:
             self._inference_step += 1
+            # Append CURRENT (post-projection, pre-attention) features to the
+            # history window for future steps. Trim to the configured window.
+            self._inference_window.append(features.detach())
+            if len(self._inference_window) > win:
+                self._inference_window = self._inference_window[-win:]
 
         # Return last token (current step output)
         return combined[:, -1, :]  # [B, H]

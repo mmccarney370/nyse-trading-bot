@@ -125,6 +125,16 @@ A four-agent deep audit on 2026-04-19 surfaced 22 concrete profit leaks across t
 - Fractional remainder after a partial exit fill is **actively swept** on the next monitor cycle via a new `_pending_fractional_close` queue (previously left unprotected until the next reconcile).
 - Monitor re-reads `tracker.groups.get(sym)` inside the TIME-STOP and PENDING_EXIT branches so it never acts on a state the stream handler has since transitioned.
 
+**Training / learning (Agent C)**
+- Stacking-ensemble train-OOS contamination mitigated: walk-forward threshold optimisation now runs only on the **stacking-holdout tail** (last 30% of the dataframe) so evaluation is genuinely out-of-sample.
+- GTrXL **inference now maintains a rolling 32-token attention window** matching training's chunked self-attention (was 2 tokens). Closes the known train/inference architecture gap.
+- Env reward gets a small **opportunity-cost term** (`OPPORTUNITY_COST_COEF × (1 - |position|)`) so the policy can no longer learn to idle for free in calm regimes.
+- PPO auxiliary volatility head **disabled** (`PPO_AUX_TASK=False`) — the SB3 rollout-buffer / info-dict alignment was undefined, making the aux loss effectively random noise.
+- Stacking-ensemble labels now shifted by **+1 bar** (`LABEL_HORIZON_LAG_BARS=1`) to prevent same-bar lookback leakage.
+- Walk-forward OOS acceptance gate adds an **absolute Sharpe gap cap** (`OOS_ACCEPT_MAX_ABS_GAP=0.5`) on top of the ratio cap.
+- Gemini tuner parameters **clamped to explicit bounds on both save and load** of `dynamic_config.json` — prevents long-run drift toward de-aggression through manual edits or bypassed apply paths.
+- Optuna threshold objective replaced with a **Sharpe-sustainability** form (auto-accept when IS > 2.0 AND gap_ratio < 15%, otherwise discount IS by gap severity). Drops the old "distance-from-midpoint" penalty that pulled toward arbitrary 0.65/0.35 defaults.
+
 **Earlier the same day (Apr 19 morning audit):**
 - Slippage-veto tuned to `2.0× edge` with a `min_samples=5` gate (was firing ×45 per fill).
 - PPO walk-forward OOS acceptance relaxed with a `-0.25` floor + 35 % gap cap (no longer silently rejecting borderline-noise windows alongside genuinely broken ones).

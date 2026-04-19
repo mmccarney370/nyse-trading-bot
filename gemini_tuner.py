@@ -34,11 +34,83 @@ TB_LOG_DIR = os.path.join(_PROJECT_ROOT, "ppo_tensorboard", "portfolio")
 DYNAMIC_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "dynamic_config.json")
 TUNING_HISTORY_PATH = os.path.join(_PROJECT_ROOT, "tuning_history.json")  # stores last few tuning changes for temporal context
 
+# Apr-19 audit: module-level bounds table so both `save_dynamic_config` and
+# `load_dynamic_config` can clamp persisted values back into safe ranges. The
+# apply-time `ABSOLUTE_BOUNDS` dict (defined inside `apply_gemini_tweaks_to_config`)
+# already handles the live path; this mirror guards the persistence path so a
+# manually-edited dynamic_config.json or a legacy bad value cannot sneak a
+# parameter outside its safe range on reload.
+_PERSISTED_ABSOLUTE_BOUNDS = {
+    'RISK_PER_TRADE_TRENDING': (0.010, 0.040),
+    'RISK_PER_TRADE_MEAN_REVERTING': (0.002, 0.015),
+    'KELLY_FRACTION': (0.25, 0.65),
+    'RISK_BUDGET_MULTIPLIER': (1.2, 2.5),
+    'MAX_LEVERAGE': (1.5, 2.5),
+    'MAX_POSITIONS': (4, 8),
+    'MAX_POSITION_VALUE_FRACTION': (0.15, 0.30),
+    'CONVICTION_THRESHOLD': (0.20, 0.40),
+    'TRAILING_STOP_ATR_TRENDING': (1.5, 3.5),
+    'TRAILING_STOP_ATR_MEAN_REVERTING': (2.0, 5.0),
+    'TAKE_PROFIT_ATR_TRENDING': (15.0, 40.0),
+    'TAKE_PROFIT_ATR_MEAN_REVERTING': (5.0, 15.0),
+    'MIN_CONFIDENCE': (0.75, 0.92),
+    'SENTIMENT_WEIGHT': (0.10, 0.40),
+    'PORTFOLIO_SENTIMENT_WEIGHT': (0.15, 0.50),
+    'MIN_HOLD_BARS_TRENDING': (3, 12),
+    'MIN_HOLD_BARS_MEAN_REVERTING': (2, 8),
+    'PPO_LEARNING_RATE': (1e-4, 5e-4),
+    'PPO_ENTROPY_COEFF': (0.01, 0.08),
+    'PPO_GAMMA': (0.93, 0.98),
+    'PPO_GAE_LAMBDA': (0.90, 0.97),
+    'PPO_CLIP_RANGE': (0.10, 0.25),
+    'VF_COEF': (0.3, 1.5),
+    'PPO_AUX_LOSS_WEIGHT': (0.10, 0.40),
+    'DD_PENALTY_COEF': (0.5, 3.0),
+    'VOL_PENALTY_COEF': (0.005, 0.03),
+    'TURNOVER_COST_MULT': (0.1, 0.5),
+    'SORTINO_WEIGHT': (0.10, 0.35),
+    'CAUSAL_PENALTY_WEIGHT': (0.20, 0.50),
+    'META_FILTER_MIN_PROB': (0.30, 0.55),
+    'TIME_STOP_THRESHOLD_BARS': (48, 192),
+    'TIME_STOP_MFE_CEILING': (0.002, 0.015),
+    'TIME_STOP_MAE_FLOOR': (-0.015, -0.002),
+}
+
+
+def _clamp_to_persisted_bounds(changes: dict) -> dict:
+    """Clamp every tunable parameter in `changes` back into its
+    `_PERSISTED_ABSOLUTE_BOUNDS` range. Unknown keys pass through unchanged.
+    Used on both save and load of `dynamic_config.json` so drift cannot
+    accumulate across cycles."""
+    clamped: dict = {}
+    for k, v in (changes or {}).items():
+        if k in _PERSISTED_ABSOLUTE_BOUNDS:
+            lo, hi = _PERSISTED_ABSOLUTE_BOUNDS[k]
+            try:
+                vv = float(v)
+                cc = max(lo, min(hi, vv))
+                if isinstance(v, int) or k in {'MAX_POSITIONS', 'MIN_HOLD_BARS_TRENDING',
+                                                'MIN_HOLD_BARS_MEAN_REVERTING',
+                                                'TIME_STOP_THRESHOLD_BARS'}:
+                    cc = int(round(cc))
+                if cc != vv:
+                    logger.warning(f"[TUNER BOUNDS] Clamped {k}: {vv} → {cc} (bounds {lo}..{hi})")
+                clamped[k] = cc
+            except (TypeError, ValueError):
+                clamped[k] = v
+        else:
+            clamped[k] = v
+    return clamped
+
 def load_dynamic_config():
     if os.path.exists(DYNAMIC_CONFIG_PATH):
         try:
             with open(DYNAMIC_CONFIG_PATH, 'r') as f:
                 dynamic = json.load(f)
+            # Apr-19 audit: clamp persisted values on load so any value that
+            # drifted outside its safe range (legacy files, manual edit) is
+            # forced back into bounds before it touches live CONFIG.
+            dynamic = _clamp_to_persisted_bounds(dynamic)
             # FIX #33: Validate BEFORE applying to CONFIG. On validation failure,
             # revert to pre-update state so invalid values don't persist.
             from config import TradingBotConfig
@@ -62,8 +134,12 @@ def load_dynamic_config():
             logger.warning(f"Failed to load dynamic config: {e}")
 
 def save_dynamic_config(changes: dict):
-    """Save dynamic config and tuning history atomically (Priority 1 fix)"""
+    """Save dynamic config and tuning history atomically (Priority 1 fix).
+    Apr-19 audit: clamp on the save-side too, so a bypassed apply-path value
+    (e.g. a future call site that writes straight here) can never drift out
+    of the bounds table. Idempotent with the apply-time clamp."""
     try:
+        changes = _clamp_to_persisted_bounds(changes or {})
         current = {}
         if os.path.exists(DYNAMIC_CONFIG_PATH):
             with open(DYNAMIC_CONFIG_PATH, 'r') as f:
