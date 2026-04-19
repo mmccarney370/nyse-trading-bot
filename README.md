@@ -135,6 +135,13 @@ A four-agent deep audit on 2026-04-19 surfaced 22 concrete profit leaks across t
 - Gemini tuner parameters **clamped to explicit bounds on both save and load** of `dynamic_config.json` — prevents long-run drift toward de-aggression through manual edits or bypassed apply paths.
 - Optuna threshold objective replaced with a **Sharpe-sustainability** form (auto-accept when IS > 2.0 AND gap_ratio < 15%, otherwise discount IS by gap severity). Drops the old "distance-from-midpoint" penalty that pulled toward arbitrary 0.65/0.35 defaults.
 
+**Data / execution (Agent D)**
+- **TFT features default to INVALID** when the cache column is missing, and the whole TFT contribution is zeroed when fewer than `TFT_MIN_VALID_FRAC=0.5` of rows are valid. Previously zero-padded neutrals for short-history symbols were treated as valid 20-dim signal.
+- Extended-hours bars (pre-market + after-hours) are **rejected at the ingestion layer** (`STREAM_REJECT_EXTENDED_HOURS=True`) so thin-volume bars don't distort HMM regime detection or feature statistics.
+- Local LLM sentiment now returns `float('nan')` on timeout or empty-opinions; signals.py **skips blending** entirely when sentiment is NaN. Previously a broken LLM returning 0.0 was indistinguishable from genuine neutral sentiment and silently corrupted target weights.
+- **Partial entry fills now record slippage** to the predictor on each fraction, not just the instantly-completing ones. Removes the bias that skewed slippage-veto calibration toward best-case fills.
+- Entry-side alpha attribution is now **re-recorded at fill time** from the order group's stashed layers if the in-memory pending buffer has no match (e.g. after a restart that outlived `alpha_attribution_pending.json`). Eliminates `exit_only` orphan records for GTC orders filling across sessions.
+
 **Earlier the same day (Apr 19 morning audit):**
 - Slippage-veto tuned to `2.0× edge` with a `min_samples=5` gate (was firing ×45 per fill).
 - PPO walk-forward OOS acceptance relaxed with a `-0.25` floor + 35 % gap cap (no longer silently rejecting borderline-noise windows alongside genuinely broken ones).

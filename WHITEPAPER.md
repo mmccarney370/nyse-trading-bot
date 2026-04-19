@@ -18,6 +18,12 @@ This revision documents the fixes merged from the Apr-19 four-agent audit. None 
 - **§ 3.10 Order Lifecycle** — fractional remainders from partial exit fills are actively swept via `_pending_fractional_close`; monitor branches re-read tracker state after the initial snapshot.
 - **§ 3.11 Risk Sizing** — per-cycle buying-power budget threaded through sequential per-symbol sizing (eliminates the 2–3× over-leverage bug).
 - **Infrastructure hardening (earlier Apr-19):** slippage veto tuning (2.0× edge, min_samples=5), PPO walk-forward OOS acceptance floor (-0.25) + gap cap (35 %), hard-to-borrow symbol auto-fallback (DAY TIF), whole-share preference on entry qty when ≥ 1 share, Gemini tuner exponential-backoff retry, causal lazy-build completion logging, alpha-attribution restart-safe persistence.
+- **§ 3 Subsystems — Data & execution (Agent D, Apr-19 afternoon):**
+  - `models/features.py`: TFT `tft_valid` defaults to zeros (not ones) when the cache has no such column; full TFT contribution is zeroed whenever fewer than `TFT_MIN_VALID_FRAC = 0.5` of rows are valid. Fixes a silent alpha leak for newly-rotated-in symbols with < 120 bars.
+  - `data/ingestion.py`: extended-hours bars are filtered at `handle_alpaca_bar` (configurable via `STREAM_REJECT_EXTENDED_HOURS`). Keeps HMM regime classifier calibrated to regular hours only.
+  - `utils/local_llm.py`: `debate_sentiment` returns `NaN` on timeout / empty opinions; `strategy/signals.py` skips the blend when NaN (previously 0.0 was indistinguishable from genuine neutral).
+  - `broker/stream.py`: partial entry fills now compute and record realised slippage per fraction, not just when the fill completes instantly — slippage veto calibration was otherwise biased toward best-case fills.
+  - `broker/order_tracker.py` + `broker/stream.py`: entry-side alpha attribution is re-recorded at fill time from group-stashed layers if the pending buffer has no match. Removes orphan `exit_only` records for cross-session GTC fills.
 - **§ 4 Training & Learning (Agent C, Apr-19 afternoon):**
   - Threshold walk-forward restricted to the last 30 % (`STACKING_HOLDOUT_FRAC`) of the dataframe so evaluation is truly out-of-sample against the stacking ensemble's train/val split.
   - Stacking labels shifted by `LABEL_HORIZON_LAG_BARS = 1` to eliminate same-bar lookback.

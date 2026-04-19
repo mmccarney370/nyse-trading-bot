@@ -172,6 +172,47 @@ class TradeStreamHandler:
                 except Exception as e:
                     logger.debug(f"[SLIPPAGE] record failed for {symbol}: {e}")
 
+            # Apr-19 audit: make sure alpha_attribution has an entry-side
+            # record for this fill. The normal path is signals.py calling
+            # record_attribution every cycle; but entries that fill from
+            # GTC orders placed in a prior session (or before the first
+            # signal-gen cycle after restart) would otherwise produce
+            # exit_only records at close. We re-record from the group's
+            # stashed entry_layers / baseline if no pending record matches.
+            try:
+                attr = getattr(self.broker, 'signal_gen', None)
+                attr = getattr(attr, 'alpha_attribution', None) if attr is not None else None
+                if attr is not None:
+                    with attr._lock:
+                        has_pending = any(
+                            r.get('symbol') == symbol for r in attr._pending
+                        )
+                    if not has_pending:
+                        base_w = getattr(group, 'baseline_weight', None)
+                        final_w = getattr(group, 'final_weight', None)
+                        layers = getattr(group, 'entry_layers', None) or {}
+                        if base_w is None and filled_qty > 0:
+                            base_w = float(filled_qty * fill_price) / 30000.0
+                        if final_w is None:
+                            final_w = base_w
+                        attr.record_attribution(
+                            symbol=symbol,
+                            baseline_weight=float(base_w or 0.0),
+                            final_weight=float(final_w or 0.0),
+                            direction=int(group.direction),
+                            layers=layers,
+                            context={
+                                "source": "entry_fill_fallback",
+                                "regime": getattr(group, 'regime', 'unknown'),
+                            },
+                        )
+                        logger.info(
+                            f"[ALPHA-ATTR] {symbol} entry-side re-recorded from "
+                            f"tracker group (pending buffer had no match)"
+                        )
+            except Exception as _attr_e:
+                logger.debug(f"[ALPHA-ATTR] entry-fill record failed for {symbol}: {_attr_e}")
+
             await self.broker.submit_exit_orders(symbol, group, fill_price, filled_qty)
 
         elif order_id and order_id in (group.trailing_stop_id, group.take_profit_id):
@@ -331,15 +372,44 @@ class TradeStreamHandler:
         filled_qty = float(order.filled_qty) if order.filled_qty else 0.0
         total_qty = float(order.qty) if order.qty else 0.0
         logger.info(f"[STREAM] Partial fill: {symbol} {order_id} filled_qty={filled_qty}/{total_qty}")
-        # Track partial exit fills — if this is an exit order and fully filled, process as exit
         tracker = self.broker.tracker
         group = tracker.lookup_by_order_id(order_id)
-        if group and order_id in (group.trailing_stop_id, group.take_profit_id):
+        if not group:
+            return
+        # Apr-19 audit: partial ENTRY fills were never recording slippage to
+        # the predictor — only fully-instantly-filled entries did. This
+        # biased the slippage veto calibration toward the best-case fills.
+        # Now: on every partial entry fill, compute slip vs limit and feed
+        # the predictor with the current partial quantity.
+        if order_id == group.entry_order_id and filled_qty > 0:
+            try:
+                fill_price = float(order.filled_avg_price) if hasattr(order, 'filled_avg_price') and order.filled_avg_price else 0.0
+                limit_price = float(group.entry_price) if group.entry_price else 0.0
+                if fill_price > 0 and limit_price > 0:
+                    slip = abs(fill_price - limit_price) / limit_price
+                    group.slippage = float(slip)  # Accumulates; final value overwritten at full fill
+                    if hasattr(self.broker, 'slippage_predictor') and self.broker.slippage_predictor:
+                        size_usd = fill_price * filled_qty
+                        self.broker.slippage_predictor.record(
+                            symbol=symbol,
+                            slip_bps=slip * 10000.0,
+                            hour=datetime.now().hour,
+                            size_usd=size_usd,
+                            direction=int(group.direction),
+                        )
+                        logger.debug(
+                            f"[SLIPPAGE] {symbol} partial entry fill — "
+                            f"{filled_qty}/{total_qty} @ {fill_price:.4f} vs limit {limit_price:.4f} "
+                            f"(slip={slip*10000:.1f}bp) recorded"
+                        )
+            except Exception as e:
+                logger.debug(f"[SLIPPAGE] Partial entry record failed for {symbol}: {e}")
+        # Track partial exit fills — if this is an exit order and fully filled, process as exit
+        if order_id in (group.trailing_stop_id, group.take_profit_id):
             remaining = total_qty - filled_qty if total_qty > 0 else 0
             if remaining <= 0.001:
                 # Fully filled via partial fills — process as full exit
                 logger.info(f"[STREAM] Partial fills complete for {symbol} — processing as full exit")
-                # M28 FIX: Removed dead fill_price assignment (value was never used)
                 await self._handle_fill(order, order_id, symbol)
 
     async def _handle_cancel(self, order, order_id: str, symbol: str, event: str):

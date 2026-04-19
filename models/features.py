@@ -659,14 +659,35 @@ def generate_features(data: pd.DataFrame, regime: str, symbol: str, full_hist_df
                 logger.debug(f"TFT cache misalignment for {symbol} — using neutral features")
             else:
                 tft_features = aligned[feat_cols].values if feat_cols else np.zeros((len(data), n_tft_feats))
-                tft_valid = aligned['tft_valid'].values if has_valid else np.ones(len(data))
+                # Apr-19 audit: when the cache has no tft_valid column the
+                # data is zero-padded neutral — default to INVALID (zeros)
+                # instead of treating it as valid. Without this the policy
+                # trains on meaningless 20-dim vectors for any symbol with
+                # <120 bars of history. Additionally zero the TFT contribution
+                # entirely when fewer than half the rows are valid.
+                if has_valid:
+                    tft_valid = aligned['tft_valid'].values
+                else:
+                    tft_valid = np.zeros(len(data))
                 n_valid = int(tft_valid.sum())
+                valid_frac = float(n_valid) / max(1, len(tft_valid))
+                min_valid_frac = float(CONFIG.get('TFT_MIN_VALID_FRAC', 0.5))
                 if n_valid == 0:
-                    logger.warning(f"TFT for {symbol}: all rows invalid (collapsed/padded)")
+                    logger.warning(f"TFT for {symbol}: all rows invalid (collapsed/padded) — zeroing TFT contribution")
+                    tft_features = np.zeros_like(tft_features)
+                elif valid_frac < min_valid_frac:
+                    logger.warning(
+                        f"TFT for {symbol}: only {valid_frac:.0%} of rows valid "
+                        f"(< {min_valid_frac:.0%}) — zeroing TFT contribution"
+                    )
+                    tft_features = np.zeros_like(tft_features)
                 else:
                     valid_feats = tft_features[tft_valid > 0.5]
                     mean_val = float(valid_feats.mean()) if len(valid_feats) > 0 else 0.0
                     std_val = float(valid_feats.std()) if len(valid_feats) > 0 else 0.0
+                    # Also zero the INVALID rows so the policy never sees
+                    # zero-padded features mixed with real ones on the same row.
+                    tft_features = tft_features * tft_valid[:, None]
                     logger.debug(f"TFT ACTIVE for {symbol} — {n_valid}/{len(data)} valid | "
                                  f"mean={mean_val:.4f} std={std_val:.4f}")
         except Exception as e:

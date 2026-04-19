@@ -50,6 +50,13 @@ class OrderGroup:
     max_favorable_pct: float = 0.0  # peak unrealized P&L as % of entry (direction-signed)
     max_adverse_pct: float = 0.0    # deepest underwater as % of entry (direction-signed, negative)
     original_trail_percent: Optional[float] = None  # preserved initial trail for loss-tighten logic
+    # Apr-19 audit: stash the entry-time alpha-attribution layers + baseline
+    # weight so stream.py can re-record attribution on entry fill if the
+    # pending-attribution buffer got lost across a restart. These travel
+    # through disk persistence inside order_tracker.json.
+    entry_layers: Optional[Dict[str, float]] = None
+    baseline_weight: Optional[float] = None
+    final_weight: Optional[float] = None
 
     def __post_init__(self):
         if self.created_at is None:

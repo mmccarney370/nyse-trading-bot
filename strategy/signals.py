@@ -1203,6 +1203,16 @@ class SignalGenerator:
                 sent_vel_weight = self.config.get('SENTIMENT_VELOCITY_WEIGHT', 0.15)
                 sent_vel_lookback = self.config.get('SENTIMENT_VELOCITY_LOOKBACK_HOURS', 4)
                 for sym, sentiment in sentiment_results:
+                    # Apr-19 audit: debate_sentiment now returns NaN on LLM
+                    # failure (timeout or empty opinions). Treat NaN as "no
+                    # information" and skip sentiment blending for this
+                    # symbol entirely — previously returning 0.0 (neutral)
+                    # was indistinguishable from genuine neutrality and let
+                    # a silent failure corrupt target_weights.
+                    if sentiment is None or (isinstance(sentiment, float) and np.isnan(sentiment)):
+                        sentiment_multipliers[sym] = 1.0
+                        logger.debug(f"{sym} sentiment unavailable (NaN) — skipping blend")
+                        continue
                     sentiment_factor = 1.0 + sentiment_blend_weight * sentiment
                     velocity_factor = 1.0
                     if sent_vel_weight > 0:
@@ -1236,7 +1246,14 @@ class SignalGenerator:
             sentiment_by_sym = {}
             if sentiment_blend_weight > 0:
                 try:
-                    sentiment_by_sym = {sym: s for sym, s in sentiment_results}
+                    # Apr-19: substitute NaN sentiment with 0.0 here so the
+                    # meta-filter gate receives a neutral feature instead of
+                    # propagating NaN into LightGBM predict (which would
+                    # crash or silently degrade calibration).
+                    sentiment_by_sym = {
+                        sym: (0.0 if s is None or (isinstance(s, float) and np.isnan(s)) else s)
+                        for sym, s in sentiment_results
+                    }
                 except Exception:
                     sentiment_by_sym = {}
             # ALPHA-ATTR: snapshot baseline weights RIGHT BEFORE the gating loop.

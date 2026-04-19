@@ -94,6 +94,27 @@ class DataIngestion:
         # FIX #1: Don't floor timestamp — Alpaca provides correct bar timestamps.
         # Resampling on lines below handles aggregation per timeframe.
         timestamp = pd.to_datetime(bar.timestamp, utc=True)
+        # Apr-19 audit: reject extended-hours bars from the 15Min store. HMM
+        # regime detection and feature statistics are calibrated on regular
+        # trading hours (09:30-16:00 ET). Pre-market (4:00-9:30) and
+        # after-hours (16:00-20:00) bars are 10-20× thinner volume and
+        # distort regime classification when resampled into the main store.
+        # Controlled by STREAM_REJECT_EXTENDED_HOURS (default True). The 16:00
+        # closing bar is retained because it contains the RTH close-auction print.
+        if self.config.get('STREAM_REJECT_EXTENDED_HOURS', True):
+            try:
+                et_ts = timestamp.tz_convert(tz.gettz('America/New_York'))
+                hour, minute = et_ts.hour, et_ts.minute
+                before_open = hour < 9 or (hour == 9 and minute < 30)
+                after_close = hour >= 16 and not (hour == 16 and minute == 0)
+                if before_open or after_close:
+                    logger.debug(
+                        f"[STREAM RTH FILTER] Dropping extended-hours bar "
+                        f"{symbol} @ {et_ts.strftime('%Y-%m-%d %H:%M %Z')}"
+                    )
+                    return
+            except Exception as _tz_e:
+                logger.debug(f"[STREAM RTH FILTER] Timezone check failed: {_tz_e} — letting bar through")
         data = {
             'open': bar.open,
             'high': bar.high,

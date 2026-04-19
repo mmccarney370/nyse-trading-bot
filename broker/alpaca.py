@@ -762,11 +762,36 @@ class AlpacaBroker:
                 persistence=persistence,
                 extended_hours=self.use_extended_hours,
             )
+            # Apr-19 audit: snapshot the most recent pending alpha-attribution
+            # entry for this symbol onto the group, so stream.py can
+            # re-record attribution at fill time even after a bot restart
+            # that outlives the in-memory pending buffer.
+            snapshot_layers = None
+            snapshot_base = None
+            snapshot_final = None
+            try:
+                attr = getattr(getattr(self, 'signal_gen', None), 'alpha_attribution', None)
+                if attr is not None:
+                    with attr._lock:
+                        for rec in reversed(attr._pending):
+                            if rec.get('symbol') == symbol:
+                                snapshot_layers = dict(rec.get('layers') or {})
+                                snapshot_base = rec.get('baseline_weight')
+                                snapshot_final = rec.get('final_weight')
+                                break
+            except Exception as _attr_e:
+                logger.debug(f"[ALPHA-ATTR] snapshot on place order failed for {symbol}: {_attr_e}")
             # Temporarily store limit_price as entry_price for slippage measurement
             with self.tracker._lock:
                 group = self.tracker.groups.get(symbol)
                 if group:
                     group.entry_price = limit_price
+                    if snapshot_layers is not None:
+                        group.entry_layers = snapshot_layers
+                    if snapshot_base is not None:
+                        group.baseline_weight = float(snapshot_base)
+                    if snapshot_final is not None:
+                        group.final_weight = float(snapshot_final)
                     self.tracker._save()
 
             with self._entry_times_lock:

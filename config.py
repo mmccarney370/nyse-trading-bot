@@ -426,6 +426,14 @@ class TradingBotConfig(BaseModel):
     # GTrXL inference rolling-window size — tokens of self-attention during
     # single-step inference (matches training chunk length semantics).
     GTRXL_INFERENCE_WINDOW: int = 32
+    # ==================== Data / execution audit fixes (Apr-19) ====================
+    # Reject extended-hours bars from the 15Min store so HMM regime
+    # detection and feature stats stay calibrated on regular hours.
+    STREAM_REJECT_EXTENDED_HOURS: bool = True
+    # TFT features are zeroed out when the fraction of valid rows falls
+    # below this threshold — prevents zero-padded neutral vectors from
+    # leaking into the PPO observation as if they were real signal.
+    TFT_MIN_VALID_FRAC: float = 0.5
     # ==================== PSD: PPO–Stacking Divergence Gate ====================
     # If PPO says go hard in one direction but stacking ensemble predicts the
     # OPPOSITE direction, that's high-conviction disagreement — historically

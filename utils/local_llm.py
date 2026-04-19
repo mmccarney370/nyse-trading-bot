@@ -85,8 +85,13 @@ class LocalLLMDebate:
                     opinions.append(score)
                     logger.debug(f"Local LLM {role} score: {score:.3f}")
                 if not opinions:
-                    logger.warning(f"All LLM opinions were NaN for {symbol} — returning neutral 0.0")
-                    return 0.0
+                    # Apr-19 audit: on complete LLM failure return NaN so the
+                    # sentiment blender in signals.py can SKIP blending
+                    # entirely. Returning 0.0 previously made "LLM broken"
+                    # indistinguishable from "genuinely neutral sentiment"
+                    # and let a silent failure corrupt target_weights.
+                    logger.warning(f"All LLM opinions were NaN for {symbol} — returning NaN sentinel")
+                    return float('nan')
                 final = sum(opinions) / len(opinions)
                 logger.info(f"Local LLM debate final: {final:.3f} ({len(news_texts)} headlines) [{symbol}]")
                 return final
@@ -94,5 +99,6 @@ class LocalLLMDebate:
         try:
             return await asyncio.wait_for(_run_debate(), timeout=_debate_timeout)
         except (asyncio.TimeoutError, TimeoutError):
-            logger.warning(f"[OLLAMA TIMEOUT] {symbol} debate exceeded {_debate_timeout}s — returning 0.0 (lock released)")
-            return 0.0
+            # Apr-19 audit: NaN sentinel, not 0.0. See note above.
+            logger.warning(f"[OLLAMA TIMEOUT] {symbol} debate exceeded {_debate_timeout}s — returning NaN sentinel")
+            return float('nan')
