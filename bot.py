@@ -30,6 +30,12 @@ from utils.helpers import is_market_open, time_until_next_open # ← UPDATED IMP
 from strategy.regime import detect_regime, is_trending
 from strategy.universe import UniverseManager
 from gemini_tuner import query_gemini_for_tuning, load_dynamic_config
+try:
+    from claude_tuner import query_claude_for_tuning, tuner_available as _claude_tuner_available
+except ImportError:
+    query_claude_for_tuning = None
+    def _claude_tuner_available() -> bool:
+        return False
 from models.features import generate_features
 from models.portfolio_env import PortfolioEnv # B-12: required for real portfolio obs
 # NEW IMPORT FOR SHUTDOWN FIX (matches exactly how GetOrdersRequest is used in alpaca.py)
@@ -1249,10 +1255,31 @@ class TradingBot:
                             'symbols_in_universe': len(self.config['SYMBOLS']),
                         }
                         logger.info(
-                            f"[GEMINI] Sharpe={sharpe_ratio} Sortino={sortino_ratio} MaxDD={max_drawdown_pct}% "
+                            f"[TUNER] Sharpe={sharpe_ratio} Sortino={sortino_ratio} MaxDD={max_drawdown_pct}% "
                             f"PF={profit_factor} WR={win_rate:.1f}% Trades={total_closed} Regime={dominant_regime}"
                         )
-                        applied = query_gemini_for_tuning(context, self.config, symbol_performance)
+                        # Apr-19: provider dispatch. Default preference is Claude Opus 4.7
+                        # (deeper reasoning + prompt caching); fall back to Gemini when
+                        # the Claude SDK / API key is unavailable or provider is set to gemini.
+                        provider = str(self.config.get('TUNER_PROVIDER', 'claude')).lower().strip()
+                        use_claude = (
+                            provider == 'claude'
+                            and query_claude_for_tuning is not None
+                            and _claude_tuner_available()
+                        )
+                        if use_claude:
+                            logger.info(f"[TUNER] Using Claude Opus path (model={self.config.get('CLAUDE_TUNER_MODEL')})")
+                            applied = query_claude_for_tuning(context, self.config, symbol_performance)
+                            if not applied:
+                                logger.warning("[TUNER] Claude returned no changes — falling back to Gemini this cycle")
+                                applied = query_gemini_for_tuning(context, self.config, symbol_performance)
+                        else:
+                            if provider == 'claude':
+                                logger.warning(
+                                    "[TUNER] Claude requested but unavailable "
+                                    "(SDK missing or ANTHROPIC_API_KEY unset) — using Gemini"
+                                )
+                            applied = query_gemini_for_tuning(context, self.config, symbol_performance)
                         if applied:
                             logger.info(f"[GEMINI TUNER] Live config updated with {len(applied)} changes")
                             # ISSUE #5 PATCH: Check for intra-week rotation trigger from Gemini

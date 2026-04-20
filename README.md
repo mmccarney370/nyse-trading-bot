@@ -81,7 +81,7 @@ The signal pipeline is aggressive by nature — it has to be to find edge. The p
 
 The bot doesn't wait for a human to tune it. Nine scheduled tasks run overnight and through the trading day.
 
-**Gemini 2.5 Flash self-tuning** (03:30 AM ET). The bot serializes its full performance profile — Sharpe, Sortino, drawdown, win rate, per-symbol P&L, PPO training scalars, regime distribution, and the history of recent RETRAIN-GUARD decisions — and sends it to Gemini with 25 parameter groups and hard bounds. Gemini writes a Chain-of-Thought reasoning block explaining its analysis, rates its own confidence (which scales step sizes server-side), and proposes changes inside a strict JSON schema. Every value is Pydantic-validated, category-clamped, and anti-oscillation-checked. With retry logic for transient API errors.
+**Nightly self-tuner** (03:30 AM ET) — Claude Opus 4.7 or Gemini 2.5 Flash. The bot serializes its full performance profile — Sharpe, Sortino, drawdown, win rate, per-symbol P&L, PPO training scalars, regime distribution, and the history of recent RETRAIN-GUARD decisions — and sends it to the configured provider with 24 parameter groups and hard bounds. The tuner returns an integrated analysis block (Opus spends its extended-thinking budget reasoning about cross-parameter interactions, statistical significance, and whether it's about to reverse a prior-cycle change), a triage label, a concrete thesis, proposed parameter values, an expected-effect estimate, a self-rated confidence level, and a rollback trigger. Every value is Pydantic-validated, category-clamped, and anti-oscillation-checked. With retry logic for transient API errors. Provider is selected via `TUNER_PROVIDER` in `config.py`; Claude uses prompt caching on the static protocol + bounds table so nightly calls cost ~$0.08–0.15 (Opus) or ~$0.015 (Sonnet).
 
 **Pre-market micro-retrain** (08:30 AM ET). A lighter PPO fine-tune — 5K timesteps on the last 500 bars at 1e-5 learning rate — adapts the model to overnight news and futures moves before market open. Wrapped in its own RETRAIN-GUARD with stricter thresholds than the nightly run.
 
@@ -141,6 +141,13 @@ A four-agent deep audit on 2026-04-19 surfaced 22 concrete profit leaks across t
 - Local LLM sentiment now returns `float('nan')` on timeout or empty-opinions; signals.py **skips blending** entirely when sentiment is NaN. Previously a broken LLM returning 0.0 was indistinguishable from genuine neutral sentiment and silently corrupted target weights.
 - **Partial entry fills now record slippage** to the predictor on each fraction, not just the instantly-completing ones. Removes the bias that skewed slippage-veto calibration toward best-case fills.
 - Entry-side alpha attribution is now **re-recorded at fill time** from the order group's stashed layers if the in-memory pending buffer has no match (e.g. after a restart that outlived `alpha_attribution_pending.json`). Eliminates `exit_only` orphan records for GTC orders filling across sessions.
+
+**New: Claude Opus 4.7 tuner (evening Apr 19)**
+- `claude_tuner.py` ships alongside `gemini_tuner.py`. Toggle via `TUNER_PROVIDER` (default `claude` when `ANTHROPIC_API_KEY` is configured; transparent fallback to Gemini otherwise).
+- Prompt was rewritten from scratch for Opus: **profit-first framing** instead of the Gemini triage tree, an architecture briefing so the model knows which layer each parameter touches, a known-failure-modes section that names de-aggression drift and noise-chasing, a reasoning protocol that rewards extended thinking over formulaic "reduce X because Y" edits, and an output schema with an explicit rollback-trigger field so every cycle commits a falsifiable bet.
+- Uses Anthropic's **ephemeral prompt caching** on the static system prompt (mission + bounds table + protocol + schema) so repeated nightly runs pay ~10% of the first-run input tokens.
+- Uses **extended thinking** (16k token budget default) — Opus can literally spend reasoning budget weighing cross-parameter interactions before committing.
+- Expected cost: Opus ≈ $0.08–0.15/night, Sonnet 4.6 ≈ $0.015/night. Setup: add `ANTHROPIC_API_KEY=sk-ant-...` to `.env`, from [console.anthropic.com](https://console.anthropic.com/settings/keys). Your Claude.ai Pro/Max subscription is separate and does **not** grant API access — you need a pay-as-you-go API key.
 
 **Earlier the same day (Apr 19 morning audit):**
 - Slippage-veto tuned to `2.0× edge` with a `min_samples=5` gate (was firing ×45 per fill).

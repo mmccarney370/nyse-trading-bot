@@ -434,6 +434,22 @@ class TradingBotConfig(BaseModel):
     # below this threshold — prevents zero-padded neutral vectors from
     # leaking into the PPO observation as if they were real signal.
     TFT_MIN_VALID_FRAC: float = 0.5
+    # ==================== Tuner provider selection (Apr-19) ====================
+    # Switch between the Gemini 2.5 Flash tuner and the Claude Opus 4.7 tuner.
+    # Claude is the quality default when ANTHROPIC_API_KEY is configured;
+    # the dispatch layer falls back to Gemini on missing key or API error.
+    # Values: "claude" | "gemini".
+    TUNER_PROVIDER: str = "claude"
+    # Claude-specific model selection. Opus gives the deepest reasoning;
+    # Sonnet 4.6 is ~6× cheaper for ~90% of the strategic quality.
+    CLAUDE_TUNER_MODEL: str = "claude-opus-4-7"
+    # Extended-thinking budget in tokens. More budget = longer reasoning
+    # but higher latency and a small cost bump. 16K is a good balance for
+    # a nightly tuning call that must weigh ~15 parameters across 20+
+    # groups. The SDK enforces thinking_budget < max_tokens.
+    CLAUDE_TUNER_THINKING_BUDGET: int = 16000
+    # Budget for the visible (non-thinking) output.
+    CLAUDE_TUNER_MAX_OUTPUT: int = 4000
     # ==================== PSD: PPO–Stacking Divergence Gate ====================
     # If PPO says go hard in one direction but stacking ensemble predicts the
     # OPPOSITE direction, that's high-conviction disagreement — historically
