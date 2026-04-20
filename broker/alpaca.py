@@ -1397,14 +1397,36 @@ class AlpacaBroker:
             # Position exists but no tracker group — check if it's a tiny fractional remainder
             abs_qty = abs(qty)
             if abs_qty < 1.0:
-                # Fractional remainder worth < 1 share — close it (negligible value, can't have trailing stop)
+                # Fractional remainder worth < 1 share — close it (negligible value, can't have trailing stop).
+                # Apr-19 fix: (1) skip entirely when market is closed — close_position submits a
+                # market order that cannot route outside RTH and would just log an error every 20s;
+                # (2) use close_position_safely so any stale pending order holding the shares is
+                # cancelled first (previously caused "insufficient qty available" retry loops);
+                # (3) throttle to one attempt per 5 minutes per symbol to avoid log spam.
                 notional = abs_qty * current_price
+                if not is_market_open():
+                    logger.debug(
+                        f"[CLEANUP] {sym} fractional remainder {abs_qty:.4f} (${notional:.2f}) — "
+                        f"deferred until market open"
+                    )
+                    return
+                now_ts = datetime.now(tz=_UTC)
+                last_attempt = getattr(self, '_frac_cleanup_last_attempt', {}).get(sym)
+                min_gap = self.config.get('FRAC_CLEANUP_MIN_INTERVAL_SEC', 300)
+                if last_attempt is not None and (now_ts - last_attempt).total_seconds() < min_gap:
+                    return
+                if not hasattr(self, '_frac_cleanup_last_attempt'):
+                    self._frac_cleanup_last_attempt = {}
+                self._frac_cleanup_last_attempt[sym] = now_ts
                 logger.info(f"[CLEANUP] {sym} fractional remainder {abs_qty:.4f} shares (${notional:.2f}) — closing")
                 try:
-                    await asyncio.to_thread(self.client.close_position, sym)
-                    logger.info(f"[CLEANUP] {sym} fractional remainder closed")
+                    ok = await self.close_position_safely(sym)
+                    if ok:
+                        logger.info(f"[CLEANUP] {sym} fractional remainder closed")
+                    else:
+                        logger.warning(f"[CLEANUP] {sym} fractional close returned False — retry in {min_gap}s")
                 except Exception as e:
-                    logger.warning(f"[CLEANUP] Failed to close {sym} fractional remainder: {e}")
+                    logger.warning(f"[CLEANUP] Failed to close {sym} fractional remainder: {e} — retry in {min_gap}s")
             elif is_market_open() and bars_held >= min_hold:
                 # Re-attach protective orders for full positions
                 await self._reattach_exits(sym, qty, direction, current_price, atr, regime)
@@ -1447,13 +1469,22 @@ class AlpacaBroker:
             # === Apr-19 FIX: fractional-remainder sweep ===
             # Exit fills that left a fractional remainder (< 1 share) are
             # flagged by stream.py into _pending_fractional_close. Native
-            # trailing stops can't cover them, so we close them here on the
-            # next monitor tick. Skip when the market is closed — close orders
-            # won't route.
+            # trailing stops can't cover them, so we close them on the next
+            # monitor tick. Skip when market is closed — close orders won't
+            # route, and per-symbol throttle to avoid hammering on persistent
+            # failures (shares held_for_orders by a stale pending close).
             if is_market_open():
                 with self._fractional_close_lock:
                     pending_syms = list(self._pending_fractional_close.keys())
+                _now_ts = datetime.now(tz=_UTC)
+                _min_gap = self.config.get('FRAC_CLEANUP_MIN_INTERVAL_SEC', 300)
+                if not hasattr(self, '_frac_cleanup_last_attempt'):
+                    self._frac_cleanup_last_attempt = {}
                 for _sym in pending_syms:
+                    _last = self._frac_cleanup_last_attempt.get(_sym)
+                    if _last is not None and (_now_ts - _last).total_seconds() < _min_gap:
+                        continue
+                    self._frac_cleanup_last_attempt[_sym] = _now_ts
                     try:
                         ok = await self.close_position_safely(_sym)
                         if ok:
@@ -1461,9 +1492,9 @@ class AlpacaBroker:
                             with self._fractional_close_lock:
                                 self._pending_fractional_close.pop(_sym, None)
                         else:
-                            logger.debug(f"[FRAC-SWEEP] {_sym} sweep returned False — retry next cycle")
+                            logger.debug(f"[FRAC-SWEEP] {_sym} sweep returned False — retry in {_min_gap}s")
                     except Exception as _frac_e:
-                        logger.debug(f"[FRAC-SWEEP] {_sym} sweep failed: {_frac_e} — retry next cycle")
+                        logger.debug(f"[FRAC-SWEEP] {_sym} sweep failed: {_frac_e} — retry in {_min_gap}s")
 
             # === Slippage adaptation from recent fills ===
             await asyncio.to_thread(self._adapt_slippage)

@@ -436,6 +436,9 @@ class TradingBotConfig(BaseModel):
     # below this threshold — prevents zero-padded neutral vectors from
     # leaking into the PPO observation as if they were real signal.
     TFT_MIN_VALID_FRAC: float = 0.5
+    # Fractional-remainder cleanup throttle (prevents log spam + API hammer
+    # when shares are stuck as held_for_orders by a stale pending close).
+    FRAC_CLEANUP_MIN_INTERVAL_SEC: int = 300
     # ==================== Tuner provider selection (Apr-19) ====================
     # Switch between the Gemini 2.5 Flash tuner and the Claude Opus 4.7 tuner.
     # Claude is the quality default when ANTHROPIC_API_KEY is configured;
