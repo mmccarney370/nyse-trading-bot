@@ -407,10 +407,12 @@ class TradingBotConfig(BaseModel):
     LEVERAGE_PERSISTENCE_FLEX_MAX: float = 0.20
     LEVERAGE_PERSISTENCE_FLEX_START: float = 0.70
     # ==================== Training audit fixes (Apr-19) ====================
-    # Walk-forward OOS absolute-gap cap (in addition to the ratio cap). A
-    # large absolute IS→OOS Sharpe gap is a red flag even when the ratio
-    # is small, because live-money losses scale with absolute Sharpe drop.
+    # Walk-forward OOS absolute-gap cap. Only applied when OOS is itself
+    # below `OOS_SHARPE_STRONG_ACCEPT` — a window with OOS=5.0 and IS=11.5
+    # has a 6.5 abs gap but is excellent; we never reject strong-OOS
+    # windows because IS was even better.
     OOS_ACCEPT_MAX_ABS_GAP: float = 0.5
+    OOS_SHARPE_STRONG_ACCEPT: float = 1.0
     # Opportunity-cost reward term — breaks the "idle is strictly rewarded"
     # bias under calm regimes by penalising low |position| lightly.
     OPPORTUNITY_COST_COEF: float = 0.0001

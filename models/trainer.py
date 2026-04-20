@@ -337,14 +337,22 @@ class Trainer:
             # noise (the Apr-19 pattern where 6/8 symbols had 6–9% gaps).
             oos_floor = self.config.get('OOS_SHARPE_ACCEPT_FLOOR', -0.25)
             gap_cap = self.config.get('OOS_ACCEPT_MAX_GAP_RATIO', 0.35)
-            # Apr-19 audit: add an ABSOLUTE Sharpe gap cap. A window with
-            # IS=3.0 / OOS=0.6 has gap_ratio≈27% (passes the ratio gate)
-            # but an 80bps absolute gap is a large live-money hit. Reject
-            # windows whose absolute gap is too wide regardless of ratio.
             abs_gap_cap = self.config.get('OOS_ACCEPT_MAX_ABS_GAP', 0.5)
-            absolute_gap_ok = is_oos_gap < abs_gap_cap
+            strong_oos = float(self.config.get('OOS_SHARPE_STRONG_ACCEPT', 1.0))
+            # Apr-19 audit v2: the absolute-gap cap ONLY applies when OOS is
+            # itself weak. A window with OOS Sharpe 5.0 and IS Sharpe 11.5
+            # has a 6.5 abs gap but OOS is excellent and must not be rejected
+            # just because IS was even better. The abs-gap cap was meant to
+            # catch cases where OOS is borderline-negative and the ratio
+            # metric looks deceptively small due to a tiny IS — so only
+            # enforce it when OOS is below `strong_oos`.
+            absolute_gap_ok = (oos_sharpe >= strong_oos) or (is_oos_gap < abs_gap_cap)
             accept = (
-                (oos_sharpe > 0.0 and absolute_gap_ok)
+                # Accept when OOS is strongly positive regardless of gap.
+                oos_sharpe >= strong_oos
+                # Or when OOS is modestly positive and the absolute gap is manageable.
+                or (oos_sharpe > 0.0 and absolute_gap_ok)
+                # Or borderline-negative OOS with a tight ratio (noise window).
                 or (oos_sharpe > oos_floor and gap_ratio < gap_cap and absolute_gap_ok)
             )
             if accept:
